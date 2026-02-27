@@ -1,0 +1,779 @@
+#!/bin/bash
+# spm-to-xcframework — Build xcframeworks from Swift Package Manager packages.
+#
+# Takes an SPM package URL (or local path) and produces ready-to-use
+# xcframeworks for each Swift library product, suitable for .NET binding
+# generation or any other xcframework consumer.
+#
+# Usage:
+#   spm-to-xcframework <package-url-or-path> --version <ver> [options]
+#
+# Examples:
+#   spm-to-xcframework https://github.com/Alamofire/Alamofire.git -v 5.10.2
+#   spm-to-xcframework https://github.com/kean/Nuke.git -v 12.8.0 -o ./output
+#   spm-to-xcframework ./local-package -o ./output --product MyLib
+#   spm-to-xcframework https://github.com/stripe/stripe-ios.git -v 25.6.2 --include-deps
+
+set -euo pipefail
+
+# --- Colors ---
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+# --- Globals ---
+PACKAGE_SOURCE=""        # URL or local path
+VERSION=""               # Tag/version
+OUTPUT_DIR=""            # Output directory (default: ./xcframeworks)
+PRODUCT_FILTER=""        # Build only this product (default: all)
+MIN_IOS="15.0"           # Minimum iOS deployment target
+INCLUDE_DEPS=false       # Also output dependency xcframeworks
+VERBOSE=false            # Show full build output
+DRY_RUN=false            # Show what would be built
+WORK_DIR=""              # Temp working directory (set in main)
+KEEP_WORK=false          # Keep work directory on exit (for debugging)
+HAS_XCODEPROJ=false      # Package has its own .xcodeproj (set in fetch_source)
+LAST_BUILT_FW_NAME=""    # Resolved framework name from last build_product (for --include-deps)
+
+# Counters
+BUILT=0
+FAILED=0
+SKIPPED=0
+
+# --- Utilities ---
+
+die() { echo -e "${RED}Error: $*${NC}" >&2; exit 1; }
+info() { echo -e "${CYAN}$*${NC}"; }
+success() { echo -e "${GREEN}$*${NC}"; }
+warn() { echo -e "${YELLOW}$*${NC}"; }
+dim() { echo -e "${DIM}$*${NC}"; }
+bold() { echo -e "${BOLD}$*${NC}"; }
+
+verbose_log() {
+    if $VERBOSE; then
+        echo -e "${DIM}$*${NC}"
+    fi
+}
+
+cleanup() {
+    if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
+        if $KEEP_WORK; then
+            dim "Work directory retained: $WORK_DIR"
+        else
+            dim "Cleaning up work directory..."
+            rm -rf "$WORK_DIR"
+        fi
+    fi
+}
+
+trap cleanup EXIT
+
+# --- Argument Parsing ---
+
+print_help() {
+    cat <<'HELP'
+spm-to-xcframework — Build xcframeworks from Swift Package Manager packages.
+
+USAGE
+    spm-to-xcframework <package-url-or-path> --version <ver> [options]
+
+ARGUMENTS
+    <package-url-or-path>   Git URL or local filesystem path to the SPM package
+
+OPTIONS
+    -v, --version <ver>     Git tag to check out (required for remote URLs)
+    -o, --output <dir>      Output directory (default: ./xcframeworks)
+    -p, --product <name>    Build only this product (default: all library products)
+        --min-ios <ver>     Minimum iOS deployment target (default: 15.0)
+        --include-deps      Also build xcframeworks for transitive dependencies
+        --verbose           Show full build output
+        --dry-run           Show what would be built without building
+        --keep-work         Keep temporary work directory (for debugging)
+    -h, --help              Show this help
+
+EXAMPLES
+    # Build all products from Alamofire
+    spm-to-xcframework https://github.com/Alamofire/Alamofire.git -v 5.10.2
+
+    # Build just the Nuke product, output to custom dir
+    spm-to-xcframework https://github.com/kean/Nuke.git -v 12.8.0 -o ./nuke-fw
+
+    # Build from a local package
+    spm-to-xcframework ./MyPackage -o ./output
+
+    # Build Stripe with all its sub-frameworks
+    spm-to-xcframework https://github.com/stripe/stripe-ios.git -v 25.6.2
+
+OUTPUT
+    Creates one .xcframework per Swift library product in the output directory.
+    Each xcframework contains device (arm64) and simulator slices, built with
+    BUILD_LIBRARY_FOR_DISTRIBUTION=YES for ABI stability.
+
+    These xcframeworks are ready for use with:
+    - Swift.Bindings (.NET binding generator)
+    - Direct Xcode integration
+    - Any xcframework consumer
+HELP
+}
+
+parse_args() {
+    # Helper: die if a value-taking flag has no argument or its argument looks like another flag.
+    require_value() {
+        if [[ $# -lt 2 || "$2" == -* ]]; then
+            die "$1 requires a value."
+        fi
+    }
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -v|--version) require_value "$@"; VERSION="$2"; shift 2 ;;
+            -o|--output) require_value "$@"; OUTPUT_DIR="$2"; shift 2 ;;
+            -p|--product) require_value "$@"; PRODUCT_FILTER="$2"; shift 2 ;;
+            --min-ios) require_value "$@"; MIN_IOS="$2"; shift 2 ;;
+            --include-deps) INCLUDE_DEPS=true; shift ;;
+            --verbose) VERBOSE=true; shift ;;
+            --dry-run) DRY_RUN=true; shift ;;
+            --keep-work) KEEP_WORK=true; shift ;;
+            -h|--help) print_help; exit 0 ;;
+            -*)
+                die "Unknown option: $1\nRun with --help for usage."
+                ;;
+            *)
+                if [[ -z "$PACKAGE_SOURCE" ]]; then
+                    PACKAGE_SOURCE="$1"
+                else
+                    die "Unexpected argument: $1\nPackage source already set to: $PACKAGE_SOURCE"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    [[ -n "$PACKAGE_SOURCE" ]] || die "Package URL or path is required.\nRun with --help for usage."
+    if [[ -z "$OUTPUT_DIR" ]]; then
+        OUTPUT_DIR="./xcframeworks"
+    fi
+}
+
+# --- Package Resolution ---
+
+# Determine if PACKAGE_SOURCE is a local path or remote URL.
+is_remote() {
+    [[ "$PACKAGE_SOURCE" == http://* || "$PACKAGE_SOURCE" == https://* || "$PACKAGE_SOURCE" == git@* || "$PACKAGE_SOURCE" == ssh://* ]]
+}
+
+# Clone or copy the package source into $WORK_DIR/source.
+fetch_source() {
+    local source_dir="$WORK_DIR/source"
+
+    if is_remote; then
+        [[ -n "$VERSION" ]] || die "Version (--version) is required for remote package URLs."
+
+        info "Cloning $PACKAGE_SOURCE @ $VERSION"
+        local clone_args=(--depth 1)
+
+        # Try the version as-is first, then with 'v' prefix
+        if git ls-remote --tags "$PACKAGE_SOURCE" "$VERSION" "refs/tags/$VERSION" 2>/dev/null | grep -q .; then
+            clone_args+=(--branch "$VERSION")
+        elif git ls-remote --tags "$PACKAGE_SOURCE" "v$VERSION" "refs/tags/v$VERSION" 2>/dev/null | grep -q .; then
+            warn "Tag '$VERSION' not found, using 'v$VERSION'"
+            VERSION="v$VERSION"
+            clone_args+=(--branch "$VERSION")
+        else
+            # Fall back to trying the version directly — git clone will error if invalid
+            clone_args+=(--branch "$VERSION")
+        fi
+
+        if ! git clone "${clone_args[@]}" "$PACKAGE_SOURCE" "$source_dir" 2>&1 | tail -3; then
+            die "Failed to clone $PACKAGE_SOURCE at version $VERSION"
+        fi
+    else
+        # Local path
+        local abs_path
+        abs_path=$(cd "$PACKAGE_SOURCE" 2>/dev/null && pwd) || die "Local path not found: $PACKAGE_SOURCE"
+        [[ -f "$abs_path/Package.swift" ]] || die "No Package.swift found at $abs_path"
+
+        info "Copying local package from $abs_path"
+        cp -R "$abs_path" "$source_dir"
+    fi
+
+    [[ -f "$source_dir/Package.swift" ]] || die "No Package.swift found in package source"
+
+    # Track whether the package has its own Xcode project.
+    # When it does, xcodebuild uses xcodeproj schemes (e.g. "Alamofire iOS")
+    # instead of auto-generated SPM schemes (e.g. "Alamofire").
+    HAS_XCODEPROJ=false
+    if find "$source_dir" -maxdepth 1 -name "*.xcodeproj" -type d 2>/dev/null | grep -q .; then
+        HAS_XCODEPROJ=true
+        verbose_log "Package has .xcodeproj — will use Xcode project schemes"
+    fi
+}
+
+# Discover library products from Package.swift.
+# Sets PRODUCTS array with entries like "name|targets"
+discover_products() {
+    local source_dir="$WORK_DIR/source"
+
+    info "Resolving package..."
+    local dump_file="$WORK_DIR/package-dump.json"
+    local dump_err="$WORK_DIR/package-dump-stderr.txt"
+    if ! (cd "$source_dir" && swift package dump-package > "$dump_file" 2>"$dump_err"); then
+        echo ""
+        warn "swift package dump-package failed:"
+        cat "$dump_err" | sed 's/^/  /' >&2
+        die "Cannot parse Package.swift — is the swift-tools-version supported?"
+    fi
+
+    # Also resolve dependencies so xcodebuild can find everything
+    (cd "$source_dir" && swift package resolve 2>&1 | tail -3) \
+        || die "Failed to resolve package dependencies"
+
+    # Extract library product names using python3
+    PRODUCTS=()
+    while IFS= read -r product_name; do
+        [[ -n "$product_name" ]] || continue
+
+        # Apply product filter if specified
+        if [[ -n "$PRODUCT_FILTER" ]]; then
+            if [[ "$product_name" != "$PRODUCT_FILTER" ]]; then
+                verbose_log "  Skipping product $product_name (filter: $PRODUCT_FILTER)"
+                continue
+            fi
+        fi
+
+        PRODUCTS+=("$product_name")
+    done < <(python3 -c "
+import json, sys
+pkg = json.load(open('$dump_file'))
+for prod in pkg.get('products', []):
+    ptype = prod.get('type', {})
+    # Library products have a 'library' key in their type
+    if 'library' in ptype or (isinstance(ptype, str) and ptype == 'library'):
+        print(prod['name'])
+" 2>/dev/null)
+
+    if [[ ${#PRODUCTS[@]} -eq 0 ]]; then
+        if [[ -n "$PRODUCT_FILTER" ]]; then
+            die "No library product matching '$PRODUCT_FILTER' found in package"
+        else
+            die "No library products found in Package.swift"
+        fi
+    fi
+
+    echo ""
+    bold "Found ${#PRODUCTS[@]} library product(s):"
+    for p in "${PRODUCTS[@]}"; do
+        echo "  - $p"
+    done
+    echo ""
+}
+
+# Discover xcodebuild schemes available for this package.
+# Populates SCHEME_LIST array.
+discover_schemes() {
+    local source_dir="$WORK_DIR/source"
+
+    info "Discovering build schemes..."
+    local list_file="$WORK_DIR/xcodebuild-list.json"
+
+    (cd "$source_dir" && xcodebuild -list -json > "$list_file" 2>/dev/null) || {
+        warn "xcodebuild -list failed; will use product names as scheme names"
+        return 0
+    }
+
+    # Parse schemes from either workspace or project format
+    SCHEME_LIST=()
+    while IFS= read -r scheme; do
+        [[ -n "$scheme" ]] && SCHEME_LIST+=("$scheme")
+    done < <(python3 -c "
+import json, sys
+data = json.load(open('$list_file'))
+# Try workspace format first, then project
+container = data.get('workspace', data.get('project', {}))
+for s in container.get('schemes', []):
+    print(s)
+" 2>/dev/null)
+
+    if [[ ${#SCHEME_LIST[@]} -gt 0 ]]; then
+        verbose_log "  Available schemes: ${SCHEME_LIST[*]}"
+    fi
+}
+
+# Find the best matching scheme for a given product name.
+# Returns the scheme name on stdout, or empty if no match.
+find_scheme_for_product() {
+    local product="$1"
+
+    # If no schemes were discovered, use product name directly
+    if [[ ${#SCHEME_LIST[@]} -eq 0 ]]; then
+        echo "$product"
+        return 0
+    fi
+
+    # Exact match
+    local s
+    for s in "${SCHEME_LIST[@]}"; do
+        [[ "$s" == "$product" ]] && { echo "$s"; return 0; }
+    done
+
+    # Case-insensitive exact match (portable — no bash 4 ${,,} needed)
+    for s in "${SCHEME_LIST[@]}"; do
+        if echo "$s" | grep -qix "$product"; then
+            echo "$s"; return 0
+        fi
+    done
+
+    # Product name with common platform/convention suffixes
+    local suffix
+    for suffix in " iOS" "-iOS" " (iOS)" " (ios)" "-ios" "-Package" "iOS" " iPhone"; do
+        for s in "${SCHEME_LIST[@]}"; do
+            [[ "$s" == "${product}${suffix}" ]] && { echo "$s"; return 0; }
+        done
+    done
+
+    # No match — return the product name and hope xcodebuild figures it out
+    echo "$product"
+}
+
+# --- Build ---
+
+# Run xcodebuild archive for a single destination.
+# Always writes full output to $WORK_DIR/.last-build-output (fresh each call)
+# so that build_archive can inspect it for scheme-not-found fallback regardless
+# of --verbose mode.
+# Arguments: source_dir scheme destination archive_path derived_data_path
+run_xcodebuild_archive() {
+    local source_dir="$1" scheme="$2" destination="$3" archive_path="$4" dd_path="$5"
+    local log_file="$WORK_DIR/.last-build-output"
+
+    local build_cmd=(
+        xcodebuild archive
+        -scheme "$scheme"
+        -destination "$destination"
+        -archivePath "$archive_path"
+        -derivedDataPath "$dd_path"
+        BUILD_LIBRARY_FOR_DISTRIBUTION=YES
+        SKIP_INSTALL=NO
+        MACH_O_TYPE=mh_dylib
+        IPHONEOS_DEPLOYMENT_TARGET="$MIN_IOS"
+        GCC_TREAT_WARNINGS_AS_ERRORS=NO
+        SWIFT_TREAT_WARNINGS_AS_ERRORS=NO
+        -skipPackagePluginValidation
+        -skipMacroValidation
+    )
+
+    # Always capture output to log file. In verbose mode, also stream to stdout.
+    local rc=0
+    if $VERBOSE; then
+        (cd "$source_dir" && "${build_cmd[@]}" 2>&1) | tee "$log_file" || rc=$?
+    else
+        (cd "$source_dir" && "${build_cmd[@]}" 2>&1) > "$log_file" || rc=$?
+        tail -5 "$log_file"
+    fi
+    return $rc
+}
+
+# Build device + simulator archives for a product.
+# If the initial scheme fails with "does not contain a scheme", retries
+# with xcodeproj/xcworkspace moved aside (pure SPM mode).
+# Arguments: source_dir scheme product archives_dir derived_data
+build_archive() {
+    local source_dir="$1" scheme="$2" product="$3" archives_dir="$4" derived_data="$5"
+    local device_archive="$archives_dir/${product}-ios-arm64.xcarchive"
+    local sim_archive="$archives_dir/${product}-ios-simulator.xcarchive"
+
+    # --- Device build ---
+    info "  Building $product — device (arm64)..."
+    if ! run_xcodebuild_archive "$source_dir" "$scheme" "generic/platform=iOS" "$device_archive" "$derived_data/device"; then
+        # Check if the failure is due to missing scheme
+        if [[ -f "$WORK_DIR/.last-build-output" ]] && grep -q "does not contain a scheme" "$WORK_DIR/.last-build-output"; then
+            if $HAS_XCODEPROJ; then
+                dim "  Scheme '$scheme' not in xcodeproj — retrying in SPM mode..."
+                # Move xcodeproj aside and retry with product name as scheme
+                local xcproj
+                for xcproj in "$source_dir"/*.xcodeproj "$source_dir"/*.xcworkspace; do
+                    [[ -e "$xcproj" ]] && mv "$xcproj" "${xcproj}.aside"
+                done
+
+                if ! run_xcodebuild_archive "$source_dir" "$product" "generic/platform=iOS" "$device_archive" "$derived_data/device"; then
+                    warn "  Device build failed in both xcodeproj and SPM modes"
+                    # Restore
+                    for xcproj in "$source_dir"/*.aside; do
+                        [[ -e "$xcproj" ]] && mv "$xcproj" "${xcproj%.aside}"
+                    done
+                    return 1
+                fi
+
+                # If device succeeded in SPM mode, build simulator too
+                info "  Building $product — simulator..."
+                if ! run_xcodebuild_archive "$source_dir" "$product" "generic/platform=iOS Simulator" "$sim_archive" "$derived_data/simulator"; then
+                    warn "  Simulator build failed in SPM mode"
+                    for xcproj in "$source_dir"/*.aside; do
+                        [[ -e "$xcproj" ]] && mv "$xcproj" "${xcproj%.aside}"
+                    done
+                    return 1
+                fi
+
+                # Restore xcodeproj for future products
+                for xcproj in "$source_dir"/*.aside; do
+                    [[ -e "$xcproj" ]] && mv "$xcproj" "${xcproj%.aside}"
+                done
+                return 0
+            fi
+        fi
+
+        warn "  Device build failed"
+        if [[ -f "$WORK_DIR/.last-build-output" ]] && ! $VERBOSE; then
+            warn "  Last 15 lines of build output:"
+            tail -15 "$WORK_DIR/.last-build-output" | sed 's/^/    /'
+        fi
+        return 1
+    fi
+
+    # --- Simulator build ---
+    info "  Building $product — simulator..."
+    if ! run_xcodebuild_archive "$source_dir" "$scheme" "generic/platform=iOS Simulator" "$sim_archive" "$derived_data/simulator"; then
+        warn "  Simulator build failed"
+        if [[ -f "$WORK_DIR/.last-build-output" ]] && ! $VERBOSE; then
+            warn "  Last 15 lines of build output:"
+            tail -15 "$WORK_DIR/.last-build-output" | sed 's/^/    /'
+        fi
+        return 1
+    fi
+
+    return 0
+}
+
+# Build a single product for device and simulator, create xcframework.
+# Arguments: product_name
+build_product() {
+    local product="$1"
+    local source_dir="$WORK_DIR/source"
+    local archives_dir="$WORK_DIR/archives/$product"
+    local derived_data="$WORK_DIR/DerivedData/$product"
+    local output_xcfw="$OUTPUT_DIR/${product}.xcframework"
+
+    # Find the scheme
+    local scheme
+    scheme=$(find_scheme_for_product "$product")
+    if [[ "$scheme" != "$product" ]]; then
+        dim "  Using scheme: $scheme"
+    fi
+
+    mkdir -p "$archives_dir"
+
+    # --- Build for device and simulator ---
+    if ! build_archive "$source_dir" "$scheme" "$product" "$archives_dir" "$derived_data"; then
+        return 1
+    fi
+
+    local device_archive="$archives_dir/${product}-ios-arm64.xcarchive"
+    local sim_archive="$archives_dir/${product}-ios-simulator.xcarchive"
+
+    # --- Find frameworks in archives ---
+    local device_fw simulator_fw
+    device_fw=$(find "$device_archive/Products" -name "${product}.framework" -type d 2>/dev/null | head -1)
+    simulator_fw=$(find "$sim_archive/Products" -name "${product}.framework" -type d 2>/dev/null | head -1)
+
+    if [[ -z "$device_fw" ]]; then
+        # The framework name might differ from the product name — search for any framework
+        warn "  ${product}.framework not found in device archive, searching..."
+        local found_fws
+        found_fws=$(find "$device_archive/Products" -name "*.framework" -type d 2>/dev/null)
+        if [[ -n "$found_fws" ]]; then
+            dim "  Found frameworks in archive:"
+            echo "$found_fws" | sed 's/^/    /'
+            # Take the first one as a best guess
+            device_fw=$(echo "$found_fws" | head -1)
+            local actual_name
+            actual_name=$(basename "$device_fw" .framework)
+            simulator_fw=$(find "$sim_archive/Products" -name "${actual_name}.framework" -type d 2>/dev/null | head -1)
+            warn "  Using $actual_name instead of $product"
+        else
+            warn "  No frameworks found in device archive"
+            return 1
+        fi
+    fi
+
+    if [[ -z "$simulator_fw" ]]; then
+        warn "  Framework not found in simulator archive"
+        return 1
+    fi
+
+    # Resolve the actual framework name (may differ from product name)
+    local fw_name
+    fw_name=$(basename "$device_fw" .framework)
+
+    # --- Inject Swift module interfaces if missing ---
+    inject_swiftmodule "$fw_name" "$scheme" "$device_fw" "$derived_data/device" "device"
+    inject_swiftmodule "$fw_name" "$scheme" "$simulator_fw" "$derived_data/simulator" "simulator"
+
+    # --- Create xcframework ---
+    info "  Creating ${product}.xcframework..."
+    rm -rf "$output_xcfw"
+
+    local create_cmd=(
+        xcodebuild -create-xcframework
+        -framework "$device_fw"
+        -framework "$simulator_fw"
+        -output "$output_xcfw"
+    )
+
+    if ! "${create_cmd[@]}" 2>&1 | tail -3; then
+        warn "  Failed to create ${product}.xcframework"
+        return 1
+    fi
+
+    # --- Validate the xcframework (advisory — warnings only) ---
+    validate_xcframework "$fw_name" "$output_xcfw"
+
+    # Export resolved framework name for --include-deps callers
+    LAST_BUILT_FW_NAME="$fw_name"
+
+    success "  ${product}.xcframework ready"
+    return 0
+}
+
+# Build dependency xcframeworks (when --include-deps is set).
+# Scans archives for frameworks beyond the main product.
+# Arguments: product_name resolved_fw_name
+build_dependency_xcframeworks() {
+    local product="$1"
+    local primary_fw_name="${2:-$product}"
+    local archives_dir="$WORK_DIR/archives/$product"
+    local derived_data="$WORK_DIR/DerivedData/$product"
+
+    local device_archive="$archives_dir/${product}-ios-arm64.xcarchive"
+    local sim_archive="$archives_dir/${product}-ios-simulator.xcarchive"
+
+    [[ -d "$device_archive" ]] || return 0
+
+    # Find all frameworks in the device archive that aren't the primary
+    # (skip by both product name and resolved fw_name to handle remaps)
+    while IFS= read -r fw_path; do
+        local fw_name
+        fw_name=$(basename "$fw_path" .framework)
+        [[ "$fw_name" == "$product" || "$fw_name" == "$primary_fw_name" ]] && continue
+        [[ -f "$OUTPUT_DIR/${fw_name}.xcframework/Info.plist" ]] && continue
+
+        local sim_fw
+        sim_fw=$(find "$sim_archive/Products" -name "${fw_name}.framework" -type d 2>/dev/null | head -1)
+        [[ -z "$sim_fw" ]] && continue
+
+        dim "  Dependency: ${fw_name}"
+
+        # Inject swiftmodule if needed
+        inject_swiftmodule "$fw_name" "$fw_name" "$fw_path" "$derived_data/device" "device"
+        inject_swiftmodule "$fw_name" "$fw_name" "$sim_fw" "$derived_data/simulator" "simulator"
+
+        local dep_xcfw="$OUTPUT_DIR/${fw_name}.xcframework"
+        if xcodebuild -create-xcframework \
+            -framework "$fw_path" \
+            -framework "$sim_fw" \
+            -output "$dep_xcfw" 2>&1 | tail -1; then
+            success "  ${fw_name}.xcframework ready (dependency)"
+        else
+            warn "  Failed to create ${fw_name}.xcframework (dependency)"
+        fi
+    done < <(find "$device_archive/Products" -name "*.framework" -type d 2>/dev/null)
+}
+
+# Inject .swiftmodule/.swiftinterface into a framework if missing.
+inject_swiftmodule() {
+    local product="$1" scheme="$2" fw_path="$3" dd_path="$4" variant="$5"
+
+    local fw_name
+    fw_name=$(basename "$fw_path" .framework)
+
+    # Check if swiftmodule already exists in the framework
+    if [[ -d "$fw_path/Modules/${fw_name}.swiftmodule" ]]; then
+        # Check if it has .swiftinterface files (not just .swiftmodule binary)
+        if find "$fw_path/Modules/${fw_name}.swiftmodule" -name "*.swiftinterface" 2>/dev/null | grep -q .; then
+            verbose_log "  Swift interfaces present in $variant framework"
+            return 0
+        fi
+    fi
+
+    # Search DerivedData for the swiftmodule
+    local swiftmod
+    swiftmod=$(find "$dd_path" \
+        -path "*/${fw_name}.swiftmodule" \
+        -type d \
+        2>/dev/null | head -1)
+
+    # Also try searching with the scheme name
+    if [[ -z "$swiftmod" && "$scheme" != "$fw_name" ]]; then
+        swiftmod=$(find "$dd_path" \
+            -path "*/ArchiveIntermediates/${scheme}/BuildProductsPath/*/${fw_name}.swiftmodule" \
+            -type d \
+            2>/dev/null | head -1)
+    fi
+
+    if [[ -n "$swiftmod" ]]; then
+        dim "  Injecting Swift module interfaces ($variant)"
+        mkdir -p "$fw_path/Modules"
+        cp -R "$swiftmod" "$fw_path/Modules/"
+    else
+        verbose_log "  No Swift module found in DerivedData for $fw_name ($variant)"
+    fi
+}
+
+# --- Validation ---
+
+# Advisory validation — warns about issues but does not fail the build.
+# Partially usable xcframeworks (e.g. missing swiftinterface for ObjC modules)
+# are still valuable, so this is intentionally warn-only.
+# Arguments: framework_binary_name xcfw_path
+validate_xcframework() {
+    local fw_name="$1" xcfw_path="$2"
+    local issues=0
+
+    # Check for at least two architecture slices (device + simulator)
+    local slices
+    slices=$(find "$xcfw_path" -name "*.framework" -type d -maxdepth 2 2>/dev/null | wc -l)
+    if [[ $slices -lt 2 ]]; then
+        warn "  Warning: Expected 2 slices (device + simulator), found $slices"
+        issues=$((issues + 1))
+    fi
+
+    # Check for swiftinterface files
+    local interfaces
+    interfaces=$(find "$xcfw_path" -name "*.swiftinterface" 2>/dev/null | wc -l)
+    if [[ $interfaces -eq 0 ]]; then
+        warn "  Warning: No .swiftinterface files found — ABI JSON may not be available"
+        issues=$((issues + 1))
+    fi
+
+    # Check for dynamic library — find the binary inside any .framework slice.
+    # The binary name matches the framework name (fw_name), not necessarily
+    # the SPM product name.
+    local dylib
+    dylib=$(find "$xcfw_path" -path "*/${fw_name}.framework/${fw_name}" -type f 2>/dev/null | head -1)
+    if [[ -n "$dylib" ]]; then
+        local file_type
+        file_type=$(file "$dylib" 2>/dev/null | head -1)
+        if echo "$file_type" | grep -q "dynamically linked"; then
+            verbose_log "  Verified: dynamic library"
+        elif echo "$file_type" | grep -q "current ar archive"; then
+            warn "  Warning: Static library detected — P/Invoke requires dynamic (.dylib)"
+            issues=$((issues + 1))
+        fi
+    else
+        warn "  Warning: No binary named '$fw_name' found in xcframework"
+        issues=$((issues + 1))
+    fi
+
+    # Check for abi.json (generated alongside swiftinterface with library evolution)
+    local abi_files
+    abi_files=$(find "$xcfw_path" -name "*.abi.json" 2>/dev/null | wc -l)
+    if [[ $abi_files -gt 0 ]]; then
+        verbose_log "  ABI JSON present ($abi_files files)"
+    else
+        # ABI JSON is generated from swiftinterface at bind time, not always present here
+        verbose_log "  No ABI JSON in xcframework (will be generated from swiftinterface at bind time)"
+    fi
+
+    if [[ $issues -gt 0 ]]; then
+        verbose_log "  Validation: $issues warning(s)"
+    fi
+    return 0
+}
+
+# --- Main ---
+
+main() {
+    parse_args "$@"
+
+    bold "spm-to-xcframework"
+    echo ""
+
+    # Verify prerequisites
+    command -v xcodebuild >/dev/null 2>&1 || die "xcodebuild not found. Install Xcode and command line tools."
+    command -v swift >/dev/null 2>&1 || die "swift not found. Install Xcode and command line tools."
+    command -v python3 >/dev/null 2>&1 || die "python3 not found."
+
+    # Create working directory
+    WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/spm-to-xcfw.XXXXXXXX")
+    verbose_log "Work directory: $WORK_DIR"
+
+    # Create output directory
+    mkdir -p "$OUTPUT_DIR"
+    OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)  # Absolutize
+
+    # Step 1: Fetch source
+    fetch_source
+
+    # Step 2: Discover products
+    discover_products
+
+    # Step 3: Discover schemes
+    discover_schemes
+
+    # Dry run — just show what we'd build
+    if $DRY_RUN; then
+        bold "Dry run — would build:"
+        for product in "${PRODUCTS[@]}"; do
+            local scheme
+            scheme=$(find_scheme_for_product "$product")
+            echo "  $product (scheme: $scheme) → $OUTPUT_DIR/${product}.xcframework"
+        done
+        echo ""
+        if $INCLUDE_DEPS; then
+            echo "  Dependency xcframeworks would also be extracted."
+        fi
+        exit 0
+    fi
+
+    # Step 4: Build each product
+    echo ""
+    bold "Building xcframeworks..."
+    echo ""
+
+    for product in "${PRODUCTS[@]}"; do
+        bold "[$((BUILT + FAILED + SKIPPED + 1))/${#PRODUCTS[@]}] $product"
+
+        if build_product "$product"; then
+            BUILT=$((BUILT + 1))
+
+            # Extract dependency xcframeworks if requested
+            if $INCLUDE_DEPS; then
+                build_dependency_xcframeworks "$product" "$LAST_BUILT_FW_NAME"
+            fi
+        else
+            FAILED=$((FAILED + 1))
+            warn "  Failed to build $product"
+        fi
+        echo ""
+    done
+
+    # --- Summary ---
+    echo ""
+    bold "=== Summary ==="
+    if [[ $BUILT -gt 0 ]]; then success "  Built: $BUILT"; fi
+    if [[ $FAILED -gt 0 ]]; then echo -e "  ${RED}Failed: $FAILED${NC}"; fi
+    if [[ $SKIPPED -gt 0 ]]; then dim "  Skipped: $SKIPPED"; fi
+    echo ""
+    bold "Output: $OUTPUT_DIR"
+
+    if [[ $BUILT -gt 0 ]]; then
+        echo ""
+        dim "Xcframeworks:"
+        find "$OUTPUT_DIR" -name "*.xcframework" -maxdepth 1 -type d | sort | while read -r fw; do
+            local name
+            name=$(basename "$fw")
+            local size
+            size=$(du -sh "$fw" 2>/dev/null | cut -f1)
+            echo "  $name ($size)"
+        done
+    fi
+
+    echo ""
+
+    [[ $FAILED -eq 0 ]] || exit 1
+}
+
+main "$@"
