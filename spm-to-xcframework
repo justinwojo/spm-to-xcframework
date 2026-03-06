@@ -2,8 +2,8 @@
 # spm-to-xcframework — Build xcframeworks from Swift Package Manager packages.
 #
 # Takes an SPM package URL (or local path) and produces ready-to-use
-# xcframeworks for each Swift library product, suitable for .NET binding
-# generation or any other xcframework consumer.
+# xcframeworks for each library product (Swift, Objective-C, or mixed),
+# suitable for .NET binding generation or any other xcframework consumer.
 #
 # Usage:
 #   spm-to-xcframework <package-url-or-path> --version <ver> [options]
@@ -78,6 +78,10 @@ print_help() {
     cat <<'HELP'
 spm-to-xcframework — Build xcframeworks from Swift Package Manager packages.
 
+Supports Swift, Objective-C, and mixed-language library products. Each
+xcframework is ready for .NET binding generation (Swift.Bindings) or any
+other xcframework consumer.
+
 USAGE
     spm-to-xcframework <package-url-or-path> --version <ver> [options]
 
@@ -96,25 +100,30 @@ OPTIONS
     -h, --help              Show this help
 
 EXAMPLES
-    # Build all products from Alamofire
+    # Build all products from Alamofire (Swift)
     spm-to-xcframework https://github.com/Alamofire/Alamofire.git -v 5.10.2
 
     # Build just the Nuke product, output to custom dir
     spm-to-xcframework https://github.com/kean/Nuke.git -v 12.8.0 -o ./nuke-fw
 
-    # Build from a local package
+    # Build from a local package (Swift, ObjC, or mixed)
     spm-to-xcframework ./MyPackage -o ./output
 
     # Build Stripe with all its sub-frameworks
     spm-to-xcframework https://github.com/stripe/stripe-ios.git -v 25.6.2
 
 OUTPUT
-    Creates one .xcframework per Swift library product in the output directory.
+    Creates one .xcframework per library product in the output directory.
     Each xcframework contains device (arm64) and simulator slices, built with
     BUILD_LIBRARY_FOR_DISTRIBUTION=YES for ABI stability.
 
+    Framework type is auto-detected and reported:
+    - Swift:  Has .swiftinterface files (binding via ABI JSON)
+    - ObjC:   Has headers + modulemap, no Swift (binding via clang AST)
+    - Mixed:  Has both Swift interfaces and ObjC headers
+
     These xcframeworks are ready for use with:
-    - Swift.Bindings (.NET binding generator)
+    - Swift.Bindings (.NET binding generator — Swift, ObjC, and mixed)
     - Direct Xcode integration
     - Any xcframework consumer
 HELP
@@ -232,7 +241,9 @@ discover_products() {
     (cd "$source_dir" && swift package resolve 2>&1 | tail -3) \
         || die "Failed to resolve package dependencies"
 
-    # Extract library product names using python3
+    # Extract library product names using python3.
+    # SPM library products can contain Swift, ObjC, or mixed targets —
+    # we discover all of them here; framework type is detected after build.
     PRODUCTS=()
     while IFS= read -r product_name; do
         [[ -n "$product_name" ]] || continue
@@ -534,7 +545,7 @@ build_product() {
     # Export resolved framework name for --include-deps callers
     LAST_BUILT_FW_NAME="$fw_name"
 
-    success "  ${product}.xcframework ready"
+    success "  ${product}.xcframework ready [$FW_TYPE]"
     return 0
 }
 
@@ -575,7 +586,8 @@ build_dependency_xcframeworks() {
             -framework "$fw_path" \
             -framework "$sim_fw" \
             -output "$dep_xcfw" 2>&1 | tail -1; then
-            success "  ${fw_name}.xcframework ready (dependency)"
+            detect_framework_type "$dep_xcfw"
+            success "  ${fw_name}.xcframework ready (dependency) [$FW_TYPE]"
         else
             warn "  Failed to create ${fw_name}.xcframework (dependency)"
         fi
@@ -622,6 +634,45 @@ inject_swiftmodule() {
     fi
 }
 
+# --- Framework Type Detection ---
+
+# Detect whether an xcframework contains Swift, ObjC, or both.
+# Sets FW_TYPE to "Swift", "ObjC", or "Mixed" and prints a label.
+# Arguments: xcfw_path
+# Returns: sets FW_TYPE global
+FW_TYPE=""
+
+detect_framework_type() {
+    local xcfw_path="$1"
+
+    local has_swift=false
+    local has_objc=false
+
+    # Swift: look for .swiftinterface or .swiftmodule
+    if find "$xcfw_path" -name "*.swiftinterface" 2>/dev/null | grep -q .; then
+        has_swift=true
+    elif find "$xcfw_path" -name "*.swiftmodule" -type d 2>/dev/null | grep -q .; then
+        has_swift=true
+    fi
+
+    # ObjC: look for public headers (.h files inside a Headers/ directory).
+    # Exclude generated *-Swift.h headers — these are auto-generated ObjC
+    # interfaces for Swift modules, not actual ObjC API.
+    if find "$xcfw_path" -path "*/Headers/*.h" ! -name "*-Swift.h" 2>/dev/null | grep -q .; then
+        has_objc=true
+    fi
+
+    if $has_swift && $has_objc; then
+        FW_TYPE="Mixed"
+    elif $has_swift; then
+        FW_TYPE="Swift"
+    elif $has_objc; then
+        FW_TYPE="ObjC"
+    else
+        FW_TYPE="Unknown"
+    fi
+}
+
 # --- Validation ---
 
 # Advisory validation — warns about issues but does not fail the build.
@@ -632,6 +683,9 @@ validate_xcframework() {
     local fw_name="$1" xcfw_path="$2"
     local issues=0
 
+    # Detect framework type first
+    detect_framework_type "$xcfw_path"
+
     # Check for at least two architecture slices (device + simulator)
     local slices
     slices=$(find "$xcfw_path" -name "*.framework" -type d -maxdepth 2 2>/dev/null | wc -l)
@@ -640,11 +694,40 @@ validate_xcframework() {
         issues=$((issues + 1))
     fi
 
-    # Check for swiftinterface files
-    local interfaces
-    interfaces=$(find "$xcfw_path" -name "*.swiftinterface" 2>/dev/null | wc -l)
-    if [[ $interfaces -eq 0 ]]; then
-        warn "  Warning: No .swiftinterface files found — ABI JSON may not be available"
+    # Swift-specific: check for swiftinterface files
+    if [[ "$FW_TYPE" == "Swift" || "$FW_TYPE" == "Mixed" ]]; then
+        local interfaces
+        interfaces=$(find "$xcfw_path" -name "*.swiftinterface" 2>/dev/null | wc -l)
+        if [[ $interfaces -eq 0 ]]; then
+            warn "  Warning: No .swiftinterface files — Swift bindings require ABI JSON (generated from swiftinterface)"
+            issues=$((issues + 1))
+        fi
+    fi
+
+    # ObjC-specific: check for headers and modulemap
+    if [[ "$FW_TYPE" == "ObjC" || "$FW_TYPE" == "Mixed" ]]; then
+        local headers
+        headers=$(find "$xcfw_path" -path "*/Headers/*.h" ! -name "*-Swift.h" 2>/dev/null | wc -l)
+        if [[ $headers -eq 0 ]]; then
+            warn "  Warning: No public headers found — ObjC bindings require headers"
+            issues=$((issues + 1))
+        else
+            verbose_log "  Public headers present ($headers files)"
+        fi
+
+        local modulemap
+        modulemap=$(find "$xcfw_path" -name "module.modulemap" -o -name "*.modulemap" 2>/dev/null | head -1)
+        if [[ -n "$modulemap" ]]; then
+            verbose_log "  Modulemap present"
+        else
+            warn "  Warning: No modulemap found — ObjC bindings may need manual header specification"
+            issues=$((issues + 1))
+        fi
+    fi
+
+    # Unknown type: no Swift interfaces and no ObjC headers
+    if [[ "$FW_TYPE" == "Unknown" ]]; then
+        warn "  Warning: No .swiftinterface files or public headers found — binding generation may not work"
         issues=$((issues + 1))
     fi
 
@@ -668,13 +751,14 @@ validate_xcframework() {
     fi
 
     # Check for abi.json (generated alongside swiftinterface with library evolution)
-    local abi_files
-    abi_files=$(find "$xcfw_path" -name "*.abi.json" 2>/dev/null | wc -l)
-    if [[ $abi_files -gt 0 ]]; then
-        verbose_log "  ABI JSON present ($abi_files files)"
-    else
-        # ABI JSON is generated from swiftinterface at bind time, not always present here
-        verbose_log "  No ABI JSON in xcframework (will be generated from swiftinterface at bind time)"
+    if [[ "$FW_TYPE" == "Swift" || "$FW_TYPE" == "Mixed" ]]; then
+        local abi_files
+        abi_files=$(find "$xcfw_path" -name "*.abi.json" 2>/dev/null | wc -l)
+        if [[ $abi_files -gt 0 ]]; then
+            verbose_log "  ABI JSON present ($abi_files files)"
+        else
+            verbose_log "  No ABI JSON in xcframework (will be generated from swiftinterface at bind time)"
+        fi
     fi
 
     if [[ $issues -gt 0 ]]; then
@@ -767,7 +851,8 @@ main() {
             name=$(basename "$fw")
             local size
             size=$(du -sh "$fw" 2>/dev/null | cut -f1)
-            echo "  $name ($size)"
+            detect_framework_type "$fw"
+            echo "  $name ($size) [$FW_TYPE]"
         done
     fi
 
