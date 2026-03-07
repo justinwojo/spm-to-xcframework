@@ -350,6 +350,73 @@ find_scheme_for_product() {
     echo "$product"
 }
 
+# --- Package Patching ---
+
+# Patch Package.swift to make all library products dynamic frameworks.
+#
+# Why: We need dynamic frameworks for xcframework output (P/Invoke, ABI JSON).
+# The old approach set MACH_O_TYPE=mh_dylib globally on the xcodebuild CLI,
+# which forced ALL targets (including internal C/ObjC dependency targets like
+# nanopb, leveldb, GoogleUtilities-NSData) to link as dynamic libraries.
+# These targets are designed to produce object files or static libraries, so
+# the linker fails. By patching Package.swift instead, only library PRODUCTS
+# become dynamic — internal dependency targets keep their natural build type.
+patch_dynamic_libraries() {
+    local pkg_file="$1"
+    [[ -f "$pkg_file" ]] || return 0
+
+    # Back up original (only if not already backed up)
+    [[ -f "${pkg_file}.original" ]] || cp "$pkg_file" "${pkg_file}.original"
+
+    python3 - "$pkg_file" << 'PYEOF'
+import re, sys
+
+pkg_path = sys.argv[1]
+with open(pkg_path, 'r') as f:
+    content = f.read()
+
+# Walk through content, find .library(...) calls (handling nested parens),
+# and ensure each has type: .dynamic.
+result = []
+i = 0
+while i < len(content):
+    match = re.match(r'\.library\s*\(', content[i:])
+    if not match:
+        result.append(content[i])
+        i += 1
+        continue
+
+    # Found .library( — find the matching closing paren
+    start = i
+    i += match.end()
+    depth = 1
+    while i < len(content) and depth > 0:
+        if content[i] == '(':
+            depth += 1
+        elif content[i] == ')':
+            depth -= 1
+        i += 1
+
+    lib_call = content[start:i]
+
+    if 'type: .dynamic' in lib_call:
+        result.append(lib_call)
+    elif re.search(r'type:\s*\.\w+', lib_call):
+        result.append(re.sub(r'type:\s*\.\w+', 'type: .dynamic', lib_call))
+    else:
+        # Insert type: .dynamic after name: "..."
+        name_match = re.search(r'(name:\s*"[^"]*")', lib_call)
+        if name_match:
+            pos = name_match.end()
+            lib_call = lib_call[:pos] + ', type: .dynamic' + lib_call[pos:]
+        result.append(lib_call)
+
+content = ''.join(result)
+with open(pkg_path, 'w') as f:
+    f.write(content)
+PYEOF
+}
+
 # --- Build ---
 
 # Run xcodebuild archive for a single destination.
@@ -359,7 +426,7 @@ find_scheme_for_product() {
 # Arguments: source_dir scheme destination archive_path derived_data_path
 run_xcodebuild_archive() {
     local source_dir="$1" scheme="$2" destination="$3" archive_path="$4" dd_path="$5"
-    local log_file="$WORK_DIR/.last-build-output"
+    local log_file="${6:-$WORK_DIR/.last-build-output}"
 
     local build_cmd=(
         xcodebuild archive
@@ -369,7 +436,6 @@ run_xcodebuild_archive() {
         -derivedDataPath "$dd_path"
         BUILD_LIBRARY_FOR_DISTRIBUTION=YES
         SKIP_INSTALL=NO
-        MACH_O_TYPE=mh_dylib
         IPHONEOS_DEPLOYMENT_TARGET="$MIN_IOS"
         GCC_TREAT_WARNINGS_AS_ERRORS=NO
         SWIFT_TREAT_WARNINGS_AS_ERRORS=NO
@@ -377,57 +443,83 @@ run_xcodebuild_archive() {
         -skipMacroValidation
     )
 
-    # Always capture output to log file. In verbose mode, also stream to stdout.
+    # Capture all output to log file. Caller is responsible for display.
     local rc=0
-    if $VERBOSE; then
-        (cd "$source_dir" && "${build_cmd[@]}" 2>&1) | tee "$log_file" || rc=$?
-    else
-        (cd "$source_dir" && "${build_cmd[@]}" 2>&1) > "$log_file" || rc=$?
-        tail -5 "$log_file"
-    fi
+    (cd "$source_dir" && "${build_cmd[@]}" 2>&1) > "$log_file" || rc=$?
     return $rc
 }
 
-# Build device + simulator archives for a product.
+# Build device + simulator archives for a product (in parallel).
 # If the initial scheme fails with "does not contain a scheme", retries
-# with xcodeproj/xcworkspace moved aside (pure SPM mode).
+# sequentially with xcodeproj/xcworkspace moved aside (pure SPM mode).
 # Arguments: source_dir scheme product archives_dir derived_data
 build_archive() {
     local source_dir="$1" scheme="$2" product="$3" archives_dir="$4" derived_data="$5"
     local device_archive="$archives_dir/${product}-ios-arm64.xcarchive"
     local sim_archive="$archives_dir/${product}-ios-simulator.xcarchive"
+    local device_log="$WORK_DIR/.build-output-${product}-device"
+    local sim_log="$WORK_DIR/.build-output-${product}-simulator"
 
-    # --- Device build ---
-    info "  Building $product — device (arm64)..."
-    if ! run_xcodebuild_archive "$source_dir" "$scheme" "generic/platform=iOS" "$device_archive" "$derived_data/device"; then
+    # --- Parallel device + simulator build ---
+    info "  Building $product — device (arm64) + simulator (parallel)..."
+
+    run_xcodebuild_archive "$source_dir" "$scheme" "generic/platform=iOS" "$device_archive" "$derived_data/device" "$device_log" &
+    local device_pid=$!
+
+    run_xcodebuild_archive "$source_dir" "$scheme" "generic/platform=iOS Simulator" "$sim_archive" "$derived_data/simulator" "$sim_log" &
+    local sim_pid=$!
+
+    local device_rc=0 sim_rc=0
+    wait $device_pid || device_rc=$?
+    wait $sim_pid || sim_rc=$?
+
+    # Show build result summaries (after both complete to avoid interleaving)
+    if [[ -f "$device_log" ]]; then
+        tail -5 "$device_log"
+    fi
+    if [[ -f "$sim_log" ]]; then
+        tail -5 "$sim_log"
+    fi
+
+    # --- Handle device failure ---
+    if [[ $device_rc -ne 0 ]]; then
         # Check if the failure is due to missing scheme
-        if [[ -f "$WORK_DIR/.last-build-output" ]] && grep -q "does not contain a scheme" "$WORK_DIR/.last-build-output"; then
+        if [[ -f "$device_log" ]] && grep -q "does not contain a scheme" "$device_log"; then
             if $HAS_XCODEPROJ; then
                 dim "  Scheme '$scheme' not in xcodeproj — retrying in SPM mode..."
-                # Move xcodeproj aside and retry with product name as scheme
+                # Move xcodeproj aside and retry sequentially with product name as scheme
                 local xcproj
                 for xcproj in "$source_dir"/*.xcodeproj "$source_dir"/*.xcworkspace; do
                     [[ -e "$xcproj" ]] && mv "$xcproj" "${xcproj}.aside"
                 done
 
-                if ! run_xcodebuild_archive "$source_dir" "$product" "generic/platform=iOS" "$device_archive" "$derived_data/device"; then
+                info "  Building $product — device (arm64) [SPM mode]..."
+                if ! run_xcodebuild_archive "$source_dir" "$product" "generic/platform=iOS" "$device_archive" "$derived_data/device" "$device_log"; then
                     warn "  Device build failed in both xcodeproj and SPM modes"
-                    # Restore
+                    if [[ -f "$device_log" ]] && ! $VERBOSE; then
+                        warn "  Last 15 lines of build output:"
+                        tail -15 "$device_log" | sed 's/^/    /'
+                    fi
                     for xcproj in "$source_dir"/*.aside; do
                         [[ -e "$xcproj" ]] && mv "$xcproj" "${xcproj%.aside}"
                     done
                     return 1
                 fi
+                tail -5 "$device_log"
 
-                # If device succeeded in SPM mode, build simulator too
-                info "  Building $product — simulator..."
-                if ! run_xcodebuild_archive "$source_dir" "$product" "generic/platform=iOS Simulator" "$sim_archive" "$derived_data/simulator"; then
+                info "  Building $product — simulator [SPM mode]..."
+                if ! run_xcodebuild_archive "$source_dir" "$product" "generic/platform=iOS Simulator" "$sim_archive" "$derived_data/simulator" "$sim_log"; then
                     warn "  Simulator build failed in SPM mode"
+                    if [[ -f "$sim_log" ]] && ! $VERBOSE; then
+                        warn "  Last 15 lines of build output:"
+                        tail -15 "$sim_log" | sed 's/^/    /'
+                    fi
                     for xcproj in "$source_dir"/*.aside; do
                         [[ -e "$xcproj" ]] && mv "$xcproj" "${xcproj%.aside}"
                     done
                     return 1
                 fi
+                tail -5 "$sim_log"
 
                 # Restore xcodeproj for future products
                 for xcproj in "$source_dir"/*.aside; do
@@ -438,20 +530,19 @@ build_archive() {
         fi
 
         warn "  Device build failed"
-        if [[ -f "$WORK_DIR/.last-build-output" ]] && ! $VERBOSE; then
+        if [[ -f "$device_log" ]] && ! $VERBOSE; then
             warn "  Last 15 lines of build output:"
-            tail -15 "$WORK_DIR/.last-build-output" | sed 's/^/    /'
+            tail -15 "$device_log" | sed 's/^/    /'
         fi
         return 1
     fi
 
-    # --- Simulator build ---
-    info "  Building $product — simulator..."
-    if ! run_xcodebuild_archive "$source_dir" "$scheme" "generic/platform=iOS Simulator" "$sim_archive" "$derived_data/simulator"; then
+    # --- Handle simulator failure ---
+    if [[ $sim_rc -ne 0 ]]; then
         warn "  Simulator build failed"
-        if [[ -f "$WORK_DIR/.last-build-output" ]] && ! $VERBOSE; then
+        if [[ -f "$sim_log" ]] && ! $VERBOSE; then
             warn "  Last 15 lines of build output:"
-            tail -15 "$WORK_DIR/.last-build-output" | sed 's/^/    /'
+            tail -15 "$sim_log" | sed 's/^/    /'
         fi
         return 1
     fi
@@ -523,6 +614,10 @@ build_product() {
     inject_swiftmodule "$fw_name" "$scheme" "$device_fw" "$derived_data/device" "device"
     inject_swiftmodule "$fw_name" "$scheme" "$simulator_fw" "$derived_data/simulator" "simulator"
 
+    # --- Inject ObjC headers if missing ---
+    inject_objc_headers "$product" "$fw_name" "$device_fw" "$source_dir" "$WORK_DIR/package-dump.json"
+    inject_objc_headers "$product" "$fw_name" "$simulator_fw" "$source_dir" "$WORK_DIR/package-dump.json"
+
     # --- Create xcframework ---
     info "  Creating ${product}.xcframework..."
     rm -rf "$output_xcfw"
@@ -577,9 +672,11 @@ build_dependency_xcframeworks() {
 
         dim "  Dependency: ${fw_name}"
 
-        # Inject swiftmodule if needed
+        # Inject swiftmodule and ObjC headers if needed
         inject_swiftmodule "$fw_name" "$fw_name" "$fw_path" "$derived_data/device" "device"
         inject_swiftmodule "$fw_name" "$fw_name" "$sim_fw" "$derived_data/simulator" "simulator"
+        inject_objc_headers "$fw_name" "$fw_name" "$fw_path" "$WORK_DIR/source" "$WORK_DIR/package-dump.json"
+        inject_objc_headers "$fw_name" "$fw_name" "$sim_fw" "$WORK_DIR/source" "$WORK_DIR/package-dump.json"
 
         local dep_xcfw="$OUTPUT_DIR/${fw_name}.xcframework"
         if xcodebuild -create-xcframework \
@@ -632,6 +729,145 @@ inject_swiftmodule() {
     else
         verbose_log "  No Swift module found in DerivedData for $fw_name ($variant)"
     fi
+}
+
+# Inject ObjC public headers and modulemap into a framework bundle.
+# SPM ObjC targets don't include headers in the archive Products — we pull
+# them from the source tree using Package.swift metadata (package-dump.json).
+# Arguments: product_name fw_name fw_path source_dir dump_file
+inject_objc_headers() {
+    local product="$1" fw_name="$2" fw_path="$3" source_dir="$4" dump_file="$5"
+
+    # Skip if framework already has public headers (excluding auto-generated Swift bridging headers)
+    if find "$fw_path/Headers" -name "*.h" ! -name "*-Swift.h" 2>/dev/null | grep -q .; then
+        verbose_log "  Public headers already present in framework"
+        return 0
+    fi
+
+    # Skip if no package dump available
+    [[ -f "$dump_file" ]] || return 0
+
+    # Use package dump to find the public headers path for the product's target(s).
+    # Priority: target matching fw_name > target matching product name > first target with headers.
+    # Also checks first-level dependencies if direct targets have no headers.
+    local headers_dir
+    headers_dir=$(python3 - "$dump_file" "$product" "$fw_name" "$source_dir" << 'PYEOF'
+import json, sys, os
+
+dump_file, product_name, fw_name, source_dir = sys.argv[1:5]
+pkg = json.load(open(dump_file))
+targets = {t["name"]: t for t in pkg.get("targets", [])}
+
+product_targets = []
+for p in pkg.get("products", []):
+    if p["name"] == product_name:
+        product_targets = p.get("targets", [])
+        break
+
+if not product_targets:
+    sys.exit(0)
+
+def find_headers_dir(target_name):
+    t = targets.get(target_name)
+    if not t or not t.get("publicHeadersPath"):
+        return None
+    path = t.get("path", "")
+    php = t["publicHeadersPath"]
+    full_path = os.path.normpath(os.path.join(source_dir, path, php))
+    if not os.path.isdir(full_path):
+        return None
+    if any(f.endswith(".h") for _, _, files in os.walk(full_path) for f in files):
+        return full_path
+    return None
+
+# Check direct product targets
+best = None
+for tname in product_targets:
+    d = find_headers_dir(tname)
+    if not d:
+        continue
+    if tname == fw_name:
+        best = d
+        break
+    elif tname == product_name and not best:
+        best = d
+    elif not best:
+        best = d
+
+# If no direct target has headers, check first-level dependencies
+if not best:
+    for tname in product_targets:
+        t = targets.get(tname)
+        if not t:
+            continue
+        for dep in t.get("dependencies", []):
+            dep_name = dep.get("byName", [None])[0]
+            if not dep_name:
+                continue
+            d = find_headers_dir(dep_name)
+            if d:
+                if dep_name in (fw_name, product_name):
+                    best = d
+                    break
+                elif not best:
+                    best = d
+        if best:
+            break
+
+if best:
+    print(best)
+PYEOF
+    )
+
+    if [[ -z "$headers_dir" || ! -d "$headers_dir" ]]; then
+        verbose_log "  No ObjC public headers found in source tree for $fw_name"
+        return 0
+    fi
+
+    dim "  Injecting ObjC headers ($fw_name)"
+
+    # Copy headers into framework.
+    # SPM convention: headers may be in a subdirectory named after the module
+    # (e.g., Public/FirebaseCore/*.h) or directly in the public headers dir.
+    mkdir -p "$fw_path/Headers"
+    local module_subdir="$headers_dir/$fw_name"
+    if [[ -d "$module_subdir" ]]; then
+        find "$module_subdir" -name "*.h" -exec cp {} "$fw_path/Headers/" \;
+    else
+        find "$headers_dir" -maxdepth 1 -name "*.h" -exec cp {} "$fw_path/Headers/" \;
+    fi
+
+    local header_count
+    header_count=$(find "$fw_path/Headers" -name "*.h" 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "$header_count" -eq 0 ]]; then
+        verbose_log "  No headers copied from $headers_dir"
+        return 0
+    fi
+
+    # Generate modulemap
+    mkdir -p "$fw_path/Modules"
+    local umbrella_header="$fw_path/Headers/${fw_name}.h"
+    if [[ -f "$umbrella_header" ]]; then
+        cat > "$fw_path/Modules/module.modulemap" << MODMAP
+framework module ${fw_name} {
+  umbrella header "${fw_name}.h"
+  export *
+  module * { export * }
+}
+MODMAP
+    else
+        # No umbrella header — list all headers explicitly
+        {
+            echo "framework module ${fw_name} {"
+            find "$fw_path/Headers" -name "*.h" -exec basename {} \; | sort | while read -r h; do
+                echo "  header \"$h\""
+            done
+            echo "  export *"
+            echo "}"
+        } > "$fw_path/Modules/module.modulemap"
+    fi
+
+    verbose_log "  Injected $header_count header(s) + modulemap"
 }
 
 # --- Framework Type Detection ---
@@ -796,6 +1032,11 @@ main() {
 
     # Step 3: Discover schemes
     discover_schemes
+
+    # Patch Package.swift to make all library products dynamic frameworks.
+    # This replaces the old MACH_O_TYPE=mh_dylib global override which broke
+    # internal C/ObjC dependency targets (nanopb, leveldb, GoogleUtilities, etc.).
+    patch_dynamic_libraries "$WORK_DIR/source/Package.swift"
 
     # Dry run — just show what we'd build
     if $DRY_RUN; then
