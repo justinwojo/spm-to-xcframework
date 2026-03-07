@@ -550,6 +550,176 @@ build_archive() {
     return 0
 }
 
+# Detect system framework dependencies from source code and SPM package metadata.
+# Scans target source files for #import <Framework/...> and @import Framework,
+# and checks linkedFramework entries in the package dump.
+# Arguments: source_dir dump_file product_name
+# Outputs: framework names on stdout, one per line
+detect_system_frameworks() {
+    local source_dir="$1" dump_file="$2" product="$3"
+
+    [[ -f "$dump_file" ]] || return 0
+
+    python3 - "$dump_file" "$product" "$source_dir" << 'PYEOF'
+import json, sys, os, re
+
+dump_file, product_name, source_dir = sys.argv[1:4]
+pkg = json.load(open(dump_file))
+targets = {t["name"]: t for t in pkg.get("targets", [])}
+
+frameworks = set()
+product_targets = []
+for p in pkg.get("products", []):
+    if p["name"] == product_name:
+        product_targets = p.get("targets", [])
+        break
+
+def scan_target(tname):
+    """Scan a target for linkedFramework settings and source imports."""
+    t = targets.get(tname, {})
+    if not t:
+        return
+
+    # linkedFramework from SPM linker settings
+    for s in t.get("settings", []):
+        if s.get("tool") == "linker":
+            kind = s.get("kind", {})
+            if isinstance(kind, dict):
+                fw = kind.get("linkedFramework")
+                if fw:
+                    frameworks.add(fw)
+
+    # Scan target source files for #import <Framework/...> and @import Framework
+    tpath = os.path.normpath(os.path.join(source_dir, t.get("path", "")))
+    if not os.path.isdir(tpath):
+        return
+    exclude = {"Tests", "Demo", "Example", "Examples", "Samples", "Playground"}
+    for root, dirs, files in os.walk(tpath):
+        dirs[:] = [d for d in dirs if d not in exclude]
+        for f in files:
+            if not f.endswith((".h", ".m", ".mm")):
+                continue
+            try:
+                content = open(os.path.join(root, f), "r", errors="replace").read()
+                for m in re.finditer(r'#import\s*<([A-Za-z_]+)/', content):
+                    frameworks.add(m.group(1))
+                for m in re.finditer(r'@import\s+([A-Za-z_]+)', content):
+                    frameworks.add(m.group(1))
+            except:
+                pass
+
+# Scan direct product targets and their first-level internal dependencies
+scanned = set()
+for tname in product_targets:
+    if tname not in scanned:
+        scan_target(tname)
+        scanned.add(tname)
+    # Walk first-level dependencies (same pattern as inject_objc_headers)
+    t = targets.get(tname, {})
+    for dep in t.get("dependencies", []):
+        dep_name = dep.get("byName", [None])[0] if isinstance(dep.get("byName"), list) else None
+        if dep_name and dep_name in targets and dep_name not in scanned:
+            scan_target(dep_name)
+            scanned.add(dep_name)
+
+# Remove self-references
+frameworks.discard(product_name)
+for tname in scanned:
+    frameworks.discard(tname)
+
+for fw in sorted(frameworks):
+    print(fw)
+PYEOF
+}
+
+# Promote a static archive (.a) to a dynamic framework bundle.
+#
+# Some SPM packages (especially ObjC-only ones like MBProgressHUD) produce
+# static archives even when patched to type: .dynamic. This function re-links
+# the .a into a dynamic library and wraps it in a .framework bundle.
+#
+# Arguments: static_lib product_name sdk_name min_ios archive_path
+promote_static_to_framework() {
+    local static_lib="$1" product="$2" sdk_name="$3" min_ios="$4" archive_path="$5"
+
+    local fw_dir="$archive_path/Products/Library/Frameworks/${product}.framework"
+    rm -rf "$fw_dir"
+    mkdir -p "$fw_dir"
+
+    # Determine architectures from the static library
+    local archs
+    archs=$(lipo -archs "$static_lib" 2>/dev/null)
+    if [[ -z "$archs" ]]; then
+        warn "  Failed to determine architectures from $static_lib"
+        return 1
+    fi
+
+    local min_ver_flag="-miphoneos-version-min=${min_ios}"
+    [[ "$sdk_name" == iphonesimulator ]] && min_ver_flag="-mios-simulator-version-min=${min_ios}"
+
+    dim "  Re-linking static → dynamic ($sdk_name: $archs)"
+
+    # Build linker command with architecture flags
+    local link_cmd=(
+        xcrun --sdk "$sdk_name" clang -dynamiclib
+    )
+    for a in $archs; do
+        link_cmd+=(-arch "$a")
+    done
+    link_cmd+=(
+        "$min_ver_flag"
+        -install_name "@rpath/${product}.framework/${product}"
+        -Xlinker -all_load
+        "$static_lib"
+    )
+
+    # Detect and explicitly link system frameworks the library imports
+    local detected_fws
+    detected_fws=$(detect_system_frameworks "$WORK_DIR/source" "$WORK_DIR/package-dump.json" "$product")
+    if [[ -n "$detected_fws" ]]; then
+        verbose_log "  Linking system frameworks: $(echo $detected_fws | tr '\n' ' ')"
+        while IFS= read -r fw; do
+            [[ -n "$fw" ]] && link_cmd+=(-framework "$fw")
+        done <<< "$detected_fws"
+    fi
+
+    # Safety net for any remaining unresolved symbols (e.g. indirect deps)
+    link_cmd+=(-Xlinker -undefined -Xlinker dynamic_lookup)
+    link_cmd+=(-o "$fw_dir/$product")
+
+    local link_log="$archive_path/relink.log"
+    local link_rc=0
+    "${link_cmd[@]}" > "$link_log" 2>&1 || link_rc=$?
+
+    if [[ $link_rc -ne 0 ]]; then
+        warn "  Failed to re-link static library as dynamic framework"
+        tail -5 "$link_log" | sed 's/^/    /'
+        return 1
+    fi
+
+    # Create minimal Info.plist (required for valid framework bundle)
+    cat > "$fw_dir/Info.plist" << PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>${product}</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.spm-to-xcframework.${product}</string>
+    <key>CFBundleName</key>
+    <string>${product}</string>
+    <key>CFBundlePackageType</key>
+    <string>FMWK</string>
+    <key>MinimumOSVersion</key>
+    <string>${min_ios}</string>
+</dict>
+</plist>
+PLIST
+
+    return 0
+}
+
 # Build a single product for device and simulator, create xcframework.
 # Arguments: product_name
 build_product() {
@@ -596,8 +766,73 @@ build_product() {
             simulator_fw=$(find "$sim_archive/Products" -name "${actual_name}.framework" -type d 2>/dev/null | head -1)
             warn "  Using $actual_name instead of $product"
         else
-            warn "  No frameworks found in device archive"
-            return 1
+            # No frameworks — check for static archives (.a) to promote to dynamic
+            local device_static=""
+
+            # Search by product name
+            device_static=$(find "$device_archive/Products" -name "lib${product}.a" -type f 2>/dev/null | head -1)
+
+            # Search by SPM target names from package metadata
+            if [[ -z "$device_static" ]]; then
+                while IFS= read -r tname; do
+                    [[ -z "$tname" || "$tname" == "$product" ]] && continue
+                    device_static=$(find "$device_archive/Products" -name "lib${tname}.a" -type f 2>/dev/null | head -1)
+                    [[ -n "$device_static" ]] && break
+                done < <(python3 -c "
+import json, sys
+pkg = json.load(open(sys.argv[1]))
+for p in pkg.get('products', []):
+    if p['name'] == sys.argv[2]:
+        for t in p.get('targets', []):
+            print(t)
+" "$WORK_DIR/package-dump.json" "$product" 2>/dev/null)
+            fi
+
+            # Last resort: any .a, but fail if ambiguous
+            if [[ -z "$device_static" ]]; then
+                local found_a=()
+                while IFS= read -r afile; do
+                    [[ -n "$afile" ]] && found_a+=("$afile")
+                done < <(find "$device_archive/Products" -name "*.a" -type f 2>/dev/null)
+
+                if [[ ${#found_a[@]} -eq 1 ]]; then
+                    device_static="${found_a[0]}"
+                elif [[ ${#found_a[@]} -gt 1 ]]; then
+                    warn "  Multiple static libraries found — cannot determine which to promote:"
+                    printf '    %s\n' "${found_a[@]}"
+                    return 1
+                fi
+            fi
+
+            if [[ -n "$device_static" ]]; then
+                warn "  Static library found — promoting to dynamic framework"
+                # Find matching simulator static library by same filename
+                local sim_static
+                sim_static=$(find "$sim_archive/Products" -name "$(basename "$device_static")" -type f 2>/dev/null | head -1)
+
+                if [[ -z "$sim_static" ]]; then
+                    warn "  No matching static library found in simulator archive"
+                    return 1
+                fi
+
+                if ! promote_static_to_framework "$device_static" "$product" "iphoneos" "$MIN_IOS" "$device_archive"; then
+                    return 1
+                fi
+                if ! promote_static_to_framework "$sim_static" "$product" "iphonesimulator" "$MIN_IOS" "$sim_archive"; then
+                    return 1
+                fi
+
+                device_fw=$(find "$device_archive/Products" -name "${product}.framework" -type d 2>/dev/null | head -1)
+                simulator_fw=$(find "$sim_archive/Products" -name "${product}.framework" -type d 2>/dev/null | head -1)
+
+                if [[ -z "$device_fw" || -z "$simulator_fw" ]]; then
+                    warn "  Framework promotion from static library failed"
+                    return 1
+                fi
+            else
+                warn "  No frameworks or static libraries found in device archive"
+                return 1
+            fi
         fi
     fi
 

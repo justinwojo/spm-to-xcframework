@@ -55,6 +55,9 @@ spm-to-xcframework ./MyPackage -o ./output
 # Build Stripe with all its sub-frameworks
 spm-to-xcframework https://github.com/stripe/stripe-ios.git -v 25.6.2
 
+# Build an ObjC library with a static SPM product (auto-promoted to dynamic)
+spm-to-xcframework https://github.com/jdg/MBProgressHUD.git -v 1.2.0
+
 # See what would be built without building
 spm-to-xcframework https://github.com/kean/Nuke.git -v 12.8.0 --dry-run
 ```
@@ -64,17 +67,18 @@ spm-to-xcframework https://github.com/kean/Nuke.git -v 12.8.0 --dry-run
 1. **Clones** the package at the specified tag (or copies a local path)
 2. **Discovers** library products via `swift package dump-package` — works for Swift, ObjC, and mixed-language targets
 3. **Resolves** build schemes via `xcodebuild -list` — handles packages with `.xcodeproj` (platform-suffixed schemes like `Alamofire iOS`) and pure SPM packages (auto-generated schemes)
-4. **Builds** device and simulator archives with:
+4. **Patches** `Package.swift` to set all library products to `type: .dynamic` — only products become dynamic, internal dependency targets keep their natural build type
+5. **Builds** device and simulator archives in parallel with:
    - `BUILD_LIBRARY_FOR_DISTRIBUTION=YES` — ABI stability + swiftinterface emission
-   - `MACH_O_TYPE=mh_dylib` — dynamic framework (required for P/Invoke, dlopen, etc.)
    - `SKIP_INSTALL=NO` — framework included in archive products
-5. **Injects** `.swiftmodule`/`.swiftinterface` from DerivedData when missing from the framework bundle (common with SPM dynamic libraries)
-6. **Assembles** xcframeworks via `xcodebuild -create-xcframework`
-7. **Detects** framework type (Swift, ObjC, or Mixed) based on content:
+6. **Promotes** static archives to dynamic frameworks when needed — some ObjC-only packages (e.g. MBProgressHUD) produce `.a` files even when patched to `.dynamic`. The tool detects this, re-links the static archive as a dynamic library via `clang -dynamiclib`, infers system framework dependencies from source imports, and wraps the result in a `.framework` bundle
+7. **Injects** `.swiftmodule`/`.swiftinterface` from DerivedData when missing from the framework bundle (common with SPM dynamic libraries)
+8. **Assembles** xcframeworks via `xcodebuild -create-xcframework`
+9. **Detects** framework type (Swift, ObjC, or Mixed) based on content:
    - **Swift**: Has `.swiftinterface` files
    - **ObjC**: Has public headers + modulemap, no Swift interfaces
    - **Mixed**: Has both Swift interfaces and ObjC headers
-8. **Validates** output with type-aware checks:
+10. **Validates** output with type-aware checks:
    - Swift/Mixed: warns if `.swiftinterface` files are missing
    - ObjC/Mixed: warns if public headers or modulemap are missing
    - All types: warns about static libraries, missing slices
