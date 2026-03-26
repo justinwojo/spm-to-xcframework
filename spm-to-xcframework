@@ -439,6 +439,7 @@ run_xcodebuild_archive() {
         IPHONEOS_DEPLOYMENT_TARGET="$MIN_IOS"
         GCC_TREAT_WARNINGS_AS_ERRORS=NO
         SWIFT_TREAT_WARNINGS_AS_ERRORS=NO
+        OTHER_SWIFT_FLAGS=-no-verify-emitted-module-interface
         -skipPackagePluginValidation
         -skipMacroValidation
     )
