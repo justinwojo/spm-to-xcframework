@@ -12,7 +12,8 @@
 #   spm-to-xcframework https://github.com/Alamofire/Alamofire.git -v 5.10.2
 #   spm-to-xcframework https://github.com/kean/Nuke.git -v 12.8.0 -o ./output
 #   spm-to-xcframework ./local-package -o ./output --product MyLib
-#   spm-to-xcframework https://github.com/stripe/stripe-ios.git -v 25.6.2 --include-deps
+#   spm-to-xcframework https://github.com/stripe/stripe-ios.git -v 25.6.2 --product StripeCore --product StripePayments
+#   spm-to-xcframework https://github.com/nicklockwood/iCarousel.git -v 1.8.3 --binary
 
 set -euo pipefail
 
@@ -29,9 +30,11 @@ NC='\033[0m'
 PACKAGE_SOURCE=""        # URL or local path
 VERSION=""               # Tag/version
 OUTPUT_DIR=""            # Output directory (default: ./xcframeworks)
-PRODUCT_FILTER=""        # Build only this product (default: all)
+PRODUCT_FILTERS=()       # Build only these products (default: all)
+REVISION=""              # Expected commit SHA for tag verification
 MIN_IOS="15.0"           # Minimum iOS deployment target
 INCLUDE_DEPS=false       # Also output dependency xcframeworks
+BINARY_MODE=false        # Download pre-built xcframeworks from binary targets
 VERBOSE=false            # Show full build output
 DRY_RUN=false            # Show what would be built
 WORK_DIR=""              # Temp working directory (set in main)
@@ -91,7 +94,9 @@ ARGUMENTS
 OPTIONS
     -v, --version <ver>     Git tag to check out (required for remote URLs)
     -o, --output <dir>      Output directory (default: ./xcframeworks)
-    -p, --product <name>    Build only this product (default: all library products)
+    -p, --product <name>    Build only this product (repeatable for multiple products)
+        --binary            Download pre-built xcframeworks from binary SPM targets
+        --revision <sha>    Verify git tag resolves to this commit SHA before building
         --min-ios <ver>     Minimum iOS deployment target (default: 15.0)
         --include-deps      Also build xcframeworks for transitive dependencies
         --verbose           Show full build output
@@ -109,8 +114,16 @@ EXAMPLES
     # Build from a local package (Swift, ObjC, or mixed)
     spm-to-xcframework ./MyPackage -o ./output
 
-    # Build Stripe with all its sub-frameworks
-    spm-to-xcframework https://github.com/stripe/stripe-ios.git -v 25.6.2
+    # Build multiple specific products from Stripe
+    spm-to-xcframework https://github.com/stripe/stripe-ios.git -v 25.6.2 \
+        --product StripeCore --product StripePayments
+
+    # Download pre-built binary xcframeworks
+    spm-to-xcframework https://github.com/nicklockwood/iCarousel.git -v 1.8.3 --binary
+
+    # Verify tag SHA before building (supply-chain security)
+    spm-to-xcframework https://github.com/kean/Nuke.git -v 12.8.0 \
+        --revision abc123def456...
 
 OUTPUT
     Creates one .xcframework per library product in the output directory.
@@ -141,8 +154,10 @@ parse_args() {
         case $1 in
             -v|--version) require_value "$@"; VERSION="$2"; shift 2 ;;
             -o|--output) require_value "$@"; OUTPUT_DIR="$2"; shift 2 ;;
-            -p|--product) require_value "$@"; PRODUCT_FILTER="$2"; shift 2 ;;
+            -p|--product) require_value "$@"; PRODUCT_FILTERS+=("$2"); shift 2 ;;
             --min-ios) require_value "$@"; MIN_IOS="$2"; shift 2 ;;
+            --revision) require_value "$@"; REVISION="$2"; shift 2 ;;
+            --binary) BINARY_MODE=true; shift ;;
             --include-deps) INCLUDE_DEPS=true; shift ;;
             --verbose) VERBOSE=true; shift ;;
             --dry-run) DRY_RUN=true; shift ;;
@@ -175,6 +190,62 @@ is_remote() {
     [[ "$PACKAGE_SOURCE" == http://* || "$PACKAGE_SOURCE" == https://* || "$PACKAGE_SOURCE" == git@* || "$PACKAGE_SOURCE" == ssh://* ]]
 }
 
+# Normalize VERSION to the actual tag name on the remote.
+# Handles the common case where the user passes "1.2.3" but the tag is "v1.2.3".
+# Mutates the global VERSION in place so all downstream code uses the resolved tag.
+normalize_version_tag() {
+    [[ -n "$VERSION" ]] || return 0
+    is_remote || return 0
+
+    # Already matches a tag — nothing to do
+    if git ls-remote --tags "$PACKAGE_SOURCE" "$VERSION" "refs/tags/$VERSION" 2>/dev/null | grep -q .; then
+        return 0
+    fi
+
+    # Try with 'v' prefix
+    if git ls-remote --tags "$PACKAGE_SOURCE" "v$VERSION" "refs/tags/v$VERSION" 2>/dev/null | grep -q .; then
+        warn "Tag '$VERSION' not found, using 'v$VERSION'"
+        VERSION="v$VERSION"
+        return 0
+    fi
+
+    # No match either way — leave VERSION as-is and let downstream fail with a clear error
+}
+
+# Verify that a git tag resolves to the expected commit SHA.
+# Uses git ls-remote (no clone needed) and handles annotated tags via ^{}.
+verify_revision() {
+    local url="$1" tag="$2" expected_sha="$3"
+
+    # Validate SHA format (full 40-character hex)
+    if ! [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]]; then
+        die "--revision requires a full 40-character SHA (got: $expected_sha)"
+    fi
+
+    info "Verifying tag '$tag' resolves to $expected_sha..."
+
+    local ls_output
+    ls_output=$(git ls-remote --tags "$url" "refs/tags/$tag" "refs/tags/${tag}^{}" 2>/dev/null) \
+        || die "Failed to query remote tags from $url"
+
+    if [[ -z "$ls_output" ]]; then
+        die "Tag '$tag' not found in $url"
+    fi
+
+    # Prefer the dereferenced (^{}) SHA for annotated tags; fall back to direct
+    local actual_sha
+    actual_sha=$(echo "$ls_output" | grep '\^{}' | awk '{print $1}')
+    if [[ -z "$actual_sha" ]]; then
+        actual_sha=$(echo "$ls_output" | head -1 | awk '{print $1}')
+    fi
+
+    if [[ "$actual_sha" != "$expected_sha" ]]; then
+        die "Revision mismatch for tag '$tag':\n  Expected: $expected_sha\n  Actual:   $actual_sha\nThe tag may have been force-pushed. Aborting for safety."
+    fi
+
+    success "  Revision verified ✓"
+}
+
 # Clone or copy the package source into $WORK_DIR/source.
 fetch_source() {
     local source_dir="$WORK_DIR/source"
@@ -182,20 +253,13 @@ fetch_source() {
     if is_remote; then
         [[ -n "$VERSION" ]] || die "Version (--version) is required for remote package URLs."
 
-        info "Cloning $PACKAGE_SOURCE @ $VERSION"
-        local clone_args=(--depth 1)
-
-        # Try the version as-is first, then with 'v' prefix
-        if git ls-remote --tags "$PACKAGE_SOURCE" "$VERSION" "refs/tags/$VERSION" 2>/dev/null | grep -q .; then
-            clone_args+=(--branch "$VERSION")
-        elif git ls-remote --tags "$PACKAGE_SOURCE" "v$VERSION" "refs/tags/v$VERSION" 2>/dev/null | grep -q .; then
-            warn "Tag '$VERSION' not found, using 'v$VERSION'"
-            VERSION="v$VERSION"
-            clone_args+=(--branch "$VERSION")
-        else
-            # Fall back to trying the version directly — git clone will error if invalid
-            clone_args+=(--branch "$VERSION")
+        # Verify revision before fetching any source
+        if [[ -n "$REVISION" ]]; then
+            verify_revision "$PACKAGE_SOURCE" "$VERSION" "$REVISION"
         fi
+
+        info "Cloning $PACKAGE_SOURCE @ $VERSION"
+        local clone_args=(--depth 1 --branch "$VERSION")
 
         if ! git clone "${clone_args[@]}" "$PACKAGE_SOURCE" "$source_dir" 2>&1 | tail -3; then
             die "Failed to clone $PACKAGE_SOURCE at version $VERSION"
@@ -220,6 +284,131 @@ fetch_source() {
         HAS_XCODEPROJ=true
         verbose_log "Package has .xcodeproj — will use Xcode project schemes"
     fi
+}
+
+# Download pre-built xcframeworks from SPM binary targets.
+# Creates a temporary package that depends on the target repo, resolves
+# dependencies, and copies any xcframeworks found in .build/artifacts/.
+fetch_binary_artifacts() {
+    local binary_dir="$WORK_DIR/binary-resolve"
+    mkdir -p "$binary_dir"
+
+    # Derive a package name from the URL
+    local pkg_name
+    pkg_name=$(basename "$PACKAGE_SOURCE" .git | tr '-' '_')
+
+    info "Resolving binary artifacts from $PACKAGE_SOURCE @ $VERSION..."
+
+    # Create a temporary Package.swift that depends on the target repo
+    cat > "$binary_dir/Package.swift" << PKGEOF
+// swift-tools-version:5.7
+import PackageDescription
+
+let package = Package(
+    name: "binary-resolver",
+    platforms: [.iOS(.v15)],
+    dependencies: [
+        .package(url: "$PACKAGE_SOURCE", exact: "$VERSION"),
+    ],
+    targets: [
+        .target(name: "Dummy", path: "Sources"),
+    ]
+)
+PKGEOF
+
+    # Create a minimal source file so the package is valid
+    mkdir -p "$binary_dir/Sources"
+    echo "// placeholder" > "$binary_dir/Sources/Dummy.swift"
+
+    # Resolve dependencies — this downloads binary artifacts
+    info "  Running swift package resolve..."
+    if ! (cd "$binary_dir" && swift package resolve 2>&1 | tail -5); then
+        die "Failed to resolve binary package dependencies"
+    fi
+
+    # Find xcframeworks in .build/artifacts/
+    local found_xcfws=()
+    while IFS= read -r xcfw; do
+        [[ -n "$xcfw" ]] && found_xcfws+=("$xcfw")
+    done < <(find "$binary_dir/.build/artifacts" -name "*.xcframework" -type d 2>/dev/null)
+
+    if [[ ${#found_xcfws[@]} -eq 0 ]]; then
+        die "No xcframeworks found in resolved artifacts. Is this a binary-target package?"
+    fi
+
+    # Collect available artifact names for filter validation
+    local available_names=()
+    for xcfw in "${found_xcfws[@]}"; do
+        available_names+=("$(basename "$xcfw" .xcframework)")
+    done
+
+    # Verify every requested --product exists in artifacts
+    if [[ ${#PRODUCT_FILTERS[@]} -gt 0 ]]; then
+        local missing=()
+        for pf in "${PRODUCT_FILTERS[@]}"; do
+            local found=false
+            for an in "${available_names[@]}"; do
+                [[ "$an" == "$pf" ]] && { found=true; break; }
+            done
+            $found || missing+=("$pf")
+        done
+        if [[ ${#missing[@]} -gt 0 ]]; then
+            die "Requested product(s) not found in binary artifacts: ${missing[*]}\n  Available: ${available_names[*]}"
+        fi
+    fi
+
+    # Build the filtered list of names to report and copy
+    local filtered_names=()
+    for an in "${available_names[@]}"; do
+        if [[ ${#PRODUCT_FILTERS[@]} -gt 0 ]]; then
+            local matched=false
+            for pf in "${PRODUCT_FILTERS[@]}"; do
+                [[ "$an" == "$pf" ]] && { matched=true; break; }
+            done
+            $matched || continue
+        fi
+        filtered_names+=("$an")
+    done
+
+    bold "Found ${#filtered_names[@]} binary xcframework(s):"
+    for an in "${filtered_names[@]}"; do
+        echo "  - ${an}.xcframework"
+    done
+
+    # Dry run — report what was found but skip copying
+    if $DRY_RUN; then
+        echo ""
+        bold "Dry run — would copy to: $OUTPUT_DIR"
+        return 0
+    fi
+
+    mkdir -p "$OUTPUT_DIR"
+    for xcfw in "${found_xcfws[@]}"; do
+        local name
+        name=$(basename "$xcfw")
+        local product_name="${name%.xcframework}"
+
+        # Apply product filter if specified
+        if [[ ${#PRODUCT_FILTERS[@]} -gt 0 ]]; then
+            local matched=false
+            for pf in "${PRODUCT_FILTERS[@]}"; do
+                [[ "$product_name" == "$pf" ]] && { matched=true; break; }
+            done
+            if ! $matched; then
+                verbose_log "  Skipping $product_name (not in filter list)"
+                continue
+            fi
+        fi
+
+        echo "  - $name"
+        rm -rf "$OUTPUT_DIR/$name"
+        cp -R "$xcfw" "$OUTPUT_DIR/$name"
+
+        # Validate the copied xcframework
+        detect_framework_type "$OUTPUT_DIR/$name"
+        success "  $name ready [$FW_TYPE]"
+        BUILT=$((BUILT + 1))
+    done
 }
 
 # Discover library products from Package.swift.
@@ -249,9 +438,13 @@ discover_products() {
         [[ -n "$product_name" ]] || continue
 
         # Apply product filter if specified
-        if [[ -n "$PRODUCT_FILTER" ]]; then
-            if [[ "$product_name" != "$PRODUCT_FILTER" ]]; then
-                verbose_log "  Skipping product $product_name (filter: $PRODUCT_FILTER)"
+        if [[ ${#PRODUCT_FILTERS[@]} -gt 0 ]]; then
+            local matched=false
+            for pf in "${PRODUCT_FILTERS[@]}"; do
+                [[ "$product_name" == "$pf" ]] && { matched=true; break; }
+            done
+            if ! $matched; then
+                verbose_log "  Skipping product $product_name (not in filter list)"
                 continue
             fi
         fi
@@ -268,10 +461,25 @@ for prod in pkg.get('products', []):
 " 2>/dev/null)
 
     if [[ ${#PRODUCTS[@]} -eq 0 ]]; then
-        if [[ -n "$PRODUCT_FILTER" ]]; then
-            die "No library product matching '$PRODUCT_FILTER' found in package"
+        if [[ ${#PRODUCT_FILTERS[@]} -gt 0 ]]; then
+            die "No library products matching filter (${PRODUCT_FILTERS[*]}) found in package"
         else
             die "No library products found in Package.swift"
+        fi
+    fi
+
+    # Verify every requested --product was found
+    if [[ ${#PRODUCT_FILTERS[@]} -gt 0 ]]; then
+        local missing=()
+        for pf in "${PRODUCT_FILTERS[@]}"; do
+            local found=false
+            for p in "${PRODUCTS[@]}"; do
+                [[ "$p" == "$pf" ]] && { found=true; break; }
+            done
+            $found || missing+=("$pf")
+        done
+        if [[ ${#missing[@]} -gt 0 ]]; then
+            die "Requested product(s) not found in package: ${missing[*]}"
         fi
     fi
 
@@ -1259,6 +1467,27 @@ main() {
     # Create output directory
     mkdir -p "$OUTPUT_DIR"
     OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)  # Absolutize
+
+    # Normalize version tag once (handles v-prefix fallback) before any code uses VERSION
+    normalize_version_tag
+
+    # Binary mode — download pre-built xcframeworks and exit
+    if $BINARY_MODE; then
+        is_remote || die "--binary requires a remote package URL"
+        [[ -n "$VERSION" ]] || die "--binary requires --version"
+        if [[ -n "$REVISION" ]]; then
+            verify_revision "$PACKAGE_SOURCE" "$VERSION" "$REVISION"
+        fi
+
+        fetch_binary_artifacts
+
+        echo ""
+        bold "=== Summary ==="
+        if [[ $BUILT -gt 0 ]]; then success "  Copied: $BUILT"; fi
+        bold "Output: $OUTPUT_DIR"
+        echo ""
+        exit 0
+    fi
 
     # Step 1: Fetch source
     fetch_source
