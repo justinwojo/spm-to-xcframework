@@ -28,7 +28,8 @@ NC='\033[0m'
 
 # --- Globals ---
 PACKAGE_SOURCE=""        # URL or local path
-VERSION=""               # Tag/version
+VERSION=""               # Tag/version (may be rewritten by normalize_version_tag, e.g. "7.6.2" → "v7.6.2")
+USER_VERSION=""          # User-supplied --version before normalization — SPM's `exact:` requires a bare semver
 OUTPUT_DIR=""            # Output directory (default: ./xcframeworks)
 PRODUCT_FILTERS=()       # Build only these products (default: all)
 TARGET_FILTERS=()        # Build SPM targets that aren't exposed as library products (escape hatch)
@@ -315,6 +316,14 @@ fetch_binary_artifacts() {
 
     info "Resolving binary artifacts from $PACKAGE_SOURCE @ $VERSION..."
 
+    # SPM's `exact:` field requires a bare semver (e.g. "7.6.2"), but --version accepts any
+    # git tag — including v-prefixed forms either supplied directly ("v7.6.2") or rewritten
+    # by normalize_version_tag ("7.6.2" → "v7.6.2"). Start from the user-supplied value so
+    # normalization's git-tag rewrite doesn't leak in, then strip a leading "v" so an explicit
+    # "v7.6.2" input also parses. SPM's version matching handles v-prefix fallback internally
+    # when resolving the bare semver back to the real git tag.
+    local exact_version="${USER_VERSION#v}"
+
     # Create a temporary Package.swift that depends on the target repo
     cat > "$binary_dir/Package.swift" << PKGEOF
 // swift-tools-version:5.7
@@ -324,7 +333,7 @@ let package = Package(
     name: "binary-resolver",
     platforms: [.iOS(.v15)],
     dependencies: [
-        .package(url: "$PACKAGE_SOURCE", exact: "$VERSION"),
+        .package(url: "$PACKAGE_SOURCE", exact: "$exact_version"),
     ],
     targets: [
         .target(name: "Dummy", path: "Sources"),
@@ -595,13 +604,16 @@ discover_schemes() {
     info "Discovering build schemes..."
     local list_file="$WORK_DIR/xcodebuild-list.json"
 
+    # Initialize before any early returns so callers can safely read ${#SCHEME_LIST[@]}
+    # under `set -u` even when xcodebuild -list fails.
+    SCHEME_LIST=()
+
     (cd "$source_dir" && xcodebuild -list -json > "$list_file" 2>/dev/null) || {
         warn "xcodebuild -list failed; will use product names as scheme names"
         return 0
     }
 
     # Parse schemes from either workspace or project format
-    SCHEME_LIST=()
     while IFS= read -r scheme; do
         [[ -n "$scheme" ]] && SCHEME_LIST+=("$scheme")
     done < <(python3 -c "
@@ -1593,6 +1605,11 @@ main() {
     # Create output directory
     mkdir -p "$OUTPUT_DIR"
     OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)  # Absolutize
+
+    # Preserve the user-supplied version before normalization — binary mode needs a bare
+    # semver for SPM's `exact:` field, while normalize_version_tag may rewrite VERSION to a
+    # v-prefixed git tag (e.g. "7.6.2" → "v7.6.2") which SPM's semver parser rejects.
+    USER_VERSION="$VERSION"
 
     # Normalize version tag once (handles v-prefix fallback) before any code uses VERSION
     normalize_version_tag
