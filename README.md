@@ -14,11 +14,14 @@ git clone https://github.com/justinwojo/spm-to-xcframework.git
 export PATH="$PWD/spm-to-xcframework:$PATH"
 ```
 
-Or just run it directly — it's a single self-contained script with no dependencies beyond Xcode.
+Or just run it directly — it's a single self-contained script with no dependencies beyond Xcode and the Python 3 that ships with macOS.
+
+`spm-to-xcframework` is implemented in **Python 3.9+** and uses only the Python standard library. No `pip install` step.
 
 ### Requirements
 
-- macOS with Xcode installed (provides `xcodebuild`, `swift`, `python3`)
+- macOS with Xcode installed (provides `xcodebuild`, `swift`)
+- `python3` (system Python on macOS is sufficient — Python 3.9 or later)
 
 ## Usage
 
@@ -87,8 +90,8 @@ spm-to-xcframework https://github.com/kean/Nuke.git -v 12.8.0 --dry-run
 2. **Verifies revision** if `--revision` is provided — runs `git ls-remote` before fetching any source, handles annotated tags, and fails with a clear mismatch error.
 3. **Clones** the package at the resolved tag (or copies a local path).
 4. **Discovers** library products via `swift package dump-package` — works for Swift, ObjC, and mixed-language targets. Additional SPM targets passed via `--target` are verified against the package's `targets[]` array and queued alongside the products.
-5. **Resolves** build schemes via `xcodebuild -list` — handles packages with `.xcodeproj` (platform-suffixed schemes like `Alamofire iOS`) and pure SPM packages (auto-generated schemes).
-6. **Patches** `Package.swift` to set all library products to `type: .dynamic` — only products become dynamic, internal dependency targets keep their natural build type.
+5. **Resolves** build schemes via `xcodebuild -list` against the staged copy. Sibling `.xcodeproj`/`.xcworkspace` files are pruned during staging so xcodebuild always picks SPM-generated schemes — no special handling needed for packages that ship multiple Xcode projects (e.g. GRDB's `GRDB.xcodeproj` + `GRDBCustom.xcodeproj`).
+6. **Patches** `Package.swift` to set the requested library products to `type: .dynamic`. Only the specific products you asked for are touched — internal dependency targets and `.systemLibrary(...)` products (e.g. GRDB's `GRDBSQLite`) are left alone, and the round-trip validator runs `swift package dump-package` against the edited manifest to confirm every requested edit actually took effect.
 7. **Builds** device and simulator archives in parallel via `xcodebuild archive`, with:
    - `BUILD_LIBRARY_FOR_DISTRIBUTION=YES` — ABI stability + swiftinterface emission
    - `SKIP_INSTALL=NO` — framework included in archive products
@@ -100,10 +103,13 @@ spm-to-xcframework https://github.com/kean/Nuke.git -v 12.8.0 --dry-run
     - **Swift**: Has `.swiftinterface` files
     - **ObjC**: Has public headers + modulemap, no Swift interfaces
     - **Mixed**: Has both Swift interfaces and ObjC headers
-13. **Validates** output with type-aware checks:
-    - Swift/Mixed: warns if `.swiftinterface` files are missing
-    - ObjC/Mixed: warns if public headers or modulemap are missing
-    - All types: warns about static libraries, missing slices
+13. **Verifies** every produced xcframework with strict per-unit checks. The build only reports success when all of these pass for every output:
+    - The `Info.plist` parses through `plistlib` (catches AppleDouble `__MACOSX` ghost xcframeworks).
+    - At least 2 slices (device + simulator) appear in `AvailableLibraries`.
+    - Every slice's binary is a dynamically-linked Mach-O (no static archives masquerading as frameworks).
+    - Swift/Mixed frameworks ship at least one `.swiftinterface` file.
+    - ObjC/Mixed frameworks ship public headers under `Headers/` and a `module.modulemap`.
+    - Failures are reported per-unit; the tool exits non-zero with a summary that names every failing output.
 
 ### Binary mode (`--binary`)
 
@@ -112,60 +118,60 @@ Some libraries (e.g. BlinkID, Firebase) distribute pre-built xcframeworks throug
 1. Normalizes the tag name for `v`-prefixed repositories, and verifies `--revision` if provided.
 2. Creates a temporary `Package.swift` that depends on the target repo.
 3. Runs `swift package resolve` to download binary artifacts.
-4. Locates xcframeworks in `.build/artifacts/`.
+4. Locates xcframeworks in `.build/artifacts/`, pruning `__MACOSX` AppleDouble ghosts that some vendor zips ship alongside the real artifacts (BlinkID 7.6.x is the canonical example).
 5. Validates `--product` filters against the resolved artifact names.
 6. Reports the filtered set that matches the request.
-7. Copies the matching xcframeworks to the output directory and validates them.
+7. Copies the matching xcframeworks to the output directory and runs the same strict per-unit verify pass that source mode uses.
 
 Product filtering (`--product`), revision verification (`--revision`), and dry-run all work in binary mode. In binary dry-run mode, the tool still resolves artifacts so it can validate the requested products and show the exact filtered set, but it does not copy anything to the output directory.
 
 ### `--target` escape hatch
 
-Some packages declare important modules as `.target(...)` in `Package.swift` without exposing them as `.library(...)` products. stripe-ios is the canonical example: `StripeCore`, `StripeUICore`, `Stripe3DS2`, and `StripeCameraCore` are all plain targets, so `--product StripeCore` fails with "No library products matching filter". The `--target` flag bypasses the library-product filter and builds the named SPM target directly.
+Some packages declare important modules as `.target(...)` in `Package.swift` without exposing them as `.library(...)` products. stripe-ios is the canonical example: `StripeCore`, `StripeUICore`, `Stripe3DS2`, and `StripeCameraCore` are all plain targets, so `--product StripeCore` fails with "No library products matching filter". The `--target` flag tells the tool to inject a synthetic `.library(name: "<name>", type: .dynamic, targets: ["<name>"])` entry into `Package.swift` for each requested target, then build the synthesized product like any other library product.
 
-Because SPM's `.target(...)` has no dynamic-type to patch, target builds fall back to the old `MACH_O_TYPE=mh_dylib` global override — i.e. every link step in the build produces a dynamic library. **This is unsafe for packages with internal C/ObjC dependency targets.** Firebase (nanopb, leveldb, GoogleUtilities), anything bundling static helper libs, and similar packages will fail to link when `--target` is used, because their internal targets are designed to produce object files or static archives and the forced-dynamic linker rejects them.
+Because the synthetic library is a real `.library(...)` declaration with `type: .dynamic`, only the requested target is forced dynamic — internal C/ObjC dependency targets keep their natural build type. This makes `--target` safe for packages like Firebase that bundle static helper libs (nanopb, leveldb, GoogleUtilities) inside their target graph. The tool refuses to synthesize a library for `.binaryTarget(...)` targets, so accidental misuse fails with a clear planner error.
 
-Use `--target` only for packages whose targets are truly standalone dynamic-compatible modules. Stripe fits this profile; Firebase does not. When in doubt, build with `--product` first — `--target` is a last resort for modules that SPM exposes no other way to reach.
+Note: the older `MACH_O_TYPE=mh_dylib` global override is gone. Synthetic libraries replaced it because the global override broke any package whose internal targets produced object files or static archives.
 
-### Scheme fallback
+### Always-clean build tree
 
-When a package has both a `.xcodeproj` and `Package.swift`, some SPM-only products may not have matching Xcode schemes. The tool detects "does not contain a scheme" errors and automatically retries with the `.xcodeproj` moved aside, falling back to SPM-generated schemes.
+Every source-mode build runs against a freshly-staged copy of the package with `.git`, `.build`, `DerivedData`, `node_modules`, and any sibling `.xcodeproj`/`.xcworkspace` files pruned. Pruning the Xcode projects forces `xcodebuild` to use SPM-generated schemes, which sidesteps both the "multiple projects with the current extension" error (GRDB ships `GRDB.xcodeproj` + `GRDBCustom.xcodeproj`) and the "does not contain a scheme" wording mismatch that the legacy bash had to grep around.
 
 ## Output
 
 ```
 $ spm-to-xcframework https://github.com/Alamofire/Alamofire.git -v 5.10.2 -o ./output
 
-spm-to-xcframework
-
 Cloning https://github.com/Alamofire/Alamofire.git @ 5.10.2
-Resolving package...
+Staging package into clean working tree...
+Inspecting package...
+Planning source build...
 
-Found 2 library product(s):
-  - Alamofire
-  - AlamofireDynamic
+Plan for Alamofire @ 5.10.2  (source mode)
+  Build units:
+    [1] Alamofire         scheme=Alamofire         language=Swift  → Alamofire.xcframework
+    [2] AlamofireDynamic  scheme=AlamofireDynamic  language=Swift  → AlamofireDynamic.xcframework
+  Package.swift edits:
+    - force_dynamic: Alamofire → targets=[Alamofire]
 
-Discovering build schemes...
-
-Building xcframeworks...
-
-[1/2] Alamofire
-  Using scheme: Alamofire iOS
+Preparing Package.swift edits...
+  Prepare validated 1 edit(s) ✓
+Executing 2 build unit(s)...
   Building Alamofire — device (arm64) + simulator (parallel)...
-  Creating Alamofire.xcframework...
-  Alamofire.xcframework ready [Swift]
-
-[2/2] AlamofireDynamic
   ...
+  Alamofire.xcframework ready [Swift]
+  Building AlamofireDynamic — device (arm64) + simulator (parallel)...
+  ...
+  AlamofireDynamic.xcframework ready [Swift]
 
 === Summary ===
-  Built: 2
+  Built: 2    Verified: 2    Failed: 0
 
 Output: /path/to/output
 
 Xcframeworks:
-  Alamofire.xcframework (16M) [Swift]
-  AlamofireDynamic.xcframework (16M) [Swift]
+  Alamofire.xcframework         (16.0M) [Swift]
+  AlamofireDynamic.xcframework  (16.0M) [Swift]
 ```
 
 ## Using with Swift.Bindings
