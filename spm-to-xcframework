@@ -12,7 +12,7 @@
 #   spm-to-xcframework https://github.com/Alamofire/Alamofire.git -v 5.10.2
 #   spm-to-xcframework https://github.com/kean/Nuke.git -v 12.8.0 -o ./output
 #   spm-to-xcframework ./local-package -o ./output --product MyLib
-#   spm-to-xcframework https://github.com/stripe/stripe-ios.git -v 25.6.2 --product StripeCore --product StripePayments
+#   spm-to-xcframework https://github.com/stripe/stripe-ios.git -v 25.6.2 --product Stripe --target StripeCore --target StripeUICore
 #   spm-to-xcframework https://github.com/nicklockwood/iCarousel.git -v 1.8.3 --binary
 
 set -euo pipefail
@@ -31,6 +31,8 @@ PACKAGE_SOURCE=""        # URL or local path
 VERSION=""               # Tag/version
 OUTPUT_DIR=""            # Output directory (default: ./xcframeworks)
 PRODUCT_FILTERS=()       # Build only these products (default: all)
+TARGET_FILTERS=()        # Build SPM targets that aren't exposed as library products (escape hatch)
+TARGET_ENTRIES=()        # Names from TARGET_FILTERS that passed verification (used by build_product)
 REVISION=""              # Expected commit SHA for tag verification
 MIN_IOS="15.0"           # Minimum iOS deployment target
 INCLUDE_DEPS=false       # Also output dependency xcframeworks
@@ -95,6 +97,14 @@ OPTIONS
     -v, --version <ver>     Git tag to check out (required for remote URLs)
     -o, --output <dir>      Output directory (default: ./xcframeworks)
     -p, --product <name>    Build only this product (repeatable for multiple products)
+    -t, --target <name>     Build an SPM target that isn't exposed as a .library() product
+                            (repeatable). Escape hatch for packages like stripe-ios that ship
+                            important modules only as .target(...). WARNING: this enables
+                            MACH_O_TYPE=mh_dylib for the build, which forces ALL link steps to
+                            produce dynamic libs. Do NOT use with packages that have internal
+                            C/ObjC dependency targets (Firebase/nanopb/leveldb/GoogleUtilities,
+                            etc.) — those targets will fail to link. Use only for packages
+                            whose targets are truly standalone dynamic modules (Stripe is fine).
         --binary            Download pre-built xcframeworks from binary SPM targets
         --revision <sha>    Verify git tag resolves to this commit SHA before building
         --min-ios <ver>     Minimum iOS deployment target (default: 15.0)
@@ -116,7 +126,12 @@ EXAMPLES
 
     # Build multiple specific products from Stripe
     spm-to-xcframework https://github.com/stripe/stripe-ios.git -v 25.6.2 \
-        --product StripeCore --product StripePayments
+        --product Stripe --product StripePayments
+
+    # Mix products and internal-only targets (Stripe ships StripeCore/StripeUICore as
+    # .target(...) rather than .library(...), so --target is the only way to build them)
+    spm-to-xcframework https://github.com/stripe/stripe-ios.git -v 25.6.2 \
+        --product Stripe --target StripeCore --target StripeUICore
 
     # Download pre-built binary xcframeworks
     spm-to-xcframework https://github.com/nicklockwood/iCarousel.git -v 1.8.3 --binary
@@ -155,6 +170,7 @@ parse_args() {
             -v|--version) require_value "$@"; VERSION="$2"; shift 2 ;;
             -o|--output) require_value "$@"; OUTPUT_DIR="$2"; shift 2 ;;
             -p|--product) require_value "$@"; PRODUCT_FILTERS+=("$2"); shift 2 ;;
+            -t|--target) require_value "$@"; TARGET_FILTERS+=("$2"); shift 2 ;;
             --min-ios) require_value "$@"; MIN_IOS="$2"; shift 2 ;;
             --revision) require_value "$@"; REVISION="$2"; shift 2 ;;
             --binary) BINARY_MODE=true; shift ;;
@@ -447,6 +463,11 @@ discover_products() {
                 verbose_log "  Skipping product $product_name (not in filter list)"
                 continue
             fi
+        elif [[ ${#TARGET_FILTERS[@]} -gt 0 ]]; then
+            # --target specified without --product: user wants only the listed targets,
+            # not every library product on top. Mirrors how --product alone works as a filter.
+            verbose_log "  Skipping product $product_name (only --target was specified)"
+            continue
         fi
 
         PRODUCTS+=("$product_name")
@@ -460,35 +481,110 @@ for prod in pkg.get('products', []):
         print(prod['name'])
 " 2>/dev/null)
 
-    if [[ ${#PRODUCTS[@]} -eq 0 ]]; then
-        if [[ ${#PRODUCT_FILTERS[@]} -gt 0 ]]; then
-            die "No library products matching filter (${PRODUCT_FILTERS[*]}) found in package"
-        else
-            die "No library products found in Package.swift"
-        fi
-    fi
-
-    # Verify every requested --product was found
+    # Verify every requested --product was found (before we add any --target entries)
     if [[ ${#PRODUCT_FILTERS[@]} -gt 0 ]]; then
         local missing=()
-        for pf in "${PRODUCT_FILTERS[@]}"; do
-            local found=false
-            for p in "${PRODUCTS[@]}"; do
-                [[ "$p" == "$pf" ]] && { found=true; break; }
+        if [[ ${#PRODUCTS[@]} -eq 0 ]]; then
+            # Short-circuit: no products matched, so every --product is missing.
+            # Avoids iterating an empty array under bash 3.2 + set -u.
+            missing=("${PRODUCT_FILTERS[@]}")
+        else
+            for pf in "${PRODUCT_FILTERS[@]}"; do
+                local found=false
+                for p in "${PRODUCTS[@]}"; do
+                    [[ "$p" == "$pf" ]] && { found=true; break; }
+                done
+                $found || missing+=("$pf")
             done
-            $found || missing+=("$pf")
-        done
+        fi
         if [[ ${#missing[@]} -gt 0 ]]; then
             die "Requested product(s) not found in package: ${missing[*]}"
         fi
     fi
 
+    local product_count=${#PRODUCTS[@]}
+
+    # --- Target escape hatch ---
+    # Verify each --target name exists in the package's targets[] array and append
+    # to PRODUCTS (so the rest of the pipeline treats them uniformly) while tracking
+    # them in TARGET_ENTRIES so build_product can apply target-specific build settings.
+    if [[ ${#TARGET_FILTERS[@]} -gt 0 ]]; then
+        # Collect available target names once for error messages and membership checks
+        local available_targets
+        available_targets=$(python3 -c "
+import json
+pkg = json.load(open('$dump_file'))
+for t in pkg.get('targets', []):
+    print(t['name'])
+" 2>/dev/null)
+
+        local tf
+        for tf in "${TARGET_FILTERS[@]}"; do
+            local found=false
+            while IFS= read -r tname; do
+                [[ "$tname" == "$tf" ]] && { found=true; break; }
+            done <<< "$available_targets"
+
+            if ! $found; then
+                echo "" >&2
+                warn "Target '$tf' not found in Package.swift targets."
+                warn "Available targets:"
+                echo "$available_targets" | sed 's/^/    /' >&2
+                die "Requested target(s) not found in package: $tf"
+            fi
+
+            # Dedupe: skip if this name is already in PRODUCTS (e.g., also passed as --product).
+            # Length-check guard because bash 3.2 (macOS) under `set -u` treats an empty
+            # "${PRODUCTS[@]}" as unbound.
+            local already_listed=false
+            if [[ ${#PRODUCTS[@]} -gt 0 ]]; then
+                local existing
+                for existing in "${PRODUCTS[@]}"; do
+                    [[ "$existing" == "$tf" ]] && { already_listed=true; break; }
+                done
+            fi
+            $already_listed && continue
+
+            PRODUCTS+=("$tf")
+            TARGET_ENTRIES+=("$tf")
+        done
+    fi
+
+    if [[ ${#PRODUCTS[@]} -eq 0 ]]; then
+        if [[ ${#PRODUCT_FILTERS[@]} -gt 0 || ${#TARGET_FILTERS[@]} -gt 0 ]]; then
+            die "No library products or targets matching filters (products: ${PRODUCT_FILTERS[*]:-none}, targets: ${TARGET_FILTERS[*]:-none}) found in package"
+        else
+            die "No library products found in Package.swift"
+        fi
+    fi
+
     echo ""
-    bold "Found ${#PRODUCTS[@]} library product(s):"
-    for p in "${PRODUCTS[@]}"; do
-        echo "  - $p"
+    if [[ $product_count -gt 0 ]]; then
+        bold "Found $product_count library product(s):"
+        local i=0
+        while [[ $i -lt $product_count ]]; do
+            echo "  - ${PRODUCTS[$i]}"
+            i=$((i + 1))
+        done
+    fi
+    if [[ ${#TARGET_ENTRIES[@]} -gt 0 ]]; then
+        bold "Found ${#TARGET_ENTRIES[@]} target(s) (escape hatch — will build with MACH_O_TYPE=mh_dylib):"
+        local t
+        for t in "${TARGET_ENTRIES[@]}"; do
+            echo "  - $t"
+        done
+    fi
+    echo ""
+}
+
+# Returns 0 if $1 is in TARGET_ENTRIES (i.e., came from --target, not --product).
+is_target_entry() {
+    local name="$1" entry
+    [[ ${#TARGET_ENTRIES[@]} -gt 0 ]] || return 1
+    for entry in "${TARGET_ENTRIES[@]}"; do
+        [[ "$entry" == "$name" ]] && return 0
     done
-    echo ""
+    return 1
 }
 
 # Discover xcodebuild schemes available for this package.
@@ -631,10 +727,13 @@ PYEOF
 # Always writes full output to $WORK_DIR/.last-build-output (fresh each call)
 # so that build_archive can inspect it for scheme-not-found fallback regardless
 # of --verbose mode.
-# Arguments: source_dir scheme destination archive_path derived_data_path
+# Arguments: source_dir scheme destination archive_path derived_data_path [log_file] [is_target]
+# is_target: "true" when building an SPM target (not a .library product) — adds
+# MACH_O_TYPE=mh_dylib so the target's static library is linked as a dynamic lib.
 run_xcodebuild_archive() {
     local source_dir="$1" scheme="$2" destination="$3" archive_path="$4" dd_path="$5"
     local log_file="${6:-$WORK_DIR/.last-build-output}"
+    local is_target="${7:-false}"
 
     local build_cmd=(
         xcodebuild archive
@@ -651,6 +750,15 @@ run_xcodebuild_archive() {
         -skipPackagePluginValidation
         -skipMacroValidation
     )
+
+    # Target escape hatch: force dynamic linkage for SPM .target(...) entries that
+    # can't be patched via .library(type: .dynamic). WARNING: this is a global
+    # override that also affects internal C/ObjC dependency targets in the same
+    # build, so it's unsafe for packages like Firebase/GoogleUtilities. See the
+    # --target flag docs in print_help for the full caveat.
+    if [[ "$is_target" == "true" ]]; then
+        build_cmd+=(MACH_O_TYPE=mh_dylib)
+    fi
 
     # Capture all output to log file. Caller is responsible for display.
     local rc=0
@@ -669,13 +777,22 @@ build_archive() {
     local device_log="$WORK_DIR/.build-output-${product}-device"
     local sim_log="$WORK_DIR/.build-output-${product}-simulator"
 
+    # Target entries (from --target) need MACH_O_TYPE=mh_dylib since SPM .target(...)
+    # has no dynamic type to patch. This is the old global mh_dylib override, opt-in
+    # per-product via --target — see print_help for the caveat about internal deps.
+    local is_target=false
+    if is_target_entry "$product"; then
+        is_target=true
+        dim "  (building as SPM target — MACH_O_TYPE=mh_dylib)"
+    fi
+
     # --- Parallel device + simulator build ---
     info "  Building $product — device (arm64) + simulator (parallel)..."
 
-    run_xcodebuild_archive "$source_dir" "$scheme" "generic/platform=iOS" "$device_archive" "$derived_data/device" "$device_log" &
+    run_xcodebuild_archive "$source_dir" "$scheme" "generic/platform=iOS" "$device_archive" "$derived_data/device" "$device_log" "$is_target" &
     local device_pid=$!
 
-    run_xcodebuild_archive "$source_dir" "$scheme" "generic/platform=iOS Simulator" "$sim_archive" "$derived_data/simulator" "$sim_log" &
+    run_xcodebuild_archive "$source_dir" "$scheme" "generic/platform=iOS Simulator" "$sim_archive" "$derived_data/simulator" "$sim_log" "$is_target" &
     local sim_pid=$!
 
     local device_rc=0 sim_rc=0
@@ -703,7 +820,7 @@ build_archive() {
                 done
 
                 info "  Building $product — device (arm64) [SPM mode]..."
-                if ! run_xcodebuild_archive "$source_dir" "$product" "generic/platform=iOS" "$device_archive" "$derived_data/device" "$device_log"; then
+                if ! run_xcodebuild_archive "$source_dir" "$product" "generic/platform=iOS" "$device_archive" "$derived_data/device" "$device_log" "$is_target"; then
                     warn "  Device build failed in both xcodeproj and SPM modes"
                     if [[ -f "$device_log" ]] && ! $VERBOSE; then
                         warn "  Last 15 lines of build output:"
@@ -717,7 +834,7 @@ build_archive() {
                 tail -5 "$device_log"
 
                 info "  Building $product — simulator [SPM mode]..."
-                if ! run_xcodebuild_archive "$source_dir" "$product" "generic/platform=iOS Simulator" "$sim_archive" "$derived_data/simulator" "$sim_log"; then
+                if ! run_xcodebuild_archive "$source_dir" "$product" "generic/platform=iOS Simulator" "$sim_archive" "$derived_data/simulator" "$sim_log" "$is_target"; then
                     warn "  Simulator build failed in SPM mode"
                     if [[ -f "$sim_log" ]] && ! $VERBOSE; then
                         warn "  Last 15 lines of build output:"
@@ -782,6 +899,11 @@ for p in pkg.get("products", []):
     if p["name"] == product_name:
         product_targets = p.get("targets", [])
         break
+
+# Fallback for --target entries: the name won't match any .library() product
+# but should exist directly in targets[]. Treat the target itself as the list.
+if not product_targets and product_name in targets:
+    product_targets = [product_name]
 
 def scan_target(tname):
     """Scan a target for linkedFramework settings and source imports."""
@@ -1208,6 +1330,10 @@ for p in pkg.get("products", []):
         product_targets = p.get("targets", [])
         break
 
+# Fallback for --target entries: name exists in targets[] but not as a .library() product.
+if not product_targets and product_name in targets:
+    product_targets = [product_name]
+
 if not product_targets:
     sys.exit(0)
 
@@ -1475,6 +1601,12 @@ main() {
     if $BINARY_MODE; then
         is_remote || die "--binary requires a remote package URL"
         [[ -n "$VERSION" ]] || die "--binary requires --version"
+        # --target is a source-build escape hatch; binary mode has no SPM library-vs-target
+        # distinction — the package just publishes named xcframework artifacts. Reject rather
+        # than silently ignore the flag.
+        if [[ ${#TARGET_FILTERS[@]} -gt 0 ]]; then
+            die "--target is not supported with --binary (binary mode has no concept of SPM library vs target — use --product to filter artifact names)"
+        fi
         if [[ -n "$REVISION" ]]; then
             verify_revision "$PACKAGE_SOURCE" "$VERSION" "$REVISION"
         fi
@@ -1507,9 +1639,12 @@ main() {
     if $DRY_RUN; then
         bold "Dry run — would build:"
         for product in "${PRODUCTS[@]}"; do
-            local scheme
+            local scheme kind_label=""
             scheme=$(find_scheme_for_product "$product")
-            echo "  $product (scheme: $scheme) → $OUTPUT_DIR/${product}.xcframework"
+            if is_target_entry "$product"; then
+                kind_label=" [target, mh_dylib]"
+            fi
+            echo "  $product (scheme: $scheme) → $OUTPUT_DIR/${product}.xcframework${kind_label}"
         done
         echo ""
         if $INCLUDE_DEPS; then

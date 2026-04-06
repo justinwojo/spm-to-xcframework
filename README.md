@@ -33,6 +33,7 @@ spm-to-xcframework <package-url-or-path> --version <ver> [options]
 | `-v, --version <ver>` | Git tag to check out (required for remote URLs) |
 | `-o, --output <dir>` | Output directory (default: `./xcframeworks`) |
 | `-p, --product <name>` | Build only these products (repeatable; default: all library products) |
+| `-t, --target <name>` | Build an SPM target that isn't exposed as a `.library()` product (repeatable). Escape hatch — see warning below. |
 | `--binary` | Download pre-built xcframeworks from binary SPM targets instead of building from source (remote URLs only) |
 | `--revision <sha>` | Verify the git tag resolves to this full 40-character commit SHA before fetching (supply-chain security) |
 | `--min-ios <ver>` | Minimum iOS deployment target for source builds (default: `15.0`) |
@@ -56,7 +57,13 @@ spm-to-xcframework ./MyPackage -o ./output
 
 # Build multiple specific products from a large package
 spm-to-xcframework https://github.com/stripe/stripe-ios.git -v 25.6.2 \
-    --product StripeCore --product StripePayments
+    --product Stripe --product StripePayments
+
+# Mix products and internal-only targets — Stripe ships StripeCore/StripeUICore as
+# .target(...) rather than .library(...), so --target is the only way to build them
+# (see the "--target escape hatch" section below for the caveat)
+spm-to-xcframework https://github.com/stripe/stripe-ios.git -v 25.6.2 \
+    --product Stripe --target StripeCore --target StripeUICore
 
 # Build an ObjC library with a static SPM product (auto-promoted to dynamic)
 spm-to-xcframework https://github.com/jdg/MBProgressHUD.git -v 1.2.0
@@ -79,7 +86,7 @@ spm-to-xcframework https://github.com/kean/Nuke.git -v 12.8.0 --dry-run
 1. **Normalizes the tag name** for remote packages. Tags with a `v` prefix are resolved automatically, so `-v 1.2.3` works even when the actual tag is `v1.2.3`.
 2. **Verifies revision** if `--revision` is provided — runs `git ls-remote` before fetching any source, handles annotated tags, and fails with a clear mismatch error.
 3. **Clones** the package at the resolved tag (or copies a local path).
-4. **Discovers** library products via `swift package dump-package` — works for Swift, ObjC, and mixed-language targets.
+4. **Discovers** library products via `swift package dump-package` — works for Swift, ObjC, and mixed-language targets. Additional SPM targets passed via `--target` are verified against the package's `targets[]` array and queued alongside the products.
 5. **Resolves** build schemes via `xcodebuild -list` — handles packages with `.xcodeproj` (platform-suffixed schemes like `Alamofire iOS`) and pure SPM packages (auto-generated schemes).
 6. **Patches** `Package.swift` to set all library products to `type: .dynamic` — only products become dynamic, internal dependency targets keep their natural build type.
 7. **Builds** device and simulator archives in parallel via `xcodebuild archive`, with:
@@ -111,6 +118,14 @@ Some libraries (e.g. BlinkID, Firebase) distribute pre-built xcframeworks throug
 7. Copies the matching xcframeworks to the output directory and validates them.
 
 Product filtering (`--product`), revision verification (`--revision`), and dry-run all work in binary mode. In binary dry-run mode, the tool still resolves artifacts so it can validate the requested products and show the exact filtered set, but it does not copy anything to the output directory.
+
+### `--target` escape hatch
+
+Some packages declare important modules as `.target(...)` in `Package.swift` without exposing them as `.library(...)` products. stripe-ios is the canonical example: `StripeCore`, `StripeUICore`, `Stripe3DS2`, and `StripeCameraCore` are all plain targets, so `--product StripeCore` fails with "No library products matching filter". The `--target` flag bypasses the library-product filter and builds the named SPM target directly.
+
+Because SPM's `.target(...)` has no dynamic-type to patch, target builds fall back to the old `MACH_O_TYPE=mh_dylib` global override — i.e. every link step in the build produces a dynamic library. **This is unsafe for packages with internal C/ObjC dependency targets.** Firebase (nanopb, leveldb, GoogleUtilities), anything bundling static helper libs, and similar packages will fail to link when `--target` is used, because their internal targets are designed to produce object files or static archives and the forced-dynamic linker rejects them.
+
+Use `--target` only for packages whose targets are truly standalone dynamic-compatible modules. Stripe fits this profile; Firebase does not. When in doubt, build with `--product` first — `--target` is a last resort for modules that SPM exposes no other way to reach.
 
 ### Scheme fallback
 
