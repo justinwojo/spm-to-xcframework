@@ -23,7 +23,6 @@ import argparse
 import concurrent.futures
 import json
 import os
-import plistlib
 import re
 import shutil
 import subprocess
@@ -2807,8 +2806,8 @@ _TARGET_SOURCE_SCAN_EXCLUDES: Set[str] = {
 # Compiled regexes for ObjC system-framework imports. Both forms appear
 # in the wild — `#import <UIKit/UIKit.h>` is the historical spelling and
 # `@import UIKit;` is the module-aware form modern ObjC code prefers.
-_RE_OBJC_HASH_IMPORT = re.compile(r"#import\s*<([A-Za-z_]+)/")
-_RE_OBJC_AT_IMPORT = re.compile(r"@import\s+([A-Za-z_]+)")
+_RE_OBJC_HASH_IMPORT = re.compile(r"#import\s*<([A-Za-z_][A-Za-z0-9_]*)/")
+_RE_OBJC_AT_IMPORT = re.compile(r"@import\s+([A-Za-z_][A-Za-z0-9_]*)")
 
 
 def _scan_target_for_frameworks(
@@ -3556,41 +3555,36 @@ def _run_one_unit(
         verbose=config.verbose,
     )
 
-    # If neither slice located a `.framework` for `unit.framework_name`
-    # but both have a static archive, run the StaticPromote strategy and
-    # re-locate the framework. This is the MBProgressHUD path.
-    if device_slice.framework_path is None and sim_slice.framework_path is None:
-        if device_slice.static_lib_path is not None and sim_slice.static_lib_path is not None:
-            warn(f"  {unit.name}: static archive(s) found — promoting to dynamic framework")
-            system_frameworks = detect_system_frameworks(prepared.package, unit.name)
-            if system_frameworks:
-                verbose_log(
-                    config.verbose,
-                    f"  Linking system frameworks: {' '.join(system_frameworks)}",
-                )
+    # If a slice produced a `.a` instead of a `.framework`, run the
+    # StaticPromote strategy on it and re-locate the framework. This is
+    # the MBProgressHUD path. Per-slice (not "both must be static") so
+    # the asymmetric case — one slice ends up with a framework, the
+    # other only a static archive — is also handled instead of failing
+    # with a misleading "framework missing" error.
+    needs_promote = [
+        s for s in (device_slice, sim_slice)
+        if s.framework_path is None and s.static_lib_path is not None
+    ]
+    if needs_promote:
+        warn(f"  {unit.name}: static archive(s) found — promoting to dynamic framework")
+        system_frameworks = detect_system_frameworks(prepared.package, unit.name)
+        if system_frameworks:
+            verbose_log(
+                config.verbose,
+                f"  Linking system frameworks: {' '.join(system_frameworks)}",
+            )
+        for slice_obj in needs_promote:
             promote_static_to_framework(
-                static_lib=device_slice.static_lib_path,
+                static_lib=slice_obj.static_lib_path,
                 product=unit.framework_name,
-                sdk_name=device_slice.sdk_name,
+                sdk_name=slice_obj.sdk_name,
                 min_ios=config.min_ios,
-                archive_path=device_slice.archive_path,
+                archive_path=slice_obj.archive_path,
                 system_frameworks=system_frameworks,
                 verbose=config.verbose,
             )
-            promote_static_to_framework(
-                static_lib=sim_slice.static_lib_path,
-                product=unit.framework_name,
-                sdk_name=sim_slice.sdk_name,
-                min_ios=config.min_ios,
-                archive_path=sim_slice.archive_path,
-                system_frameworks=system_frameworks,
-                verbose=config.verbose,
-            )
-            device_slice.framework_path = _archive_framework_path(
-                device_slice.archive_path, unit.framework_name
-            )
-            sim_slice.framework_path = _archive_framework_path(
-                sim_slice.archive_path, unit.framework_name
+            slice_obj.framework_path = _archive_framework_path(
+                slice_obj.archive_path, unit.framework_name
             )
 
     if device_slice.framework_path is None:
@@ -6034,7 +6028,11 @@ def _run_binary_mode(config: Config) -> int:
 # parsed xcresult diagnostics + the build log path; a Python traceback on
 # top of that would just be noise.
 _USER_FACING_ERRORS = (FetchError, InspectError, PlanError, ExecuteError)
-_BUG_CLASS_ERRORS = (PrepareError,)
+# VerifyError is bug-class because Verify is the post-build sanity check —
+# any failure there means our plan was wrong, not that the user did
+# something wrong, so we want the traceback. Keep this in sync with
+# REWRITE_DESIGN.md §7.
+_BUG_CLASS_ERRORS = (PrepareError, VerifyError)
 
 
 def _phase_label_for(exc: SpmToXcframeworkError) -> str:
