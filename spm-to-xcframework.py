@@ -395,6 +395,45 @@ class Plan:
     binary_mode: bool = False
 
 
+@dataclass
+class PreparedPlan:
+    """Output of Prepare. Wraps the original Plan together with the typed
+    Package model that resulted from re-parsing the edited active manifest.
+
+    Existence of a PreparedPlan is a contract: the active manifest under
+    `package.staged_dir` (`Package.swift` or whichever
+    `Package@swift-X.Y.swift` SPM picks for the toolchain) parses cleanly
+    through `swift package dump-package` and every planner-requested edit
+    appears in the dumped output the way the planner expected. Execute can
+    rely on that invariant — it never re-validates the manifest itself.
+    """
+
+    plan: Plan
+    package: Package
+
+
+@dataclass
+class ExecutedUnit:
+    """Output of Execute for a single build unit.
+
+    Session 3 captures only what the device-only slice produces (the
+    archive directory plus the located primary framework, if any). Session 4
+    will extend this with simulator slices, xcframework paths, and
+    static-promote diagnostics. The dataclass is intentionally additive so
+    Session 4 can grow it without rewriting Session 3 callers.
+    """
+
+    name: str                     # build unit name (matches plan.build_units[i].name)
+    archive_path: Path            # device .xcarchive directory
+    # Path to the located <X>.framework anywhere under <archive>/Products/.
+    # SPM library archives typically land at Products/usr/local/lib/<X>.framework
+    # but the lookup is recursive (matches the legacy bash strategy).
+    framework_path: Optional[Path]
+    log_path: Path                # WORK_DIR/.build-output-<name>-device
+    result_bundle_path: Path      # WORK_DIR/results/<name>-device.xcresult
+    static_lib_path: Optional[Path] = None  # set when xcodebuild produced a .a instead of a framework
+
+
 # ============================================================================
 # --- Phase 0: Fetch (clone/copy + stage) ---
 # ============================================================================
@@ -1613,23 +1652,1032 @@ def print_plan(
 
 
 # ============================================================================
-# --- Phase 3: Prepare (stub) ---
+# --- Phase 3: Prepare ---
 # ============================================================================
+#
+# Prepare is the riskiest phase (§5.3). It mutates Package.swift via
+# string surgery and then verifies the result by re-running real
+# `swift package dump-package` and asserting against the planner's
+# expectations. Three guardrails (per design):
+#
+#   1. Edits are *whitelisted*. Prepare never decides what to edit; it
+#      consumes Plan.package_swift_edits verbatim.
+#   2. Edits are *span-scoped*. We locate one .library(...) call by exact
+#      `name: "X"` substring match, walk balanced parens to find its
+#      extent, then edit only inside that span.
+#   3. Mandatory round-trip validation. After every edit lands, we
+#      re-dump the manifest and assert linkage / product membership match
+#      the plan. A failure here raises PrepareError with a unified diff
+#      and the failed assertions.
+#
+# Anything that gets past the round-trip validator is by construction
+# safe for Execute to consume.
 
 
-def apply_package_swift_edits(staged_dir: Path, edits: List[PackageSwiftEdit]) -> None:
-    """Stub for session 3."""
-    raise NotImplementedError("Prepare phase is implemented in session 3.")
+def _assert_no_unsupported_swift_constructs(text: str) -> None:
+    """Fail loudly if `text` contains Swift constructs the balanced-paren
+    walker can't reason about.
+
+    The walker handles double-quoted strings (with backslash escapes),
+    line comments (//) and block comments. It does NOT handle Swift raw
+    strings (#"..."#), multi-line triple-quoted strings, or string
+    interpolation: parens inside an interpolated expression would fool
+    the depth counter, and unescaped quotes inside a raw string would
+    confuse the string-skip state.
+
+    Real-world Package.swift files we've seen never use these inside
+    .library(...) argument lists or products: [...] arrays, but if a
+    future manifest does, silently mis-parsing would corrupt the edit. We
+    raise a targeted PrepareError up-front so the user gets a clear error
+    instead of an opaque round-trip mismatch.
+
+    Cheap heuristic: a substring scan. The few false positives this might
+    flag (e.g. doc comments mentioning these constructs) aren't worth the
+    cost of a full Swift tokenizer.
+    """
+    if '#"' in text:
+        raise PrepareError(
+            "Package.swift uses Swift raw string literals (`#\"...\"#`), "
+            "which the balanced-paren walker doesn't understand. "
+            "File a bug if this needs to be supported."
+        )
+    if '"""' in text:
+        raise PrepareError(
+            "Package.swift uses Swift triple-quoted strings (`\"\"\"`), "
+            "which the balanced-paren walker doesn't understand. "
+            "File a bug if this needs to be supported."
+        )
+    if '\\(' in text:
+        raise PrepareError(
+            "Package.swift uses Swift string interpolation (`\\(...)`), "
+            "which the balanced-paren walker doesn't understand. "
+            "File a bug if this needs to be supported."
+        )
+
+
+def _balanced_close(text: str, open_idx: int) -> int:
+    """Walk text from `open_idx` (which must point at one of `(`, `[`, `{`)
+    to the matching closing bracket, returning its index. Skips over Swift
+    string literals (`"..."` with `\\"` escapes), `// ...` line comments, and
+    `/* ... */` block comments. Returns -1 if no matching close is found.
+
+    Does NOT handle Swift multi-line triple-quoted strings, raw strings,
+    or string interpolation. Callers should run
+    `_assert_no_unsupported_swift_constructs` on the full manifest text
+    before invoking this walker so unsupported syntax fails loudly with a
+    targeted PrepareError instead of being silently mis-parsed.
+    """
+    if open_idx < 0 or open_idx >= len(text):
+        return -1
+    open_ch = text[open_idx]
+    pair = {"(": ")", "[": "]", "{": "}"}
+    if open_ch not in pair:
+        return -1
+    close_ch = pair[open_ch]
+
+    depth = 0
+    i = open_idx
+    n = len(text)
+    while i < n:
+        c = text[i]
+        # Line comment: skip to end-of-line.
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            nl = text.find("\n", i + 2)
+            if nl == -1:
+                return -1
+            i = nl + 1
+            continue
+        # Block comment: skip to */
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            close = text.find("*/", i + 2)
+            if close == -1:
+                return -1
+            i = close + 2
+            continue
+        # String literal: skip to closing quote, honoring `\\"` escapes.
+        if c == '"':
+            i += 1
+            while i < n:
+                cc = text[i]
+                if cc == "\\" and i + 1 < n:
+                    i += 2
+                    continue
+                if cc == '"':
+                    i += 1
+                    break
+                if cc == "\n":
+                    # Unterminated string — give up rather than misparse.
+                    return -1
+                i += 1
+            continue
+        if c == open_ch:
+            depth += 1
+        elif c == close_ch:
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def _find_library_call_for_product(text: str, product_name: str) -> Tuple[int, int]:
+    """Locate the `.library(...)` call whose argument list contains
+    `name: "<product_name>"` (exact substring match — no prefix, no glob).
+
+    Returns `(open_paren_idx, close_paren_idx)` for the located call, or
+    `(-1, -1)` if no `.library(` call's span contains a matching `name:`
+    clause.
+
+    Implementation note: GRDB's manifest declares THREE `.library(...)`
+    products on the same target, and two of them have names starting with
+    `GRDB`. Walking forward from the first `.library(` after a hard-coded
+    name is wrong — we'd accidentally match the wrong product. Instead we
+    enumerate every `.library(` span in the file and check whose interior
+    matches the exact-name regex.
+    """
+    name_re = re.compile(r'name\s*:\s*"' + re.escape(product_name) + r'"')
+    library_re = re.compile(r"\.library\s*\(")
+    pos = 0
+    while True:
+        m = library_re.search(text, pos)
+        if not m:
+            return -1, -1
+        open_idx = m.end() - 1
+        close_idx = _balanced_close(text, open_idx)
+        if close_idx == -1:
+            raise PrepareError(
+                f"Could not find balanced `)` for .library( at offset {open_idx}; "
+                f"the manifest may be malformed."
+            )
+        span = text[open_idx + 1 : close_idx]
+        if name_re.search(span):
+            return open_idx, close_idx
+        pos = close_idx + 1
+
+
+def edit_force_dynamic(manifest_text: str, product_name: str) -> str:
+    """Rewrite `manifest_text` so the `.library(name: "<product_name>", ...)`
+    call has `type: .dynamic`.
+
+    Three cases:
+      - The library is already `type: .dynamic` → return text unchanged.
+        (Defensive: the planner should never emit this edit, but Prepare
+        treats it as a no-op rather than raising — the round-trip validator
+        is what catches genuinely-broken edits.)
+      - The library has an explicit `type: .X` → replace it with
+        `type: .dynamic`.
+      - The library has no `type:` clause → insert `, type: .dynamic`
+        immediately after the matching `name: "<product_name>"` clause.
+
+    All edits are scoped to the located `.library(...)` span; the rest of
+    the file is left untouched. Raises PrepareError if no matching call is
+    found (use `_find_library_call_for_product` to test before calling).
+    """
+    open_idx, close_idx = _find_library_call_for_product(manifest_text, product_name)
+    if open_idx == -1:
+        snippet = manifest_text[:200].replace("\n", "\\n")
+        raise PrepareError(
+            f"force_dynamic: could not locate `.library(name: {product_name!r}, ...)` "
+            f"in manifest. The planner asked for an edit that doesn't match any "
+            f"product. First 200 chars of manifest:\n  {snippet!r}"
+        )
+
+    span = manifest_text[open_idx + 1 : close_idx]
+
+    type_dynamic_re = re.compile(r"type\s*:\s*\.dynamic\b")
+    if type_dynamic_re.search(span):
+        return manifest_text  # already dynamic; nothing to do
+
+    type_other_re = re.compile(r"type\s*:\s*\.[A-Za-z_][A-Za-z0-9_]*")
+    m = type_other_re.search(span)
+    if m:
+        new_span = span[: m.start()] + "type: .dynamic" + span[m.end() :]
+        return manifest_text[: open_idx + 1] + new_span + manifest_text[close_idx:]
+
+    name_re = re.compile(r'name\s*:\s*"' + re.escape(product_name) + r'"')
+    nm = name_re.search(span)
+    if not nm:
+        # Should be unreachable: _find_library_call_for_product just confirmed it.
+        raise PrepareError(
+            f"force_dynamic: located `.library(` for {product_name!r} but lost "
+            f"track of the `name:` clause. This is a bug in spm-to-xcframework."
+        )
+    insert_at = nm.end()
+    new_span = span[:insert_at] + ", type: .dynamic" + span[insert_at:]
+    return manifest_text[: open_idx + 1] + new_span + manifest_text[close_idx:]
+
+
+def _find_products_array(text: str) -> Tuple[int, int]:
+    """Return `(open_bracket_idx, close_bracket_idx)` for the `products: [...]`
+    array, or `(-1, -1)` if no such array is found.
+
+    Matches `\\bproducts\\s*:\\s*\\[` so we don't accidentally trigger on a
+    target field literally named `products` inside a settings dict (no real
+    package does this, but defense-in-depth is cheap).
+    """
+    label_re = re.compile(r"\bproducts\s*:\s*\[")
+    m = label_re.search(text)
+    if not m:
+        return -1, -1
+    open_bracket = m.end() - 1
+    close_bracket = _balanced_close(text, open_bracket)
+    return open_bracket, close_bracket
+
+
+def edit_add_synthetic_library(
+    manifest_text: str, name: str, targets: Sequence[str]
+) -> str:
+    """Insert `.library(name: "<name>", type: .dynamic, targets: [...])`
+    immediately before the closing `]` of the `products:` array.
+
+    Handles both shapes commonly seen in real Package.swift files:
+      - Trailing-comma form (GRDB):       `.library(...),\\n    ]`
+      - No trailing comma (Stripe):       `.library(...)\\n    ]`
+
+    The new entry's indent is sampled from the line containing the previous
+    entry's last meaningful character. Empty arrays fall back to the close
+    bracket's indent + 4 spaces.
+
+    A leading comma is added iff the previous non-whitespace character
+    inside the array is not `,` or `[`. This means trailing-comma manifests
+    stay valid (no double comma) and no-trailing-comma manifests gain the
+    necessary separator.
+    """
+    open_bracket, close_bracket = _find_products_array(manifest_text)
+    if open_bracket == -1:
+        raise PrepareError(
+            "add_synthetic_library: could not locate `products:` array in "
+            "manifest. The planner emitted an `add_synthetic_library` edit "
+            "for a package without a products section."
+        )
+    if close_bracket == -1:
+        raise PrepareError(
+            "add_synthetic_library: products array `[` has no matching `]`. "
+            "The manifest may be malformed."
+        )
+
+    # Walk back from the close bracket to find the last meaningful character
+    # inside the array. Whitespace and the close bracket itself don't count.
+    j = close_bracket - 1
+    while j > open_bracket and manifest_text[j] in " \t\r\n":
+        j -= 1
+    has_entries = j > open_bracket
+    prev_ch = manifest_text[j] if has_entries else "["
+
+    # Compute the indent for the new entry. Sample from the line containing
+    # the last meaningful character (which sits inside the previous entry's
+    # span — typically the closing `)` or trailing `,`). For empty arrays we
+    # fall back to one indent level deeper than the close bracket's line.
+    sample_idx = j if has_entries else close_bracket
+    line_start = manifest_text.rfind("\n", 0, sample_idx) + 1
+    indent = ""
+    for ch in manifest_text[line_start:sample_idx]:
+        if ch in (" ", "\t"):
+            indent += ch
+        else:
+            break
+    if not has_entries:
+        indent = indent + "    "
+    entry_indent = indent
+
+    targets_literal = ", ".join(f'"{t}"' for t in targets)
+    new_entry = (
+        f'.library(name: "{name}", type: .dynamic, targets: [{targets_literal}])'
+    )
+
+    if prev_ch in (",", "["):
+        insertion = f"\n{entry_indent}{new_entry}"
+    else:
+        insertion = f",\n{entry_indent}{new_entry}"
+
+    # Insert immediately after the last meaningful char (or at open_bracket+1
+    # for empty arrays). The whitespace + indent + `]` that originally
+    # followed stays in place, so the array's overall shape is preserved.
+    insert_at = j + 1 if has_entries else open_bracket + 1
+    return manifest_text[:insert_at] + insertion + manifest_text[insert_at:]
+
+
+def _swift_toolchain_version() -> Optional[Tuple[int, int, int]]:
+    """Return the Swift toolchain `(major, minor, patch)`, or None if it
+    can't be parsed.
+
+    Used by `_select_active_manifest` to mirror SPM's manifest-selection
+    rule: SPM picks the highest `Package@swift-X.Y[.Z].swift` whose version
+    is `<=` the active toolchain version, falling back to `Package.swift`.
+    """
+    try:
+        cp = subprocess.run(
+            ["swift", "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except (FileNotFoundError, OSError):
+        return None
+    if cp.returncode != 0:
+        return None
+    m = re.search(r"Swift version (\d+)\.(\d+)(?:\.(\d+))?", cp.stdout or "")
+    if not m:
+        return None
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0))
+
+
+def _select_active_manifest(staged_dir: Path) -> Path:
+    """Pick the Package.swift file SPM will actually read for this toolchain.
+
+    Mirrors SPM's selection rule: `Package@swift-X.Y[.Z].swift` is preferred
+    over `Package.swift` when its version is `<=` the toolchain version, and
+    the highest matching version wins. The patch component matters: if both
+    `Package@swift-5.9.swift` and `Package@swift-5.9.1.swift` exist, the
+    `.1` variant wins on a 5.9.1+ toolchain (and is filtered on 5.9.0).
+
+    Falls back to `Package.swift` if no version-specific manifest applies
+    (or the toolchain version can't be parsed).
+    """
+    base = staged_dir / "Package.swift"
+    tc = _swift_toolchain_version()
+    if tc is None:
+        return base
+    best: Optional[Tuple[Tuple[int, int, int], Path]] = None
+    pat = re.compile(r"^Package@swift-(\d+)(?:\.(\d+))?(?:\.(\d+))?\.swift$")
+    for candidate in staged_dir.glob("Package@swift-*.swift"):
+        m = pat.match(candidate.name)
+        if not m:
+            continue
+        cand = (int(m.group(1)), int(m.group(2) or 0), int(m.group(3) or 0))
+        if cand <= tc and (best is None or cand > best[0]):
+            best = (cand, candidate)
+    return best[1] if best is not None else base
+
+
+def apply_package_swift_edits(staged_dir: Path, plan: Plan) -> str:
+    """Mutate the active Package.swift in `staged_dir` according to
+    `plan.package_swift_edits`.
+
+    "Active" means the manifest SPM actually reads for this toolchain —
+    if the package ships a `Package@swift-X.Y.swift` whose version is
+    `<=` the active Swift toolchain, that file is edited *instead of*
+    `Package.swift`. This matches what `swift package dump-package` and
+    `xcodebuild` see, so the planner's edit decisions (which were derived
+    from the same dump) line up with the file we mutate.
+
+    Side effects:
+      - Writes `.original-<basename>` next to the active manifest as a
+        debugging artifact (only if not already present from a prior run).
+      - Overwrites the active manifest with the edited text.
+
+    Order of operations: all `force_dynamic` edits first, then all
+    `add_synthetic_library` edits. This matters because synthetic libraries
+    are inserted at the END of the products array, so applying them last
+    means the force_dynamic regex never trips over a freshly-added line.
+
+    Returns the original (pre-edit) manifest text. The caller passes that
+    to `validate_prepared_manifest` so a validation failure can render a
+    diff against the same baseline this function used.
+    """
+    manifest_path = _select_active_manifest(staged_dir)
+    if not manifest_path.is_file():
+        raise PrepareError(f"No Package.swift at {manifest_path}")
+
+    original_text = manifest_path.read_text()
+    # Fail loudly on Swift constructs the walker can't reason about
+    # (raw strings, triple-quoted strings, string interpolation). Better
+    # to abort here with a clear message than to silently mis-edit and
+    # surface as an opaque round-trip mismatch later.
+    _assert_no_unsupported_swift_constructs(original_text)
+    edited = original_text
+
+    # Snapshot the original for debugging. Don't clobber a prior snapshot:
+    # if a previous run failed mid-Prepare, the .original from that run is
+    # the *real* original and overwriting it would lose information.
+    snapshot_path = manifest_path.parent / f".original-{manifest_path.name}"
+    if not snapshot_path.exists():
+        snapshot_path.write_text(original_text)
+
+    # Phase 1: force_dynamic edits. Apply in plan order so the diff in any
+    # validator-failure message stays deterministic across runs.
+    for edit in plan.package_swift_edits:
+        if edit.kind != "force_dynamic":
+            continue
+        edited = edit_force_dynamic(edited, edit.product_name)
+
+    # Phase 2: synthetic library inserts. We append in plan order, so the
+    # final products array preserves the planner's stated ordering.
+    for edit in plan.package_swift_edits:
+        if edit.kind != "add_synthetic_library":
+            continue
+        edited = edit_add_synthetic_library(edited, edit.product_name, edit.targets)
+
+    if edited != original_text:
+        manifest_path.write_text(edited)
+
+    return original_text
+
+
+def validate_prepared_manifest(
+    staged_dir: Path,
+    plan: Plan,
+    original_text: str,
+) -> Tuple[dict, List[Product], List[Target], List[Platform], str, str]:
+    """Round-trip the edited Package.swift through `swift package dump-package`
+    and assert every planner-requested edit landed correctly.
+
+    On success, returns the parsed dump shards (the same shape `dump_package`
+    returns) so the caller can build a Package model with whatever schemes
+    list it wants attached. On failure, raises PrepareError.
+
+    Asserts (per design §5.3):
+      1. The dump still parses (handled by raising InspectError → caught
+         and re-raised as PrepareError with diff context).
+      2. Every `force_dynamic` edit produced a product with linkage DYNAMIC.
+      3. Every `add_synthetic_library` edit produced a product with the
+         requested name, linkage DYNAMIC, and targets matching exactly.
+      4. Every build unit the planner intends to archive (i.e. not a
+         copy-artifact) corresponds to a present product in the dumped
+         manifest.
+
+    On any failure, raises PrepareError with the failed assertion(s), a
+    unified diff between the pre-edit and post-edit manifests, and a JSON
+    snapshot of any directly-implicated post-edit products.
+    """
+    manifest_path = _select_active_manifest(staged_dir)
+    edited_text = manifest_path.read_text() if manifest_path.is_file() else ""
+
+    try:
+        raw, products, targets, platforms, name, tools_version = dump_package(staged_dir)
+    except InspectError as exc:
+        diff = _unified_diff(original_text, edited_text, label=manifest_path.name)
+        raise PrepareError(
+            f"Round-trip validation failed: edited {manifest_path.name} no longer "
+            f"parses through `swift package dump-package`.\n\nUnderlying "
+            f"error:\n  {exc}\n\nUnified diff (original → edited):\n{diff}"
+        ) from exc
+
+    products_by_name = {p.name: p for p in products}
+    failures: List[str] = []
+    implicated: List[Product] = []
+
+    for edit in plan.package_swift_edits:
+        if edit.kind == "force_dynamic":
+            prod = products_by_name.get(edit.product_name)
+            if prod is None:
+                failures.append(
+                    f"force_dynamic: product {edit.product_name!r} is missing "
+                    f"from the post-edit dumped manifest"
+                )
+                continue
+            if prod.linkage != Linkage.DYNAMIC:
+                failures.append(
+                    f"force_dynamic: product {edit.product_name!r} has linkage "
+                    f"{prod.linkage!r} after Prepare; expected {Linkage.DYNAMIC!r}"
+                )
+                implicated.append(prod)
+        elif edit.kind == "add_synthetic_library":
+            prod = products_by_name.get(edit.product_name)
+            if prod is None:
+                failures.append(
+                    f"add_synthetic_library: product {edit.product_name!r} is "
+                    f"absent from the post-edit dumped manifest (the new "
+                    f".library() entry didn't take effect)"
+                )
+                continue
+            if prod.linkage != Linkage.DYNAMIC:
+                failures.append(
+                    f"add_synthetic_library: product {edit.product_name!r} "
+                    f"has linkage {prod.linkage!r}; expected {Linkage.DYNAMIC!r}"
+                )
+                implicated.append(prod)
+            expected_targets = list(edit.targets)
+            if list(prod.targets) != expected_targets:
+                failures.append(
+                    f"add_synthetic_library: product {edit.product_name!r} "
+                    f"targets are {prod.targets!r}; expected {expected_targets!r}"
+                )
+                implicated.append(prod)
+
+    # Cross-check: every non-copy-artifact build unit must correspond to a
+    # present product. This catches the class of bug where a planner change
+    # silently emits a build unit for a product Prepare doesn't materialize.
+    for unit in plan.build_units:
+        if unit.archive_strategy == "copy-artifact":
+            continue
+        if unit.name not in products_by_name:
+            failures.append(
+                f"build_unit {unit.name!r}: not present in post-edit dumped "
+                f"manifest (planner expected this product to exist)"
+            )
+
+    if failures:
+        diff = _unified_diff(original_text, edited_text, label=manifest_path.name)
+        impl_block = ""
+        if implicated:
+            seen = set()
+            unique = []
+            for p in implicated:
+                if p.name in seen:
+                    continue
+                seen.add(p.name)
+                unique.append(p)
+            impl_lines = [
+                f"  - {p.name}: linkage={p.linkage}, targets={p.targets}"
+                for p in unique
+            ]
+            impl_block = "\n\nImplicated post-edit products:\n" + "\n".join(impl_lines)
+        bullet = "\n".join(f"  - {f}" for f in failures)
+        raise PrepareError(
+            "Round-trip validation failed:\n"
+            + bullet
+            + impl_block
+            + "\n\nUnified diff (original → edited):\n"
+            + diff
+        )
+
+    # Re-resolve dependencies if any synthetic library was added — new
+    # products can pull new transitive deps that need .build/checkouts.
+    if any(e.kind == "add_synthetic_library" for e in plan.package_swift_edits):
+        cp = subprocess.run(
+            ["swift", "package", "resolve"],
+            cwd=str(staged_dir),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if cp.returncode != 0:
+            tail = "\n".join((cp.stderr or "").rstrip().splitlines()[-10:])
+            raise PrepareError(
+                "swift package resolve failed after Prepare added synthetic "
+                "libraries:\n" + (tail or "  (no stderr)")
+            )
+
+    return raw, products, targets, platforms, name, tools_version
+
+
+def _unified_diff(original: str, edited: str, label: str = "Package.swift") -> str:
+    """Render a unified diff between two manifest texts. Used in
+    PrepareError messages so users (and the test harness) can see exactly
+    what surgery Prepare attempted.
+
+    Imported lazily because difflib is rarely needed at runtime — the
+    happy path doesn't render diffs at all.
+    """
+    import difflib
+
+    return "".join(
+        difflib.unified_diff(
+            original.splitlines(keepends=True),
+            edited.splitlines(keepends=True),
+            fromfile=f"{label} (pre-edit)",
+            tofile=f"{label} (post-edit)",
+            n=3,
+        )
+    )
+
+
+def prepare(staged_dir: Path, plan: Plan, *, verbose: bool = False) -> PreparedPlan:
+    """Top-level Prepare entry point.
+
+    Applies the planner's whitelisted edits to `staged_dir/Package.swift`
+    and runs the mandatory round-trip validator. Returns a PreparedPlan
+    that wraps the original Plan and the post-edit Package model. Schemes
+    from the inspect-time discovery are preserved on the returned Package
+    (synthetic libraries don't need pre-discovered schemes — xcodebuild
+    auto-generates them at archive time against our clean staged dir).
+    """
+    info("Preparing Package.swift edits...")
+    active_manifest = _select_active_manifest(staged_dir)
+    if active_manifest.name != "Package.swift":
+        verbose_log(
+            verbose,
+            f"  Active manifest: {active_manifest.name} (selected by toolchain)",
+        )
+    no_op = not plan.package_swift_edits
+    if no_op:
+        verbose_log(verbose, "  No Package.swift edits requested by planner.")
+        # Re-dump anyway so PreparedPlan.package reflects whatever the
+        # current manifest says — Execute reads it for diagnostic context.
+        raw, products, targets, platforms, name, tv = dump_package(staged_dir)
+        return PreparedPlan(
+            plan=plan,
+            package=Package(
+                name=name,
+                tools_version=tv,
+                platforms=platforms,
+                products=products,
+                targets=targets,
+                schemes=[],
+                raw_dump=raw,
+                staged_dir=staged_dir,
+            ),
+        )
+
+    for edit in plan.package_swift_edits:
+        if edit.kind == "force_dynamic":
+            verbose_log(verbose, f"  edit: force_dynamic {edit.product_name}")
+        elif edit.kind == "add_synthetic_library":
+            verbose_log(
+                verbose,
+                f"  edit: add_synthetic_library {edit.product_name} → "
+                f"targets={edit.targets}",
+            )
+
+    original = apply_package_swift_edits(staged_dir, plan)
+    raw, products, targets, platforms, name, tv = validate_prepared_manifest(
+        staged_dir, plan, original
+    )
+    success(f"  Prepare validated {len(plan.package_swift_edits)} edit(s) ✓")
+    return PreparedPlan(
+        plan=plan,
+        package=Package(
+            name=name,
+            tools_version=tv,
+            platforms=platforms,
+            products=products,
+            targets=targets,
+            # The schemes the planner saw at inspect time still describe the
+            # pre-edit manifest, but synthetic-library schemes are
+            # auto-generated by xcodebuild at archive time against our clean
+            # staged dir, so the build unit's `scheme` field is what Execute
+            # actually consumes. We leave schemes empty here rather than
+            # carrying a stale list across the Prepare boundary.
+            schemes=[],
+            raw_dump=raw,
+            staged_dir=staged_dir,
+        ),
+    )
 
 
 # ============================================================================
-# --- Phase 4: Execute (stub) ---
+# --- Phase 4: Execute ---
 # ============================================================================
+#
+# Session 3 lands the device-only slice in source mode. Sessions 4 and 5
+# fill in: parallel device + simulator builds, static→dynamic promotion,
+# swiftmodule + ObjC header injection, xcframework merge, binary mode,
+# and --include-deps. Until then, the executor's contract is narrow:
+# given a PreparedPlan, run `xcodebuild archive` once per source build
+# unit (target = generic/platform=iOS), locate the produced framework in
+# the archive, and surface any failure as an ExecuteError populated with
+# parsed xcresult diagnostics.
+#
+# Pure-function discipline matters here even before parallelism arrives:
+# Session 4 will lift `_archive_one_build_unit` into a thread pool, and
+# any hidden global state (a shared mutable list, a lazy module cache,
+# etc.) would race. Every helper below takes its inputs as parameters and
+# returns its outputs as values. No module-level mutation.
 
 
-def execute_source_plan(config: Config, plan: Plan) -> None:
-    """Stub for session 3 / 4."""
-    raise NotImplementedError("Execute phase is implemented in sessions 3+4.")
+def _archive_framework_path(archive_path: Path, framework_name: str) -> Optional[Path]:
+    """Return the path of `<framework_name>.framework` inside `archive_path`'s
+    Products tree, or None if it isn't there.
+
+    SPM-driven archives drop frameworks in different places depending on the
+    package's setup:
+      - Apps with embedded frameworks land in `Products/Library/Frameworks/`.
+      - Standalone library archives (the common case here) land in
+        `Products/usr/local/lib/<X>.framework` because xcodebuild uses
+        `INSTALL_PATH=/usr/local/lib` by default for SPM library targets.
+      - A few packages move things further (custom Xcode projects, etc.).
+
+    Rather than maintain a hardcoded list, we walk the Products tree once
+    and look for an exact `<framework_name>.framework` directory. The
+    legacy bash spm-to-xcframework uses the same `find Products -name
+    *.framework` strategy at lines 1094, 1168, 1248. Returns the first
+    match (sorted) or None if no `.framework` bundle exists at all.
+    """
+    products = archive_path / "Products"
+    if not products.is_dir():
+        return None
+    matches = sorted(products.rglob(f"{framework_name}.framework"))
+    for m in matches:
+        if m.is_dir():
+            return m
+    return None
+
+
+def _archive_static_lib_path(archive_path: Path) -> Optional[Path]:
+    """Return the first `lib*.a` static library found anywhere under
+    `<archive>/Products/`, or None.
+
+    Session 3 records this for diagnostic purposes only — Session 4
+    consumes it via `promote_static_to_framework`. Recording it here means
+    the device-only slice's ExecutedUnit already carries enough information
+    for Session 4 to take over without re-walking the archive.
+    """
+    products = archive_path / "Products"
+    if not products.is_dir():
+        return None
+    for path in sorted(products.rglob("lib*.a")):
+        if path.is_file():
+            return path
+    return None
+
+
+def run_xcodebuild_archive(
+    *,
+    staged_dir: Path,
+    scheme: str,
+    destination: str,
+    archive_path: Path,
+    dd_path: Path,
+    result_bundle_path: Path,
+    log_path: Path,
+    min_ios: str,
+    verbose: bool,
+) -> int:
+    """Run `xcodebuild archive` for one (build unit, slice) combination.
+
+    Captures combined stdout+stderr into `log_path`. In verbose mode the
+    output is also tee'd to the terminal as it streams; non-verbose mode
+    only writes to the log file. Returns the xcodebuild exit code (does
+    not raise).
+
+    The flag set is exactly the one specified in REWRITE_DESIGN.md §5.4:
+
+        BUILD_LIBRARY_FOR_DISTRIBUTION=YES
+        SKIP_INSTALL=NO
+        IPHONEOS_DEPLOYMENT_TARGET=<min_ios>
+        GCC_TREAT_WARNINGS_AS_ERRORS=NO
+        SWIFT_TREAT_WARNINGS_AS_ERRORS=NO
+        OTHER_SWIFT_FLAGS=-no-verify-emitted-module-interface
+        -skipPackagePluginValidation
+        -skipMacroValidation
+
+    There is **no MACH_O_TYPE=mh_dylib**. Dynamic linkage is handled at
+    the Package.swift layer in Prepare; never at the xcodebuild CLI layer.
+    The whole point of the rewrite is that the synthetic
+    `.library(type: .dynamic)` plumbing in Prepare replaces the global
+    `mh_dylib` override that the bash tool used.
+    """
+    # Make sure parent dirs exist for the archive / dd / xcresult / log paths.
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    dd_path.mkdir(parents=True, exist_ok=True)
+    result_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    # `xcodebuild archive` refuses to overwrite an existing archive, and
+    # similarly will refuse a pre-existing result bundle. Clear them so
+    # retries work.
+    if archive_path.exists():
+        shutil.rmtree(archive_path, ignore_errors=True)
+    if result_bundle_path.exists():
+        shutil.rmtree(result_bundle_path, ignore_errors=True)
+
+    cmd = [
+        "xcodebuild",
+        "archive",
+        "-scheme", scheme,
+        "-destination", destination,
+        "-archivePath", str(archive_path),
+        "-derivedDataPath", str(dd_path),
+        "-resultBundlePath", str(result_bundle_path),
+        "BUILD_LIBRARY_FOR_DISTRIBUTION=YES",
+        "SKIP_INSTALL=NO",
+        f"IPHONEOS_DEPLOYMENT_TARGET={min_ios}",
+        "GCC_TREAT_WARNINGS_AS_ERRORS=NO",
+        "SWIFT_TREAT_WARNINGS_AS_ERRORS=NO",
+        "OTHER_SWIFT_FLAGS=-no-verify-emitted-module-interface",
+        "-skipPackagePluginValidation",
+        "-skipMacroValidation",
+    ]
+
+    verbose_log(verbose, f"  $ (cd {staged_dir} && {' '.join(cmd)})")
+
+    if verbose:
+        # Stream output line-by-line to both the log file and stdout. Using
+        # Popen with text=True keeps line buffering on the file objects.
+        with open(log_path, "w") as logf:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(staged_dir),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                logf.write(line)
+            return proc.wait()
+    else:
+        with open(log_path, "w") as logf:
+            cp = subprocess.run(
+                cmd,
+                cwd=str(staged_dir),
+                stdout=logf,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            return cp.returncode
+
+
+def _parse_xcresult_build_results(data: dict, limit: int = 5) -> List[dict]:
+    """Pure parser for the JSON returned by `xcrun xcresulttool get
+    build-results`. Extracted from `read_xcresult_errors` so the unit
+    tests can exercise it without invoking xcrun.
+
+    The Xcode 16+ schema (verified against `xcrun xcresulttool get
+    build-results --schema` on Xcode 26.2) shapes errors as:
+
+        {
+          "errors": [
+            {
+              "issueType": "...",
+              "message": "...",
+              "targetName": "...",   // optional
+              "sourceURL": "...",    // optional
+              "className": "..."     // optional
+            },
+            ...
+          ],
+          ...
+        }
+
+    Returns a list of dicts shaped like
+    `{"target": str, "message": str, "source": str, "issueType": str}`.
+    Bad shapes are silently dropped — the diagnostic is best-effort and
+    must never blow up Execute's error path.
+    """
+    if not isinstance(data, dict):
+        return []
+    errors = data.get("errors")
+    if not isinstance(errors, list):
+        return []
+    out: List[dict] = []
+    for err in errors:
+        if len(out) >= limit:
+            break
+        if not isinstance(err, dict):
+            continue
+        out.append({
+            "target": str(err.get("targetName") or ""),
+            "message": str(err.get("message") or ""),
+            "source": str(err.get("sourceURL") or ""),
+            "issueType": str(err.get("issueType") or ""),
+        })
+    return out
+
+
+def read_xcresult_errors(result_bundle_path: Path, limit: int = 5) -> List[dict]:
+    """Read up to `limit` build errors from an xcresult bundle.
+
+    Uses the Xcode 16+ `xcresulttool get build-results` API exclusively
+    (no `--legacy`, no `get object`). Returns an empty list on any failure
+    — the bundle is a diagnostic, not a contract, and Execute's error
+    handling must still surface the underlying xcodebuild failure even if
+    we can't parse the bundle.
+    """
+    if not result_bundle_path.exists():
+        return []
+    cp = subprocess.run(
+        [
+            "xcrun", "xcresulttool", "get", "build-results",
+            "--path", str(result_bundle_path),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if cp.returncode != 0:
+        return []
+    try:
+        data = json.loads(cp.stdout)
+    except json.JSONDecodeError:
+        return []
+    return _parse_xcresult_build_results(data, limit=limit)
+
+
+def _format_execute_error(unit_name: str, log_path: Path, errors: List[dict]) -> str:
+    """Build a human-readable ExecuteError message body for one failed
+    build unit. Pulled out so the parallelization work in Session 4 can
+    reuse it without re-deriving the format."""
+    lines = [f"xcodebuild archive failed for build unit {unit_name!r}."]
+    if errors:
+        lines.append(f"Top {len(errors)} error(s) from xcresult:")
+        for i, err in enumerate(errors, start=1):
+            target = err.get("target") or "(unknown target)"
+            msg = err.get("message") or "(no message)"
+            src = err.get("source") or ""
+            head = f"  [{i}] [{target}] {msg}"
+            lines.append(head)
+            if src:
+                lines.append(f"      at {src}")
+    else:
+        lines.append("(xcresult bundle did not parse or contained no errors — "
+                     "fall back to the build log)")
+    lines.append(f"Build log: {log_path}")
+    return "\n".join(lines)
+
+
+def _archive_one_build_unit(
+    unit: BuildUnit,
+    *,
+    staged_dir: Path,
+    work_dir: Path,
+    min_ios: str,
+    verbose: bool,
+) -> ExecutedUnit:
+    """Run xcodebuild archive once for one build unit, device slice only.
+
+    Pure with respect to module-level state: every input is a parameter
+    and every output is part of the returned ExecutedUnit. Designed to be
+    safe for `concurrent.futures.ThreadPoolExecutor` lifting in Session 4.
+
+    Raises ExecuteError on xcodebuild failure (with parsed xcresult
+    context). On success, returns the ExecutedUnit; the caller is
+    responsible for printing whatever summary it wants.
+    """
+    archive_path = work_dir / "archives" / f"{unit.name}-ios-arm64.xcarchive"
+    dd_path = work_dir / "dd" / unit.name / "device"
+    result_bundle_path = work_dir / "results" / f"{unit.name}-device.xcresult"
+    log_path = work_dir / f".build-output-{unit.name}-device"
+
+    info(f"  Building {unit.name} — device (arm64)...")
+    rc = run_xcodebuild_archive(
+        staged_dir=staged_dir,
+        scheme=unit.scheme,
+        destination="generic/platform=iOS",
+        archive_path=archive_path,
+        dd_path=dd_path,
+        result_bundle_path=result_bundle_path,
+        log_path=log_path,
+        min_ios=min_ios,
+        verbose=verbose,
+    )
+    if rc != 0:
+        errors = read_xcresult_errors(result_bundle_path, limit=5)
+        msg = _format_execute_error(unit.name, log_path, errors)
+        raise ExecuteError(msg)
+
+    framework_path = _archive_framework_path(archive_path, unit.framework_name)
+    static_lib_path = None
+    if framework_path is None:
+        # Session 3 doesn't promote static archives — Session 4 will. We
+        # still record the .a path here so the diagnostic at end-of-run
+        # tells the user the unit produced a static archive instead of a
+        # framework, rather than reporting it as a totally empty build.
+        static_lib_path = _archive_static_lib_path(archive_path)
+        if static_lib_path is not None:
+            warn(
+                f"  {unit.name}: xcodebuild produced a static archive "
+                f"({static_lib_path.name}) instead of a .framework — "
+                f"static→dynamic promotion lands in Session 4."
+            )
+        else:
+            warn(
+                f"  {unit.name}: archive completed but no "
+                f"{unit.framework_name}.framework found anywhere under "
+                f"{archive_path}/Products/. "
+                f"Subsequent injection / xcframework steps will surface this."
+            )
+    else:
+        success(f"  {unit.name}: {framework_path.relative_to(archive_path.parent)}")
+
+    return ExecutedUnit(
+        name=unit.name,
+        archive_path=archive_path,
+        framework_path=framework_path,
+        log_path=log_path,
+        result_bundle_path=result_bundle_path,
+        static_lib_path=static_lib_path,
+    )
+
+
+def execute_source_plan_device_only(
+    prepared: PreparedPlan,
+    config: Config,
+) -> List[ExecutedUnit]:
+    """Run the device-only slice of every source-mode build unit in
+    `prepared.plan`. Sequential, no parallelism — Session 4 lifts to
+    `ThreadPoolExecutor(max_workers=2)` for device + sim concurrency.
+
+    Skips any unit with `archive_strategy == "copy-artifact"` (binary
+    mode). Returns the list of ExecutedUnits in plan order. Raises
+    ExecuteError on the first failure (later units are not attempted —
+    fail fast keeps the diagnostic small for the user).
+    """
+    if config.work_dir is None:
+        # `main()` always allocates work_dir before reaching this code path.
+        # If we get here something is structurally broken; surface it as
+        # ExecuteError so the user gets a clean phase-tagged message rather
+        # than an AssertionError that disappears under `python -O`.
+        raise ExecuteError("internal error: config.work_dir was not allocated before Execute")
+    work_dir = config.work_dir
+    results: List[ExecutedUnit] = []
+    archive_units = [u for u in prepared.plan.build_units if u.archive_strategy != "copy-artifact"]
+    if not archive_units:
+        return results
+    bold(f"\nExecuting {len(archive_units)} build unit(s) — device slice only...")
+    for unit in archive_units:
+        executed = _archive_one_build_unit(
+            unit,
+            staged_dir=prepared.package.staged_dir,
+            work_dir=work_dir,
+            min_ios=config.min_ios,
+            verbose=config.verbose,
+        )
+        results.append(executed)
+    return results
 
 
 # ============================================================================
@@ -2423,6 +3471,656 @@ def _selftest_planner_language_inference() -> None:
     )
 
 
+# --- Prepare self-tests ---------------------------------------------------
+#
+# Two layers:
+#   1. String-level unit tests for the manifest editors. Fast (no swift).
+#   2. Round-trip integration tests for the editors + planner edits. Each
+#      writes a real Package.swift to a temp dir, applies edits, runs real
+#      `swift package dump-package`, and asserts the post-edit product
+#      list matches expectations. Gated by `requires_swift=True`.
+
+# Real Package.swift fixtures, embedded as Python literals so the tests
+# don't depend on a network or a checked-out clone of GRDB / Stripe / etc.
+# These are the EXACT contents fetched from the upstream repos at the
+# pinned versions used by the swift-dotnet-packages matrix; their hazards
+# are documented in REWRITE_DESIGN.md and the Session 2 brief.
+
+# GRDB v7.9.0: three .library() declarations on the same target. The
+# session-2 brief calls out the hazard explicitly: edit_force_dynamic must
+# locate by exact `name: "GRDB"`, not by walking forward from the first
+# `.library(`, or it will edit GRDB-dynamic instead.
+GRDB_PACKAGE_SWIFT_FIXTURE = '''// swift-tools-version:6.1
+// The swift-tools-version declares the minimum version of Swift required to build this package.
+
+import Foundation
+import PackageDescription
+
+let package = Package(
+    name: "GRDB",
+    defaultLocalization: "en", // for tests
+    platforms: [
+        .iOS(.v13),
+        .macOS(.v10_15),
+        .tvOS(.v13),
+        .watchOS(.v7),
+    ],
+    products: [
+        .library(name: "GRDBSQLite", targets: ["GRDBSQLite"]),
+        .library(name: "GRDB", targets: ["GRDB"]),
+        .library(name: "GRDB-dynamic", type: .dynamic, targets: ["GRDB"]),
+    ],
+    targets: [
+        .systemLibrary(
+            name: "GRDBSQLite",
+            providers: [.apt(["libsqlite3-dev"])]),
+        .target(
+            name: "GRDB",
+            dependencies: [
+                .target(name: "GRDBSQLite"),
+            ],
+            path: "GRDB"),
+    ]
+)
+'''
+
+# Alamofire 5.10.2: same target backs both `Alamofire` (automatic) and
+# `AlamofireDynamic` (already-dynamic). Tests that the editor doesn't
+# double-patch the already-dynamic one and doesn't accidentally clobber it
+# while editing the regular one.
+ALAMOFIRE_PACKAGE_SWIFT_FIXTURE = '''// swift-tools-version: 6.0
+import PackageDescription
+
+let package = Package(name: "Alamofire",
+                      platforms: [.macOS(.v10_13),
+                                  .iOS(.v12),
+                                  .tvOS(.v12),
+                                  .watchOS(.v4)],
+                      products: [
+                          .library(name: "Alamofire", targets: ["Alamofire"]),
+                          .library(name: "AlamofireDynamic", type: .dynamic, targets: ["Alamofire"])
+                      ],
+                      targets: [.target(name: "Alamofire",
+                                        path: "Source")])
+'''
+
+# Stripe 25.6.2 (trimmed): the Stripe library is buried inside several
+# multi-line `.library(...)` and `.target(...)` calls with nested arrays.
+# The full real manifest has 14 .library entries; this trimmed version
+# preserves the multi-line shape and the no-trailing-comma `]` close.
+# Targets included only by reference; dump-package doesn't validate paths.
+STRIPE_PACKAGE_SWIFT_FIXTURE = '''// swift-tools-version:5.7
+import PackageDescription
+
+let package = Package(
+    name: "Stripe",
+    defaultLocalization: "en",
+    platforms: [
+        .iOS(.v13)
+    ],
+    products: [
+        .library(
+            name: "Stripe",
+            targets: ["Stripe"]
+        ),
+        .library(
+            name: "StripePayments",
+            targets: ["StripePayments"]
+        ),
+        .library(
+            name: "StripeFinancialConnections",
+            targets: ["StripeFinancialConnections"]
+        ),
+        .library(
+            name: "StripeConnect",
+            targets: ["StripeConnect"]
+        )
+    ],
+    targets: [
+        .target(
+            name: "Stripe",
+            dependencies: ["StripeCore", "StripePayments"],
+            path: "Stripe/StripeiOS"
+        ),
+        .target(
+            name: "StripeCore",
+            path: "StripeCore/StripeCore"
+        ),
+        .target(
+            name: "StripePayments",
+            dependencies: ["StripeCore"],
+            path: "StripePayments/StripePayments"
+        ),
+        .target(
+            name: "StripeFinancialConnections",
+            dependencies: ["StripeCore"],
+            path: "StripeFinancialConnections/StripeFinancialConnections"
+        ),
+        .target(
+            name: "StripeConnect",
+            dependencies: ["StripeCore", "StripeFinancialConnections"],
+            path: "StripeConnect/StripeConnect"
+        )
+    ]
+)
+'''
+
+# A small fixture that mixes a system library with a regular target. The
+# planner skips the system product entirely and Prepare must therefore
+# leave it untouched. Used to confirm the validator doesn't false-positive
+# on packages that contain system targets.
+SYSTEM_LIB_PACKAGE_SWIFT_FIXTURE = '''// swift-tools-version:5.7
+import PackageDescription
+
+let package = Package(
+    name: "MixedSystem",
+    platforms: [.iOS(.v13)],
+    products: [
+        .library(name: "Sqlite3", targets: ["Sqlite3"]),
+        .library(name: "Wrapper", targets: ["Wrapper"]),
+    ],
+    targets: [
+        .systemLibrary(
+            name: "Sqlite3",
+            providers: [.apt(["libsqlite3-dev"])]),
+        .target(
+            name: "Wrapper",
+            dependencies: ["Sqlite3"],
+            path: "Sources/Wrapper"),
+    ]
+)
+'''
+
+
+def _selftest_balanced_close_basic() -> None:
+    s = "(abc)"
+    _assert(_balanced_close(s, 0) == 4, f"_balanced_close basic: {_balanced_close(s, 0)}")
+    s = "((a)(b))"
+    _assert(_balanced_close(s, 0) == 7, f"nested: {_balanced_close(s, 0)}")
+    s = "(a)(b)"
+    _assert(_balanced_close(s, 0) == 2, f"first call ends at 2")
+    _assert(_balanced_close(s, 3) == 5, f"second call")
+    # Mismatched
+    _assert(_balanced_close("(a", 0) == -1, "no close → -1")
+
+
+def _selftest_balanced_close_strings() -> None:
+    # String literals containing parens must be skipped.
+    s = '(name: "foo)bar")'
+    _assert(_balanced_close(s, 0) == len(s) - 1,
+            f"string-with-paren: {_balanced_close(s, 0)} vs {len(s)-1}")
+    # Escaped quotes inside strings must not end the string early.
+    s = '(name: "a\\"b)c", x: 1)'
+    _assert(_balanced_close(s, 0) == len(s) - 1,
+            f"escaped-quote: {_balanced_close(s, 0)} vs {len(s)-1}")
+
+
+def _selftest_balanced_close_comments() -> None:
+    # Block comment with a `)` inside.
+    s = "(a /* ) */ b)"
+    _assert(_balanced_close(s, 0) == len(s) - 1,
+            f"block-comment-with-paren: {_balanced_close(s, 0)} vs {len(s)-1}")
+    # Line comment with a `)` inside, terminated by newline.
+    s = "(a // ) ignored\n  b)"
+    _assert(_balanced_close(s, 0) == len(s) - 1,
+            f"line-comment-with-paren: {_balanced_close(s, 0)} vs {len(s)-1}")
+
+
+def _selftest_edit_force_dynamic_grdb_targets_correct_library() -> None:
+    """The CRITICAL hazard: GRDB has two libraries whose names start with
+    'GRDB'. force_dynamic('GRDB') must edit the middle one ('GRDB'), NOT
+    the third one ('GRDB-dynamic') and NOT GRDBSQLite. This is the bug
+    the session-2 worker called out by name."""
+    out = edit_force_dynamic(GRDB_PACKAGE_SWIFT_FIXTURE, "GRDB")
+    # The GRDB line must now contain `type: .dynamic`.
+    grdb_line = [
+        ln for ln in out.splitlines()
+        if 'name: "GRDB",' in ln and ".library(" in ln
+    ]
+    _assert(len(grdb_line) == 1, f"expected exactly one GRDB .library line, got {len(grdb_line)}")
+    _assert("type: .dynamic" in grdb_line[0],
+            f"GRDB line missing type: .dynamic — {grdb_line[0]}")
+    # GRDB-dynamic line must be unchanged: still contains the same shape.
+    grdb_dyn_line = [
+        ln for ln in out.splitlines()
+        if 'name: "GRDB-dynamic"' in ln
+    ]
+    _assert(len(grdb_dyn_line) == 1, "GRDB-dynamic line missing")
+    _assert(
+        grdb_dyn_line[0].count("type: .dynamic") == 1,
+        f"GRDB-dynamic line should still have exactly one type: .dynamic — {grdb_dyn_line[0]}",
+    )
+    # GRDBSQLite line must be untouched (still no type: clause).
+    grdb_sqlite_line = [
+        ln for ln in out.splitlines()
+        if 'name: "GRDBSQLite"' in ln and ".library(" in ln
+    ]
+    _assert(len(grdb_sqlite_line) == 1, "GRDBSQLite line missing")
+    _assert(
+        "type:" not in grdb_sqlite_line[0],
+        f"GRDBSQLite line should NOT have a type: clause — {grdb_sqlite_line[0]}",
+    )
+
+
+def _selftest_edit_force_dynamic_already_dynamic_is_noop() -> None:
+    """Defensive: if the edit is somehow applied to an already-dynamic
+    library, it must not introduce a duplicate clause or otherwise
+    corrupt the manifest."""
+    out = edit_force_dynamic(GRDB_PACKAGE_SWIFT_FIXTURE, "GRDB-dynamic")
+    _assert(out == GRDB_PACKAGE_SWIFT_FIXTURE,
+            "force_dynamic on already-dynamic product should be a no-op")
+
+
+def _selftest_edit_force_dynamic_replaces_existing_type() -> None:
+    """If a library already has `type: .static`, the edit replaces it
+    with `type: .dynamic` rather than appending a second `type:` clause."""
+    src = '''let p = Package(
+    products: [
+        .library(name: "Foo", type: .static, targets: ["Foo"]),
+    ]
+)
+'''
+    out = edit_force_dynamic(src, "Foo")
+    _assert("type: .dynamic" in out, f"expected .dynamic in output: {out}")
+    _assert(".static" not in out, f"static not removed: {out}")
+    # Make sure exactly one type: clause exists.
+    _assert(out.count("type:") == 1, f"expected exactly one type: clause, got {out.count('type:')}")
+
+
+def _selftest_edit_force_dynamic_multiline_arguments() -> None:
+    """Stripe-shape: the .library(...) call uses multi-line arguments. The
+    balanced-paren walker must navigate them correctly."""
+    out = edit_force_dynamic(STRIPE_PACKAGE_SWIFT_FIXTURE, "Stripe")
+    # The Stripe library should now have type: .dynamic injected after
+    # the name line. The simplest assertion: the modified text contains
+    # `name: "Stripe", type: .dynamic` (with whatever exact spacing the
+    # editor uses).
+    _assert('name: "Stripe", type: .dynamic' in out,
+            f"Stripe edit didn't land — searched for 'name: \"Stripe\", type: .dynamic'")
+    # And StripePayments must remain untouched (its `name:` line is on
+    # its own line, no type: clause should be added).
+    _assert('name: "StripePayments",\n            targets:' in out,
+            "StripePayments was unexpectedly modified")
+
+
+def _selftest_edit_force_dynamic_missing_product_raises() -> None:
+    """Deliberate-failure path: requesting force_dynamic on a name that
+    doesn't exist must raise PrepareError, not silently no-op."""
+    try:
+        edit_force_dynamic(GRDB_PACKAGE_SWIFT_FIXTURE, "DoesNotExist")
+    except PrepareError as exc:
+        _assert("DoesNotExist" in str(exc), f"error mentions name: {exc}")
+        return
+    raise AssertionError("expected PrepareError for missing product")
+
+
+def _selftest_edit_add_synthetic_library_no_trailing_comma() -> None:
+    """Stripe-shape `]` (no trailing comma after last entry): the editor
+    must insert a leading comma + new entry before the close bracket."""
+    out = edit_add_synthetic_library(STRIPE_PACKAGE_SWIFT_FIXTURE, "StripeCore", ["StripeCore"])
+    _assert(
+        '.library(name: "StripeCore", type: .dynamic, targets: ["StripeCore"])' in out,
+        "synthetic library entry missing",
+    )
+    # The previous last entry's closing `)` should now be followed by a `,`.
+    # Find the last existing entry's close paren in the modified text.
+    idx = out.find('.library(\n            name: "StripeConnect"')
+    _assert(idx != -1, "StripeConnect entry should still be there")
+    after = out[idx:]
+    # The first `)` after StripeConnect's open should be followed by `,`.
+    rp = after.find(")")
+    _assert(rp != -1, "StripeConnect close paren missing")
+    _assert(after[rp + 1] == ",", f"expected `,` after StripeConnect's `)`, got {after[rp+1]!r}")
+
+
+def _selftest_edit_add_synthetic_library_with_trailing_comma() -> None:
+    """GRDB-shape `,]`: the editor must NOT add a duplicate comma."""
+    out = edit_add_synthetic_library(GRDB_PACKAGE_SWIFT_FIXTURE, "MyExtra", ["GRDB"])
+    _assert(
+        '.library(name: "MyExtra", type: .dynamic, targets: ["GRDB"])' in out,
+        "synthetic library entry missing",
+    )
+    # GRDB-dynamic line ends with `,` — check we didn't double up.
+    grdb_dyn_idx = out.find('.library(name: "GRDB-dynamic"')
+    _assert(grdb_dyn_idx != -1, "GRDB-dynamic line should still be there")
+    rp = out.find(")", grdb_dyn_idx)
+    _assert(out[rp + 1] == ",", f"GRDB-dynamic should still end with `,`, got {out[rp+1]!r}")
+    _assert(out[rp + 2] != ",", f"no double comma — got {out[rp+1:rp+3]!r}")
+
+
+def _selftest_edit_add_synthetic_library_empty_array() -> None:
+    """An empty `products: []` should accept a new entry without
+    corrupting the brackets."""
+    src = '''let p = Package(
+    name: "Empty",
+    products: [],
+    targets: []
+)
+'''
+    out = edit_add_synthetic_library(src, "Foo", ["Foo"])
+    _assert('.library(name: "Foo", type: .dynamic, targets: ["Foo"])' in out,
+            f"missing entry: {out}")
+    # `[]` was empty; after edit, products list should be a valid array.
+    # Specifically the `[]` close bracket must still be present somewhere.
+    _assert("]," in out and "products: [" in out, f"shape broken: {out}")
+
+
+def _selftest_parse_xcresult_build_results() -> None:
+    """The xcresulttool parser extracts target/message/source from the
+    Xcode 16+ build-results JSON shape, drops malformed entries, and
+    honors the `limit` parameter."""
+    fixture = {
+        "actionTitle": "Build",
+        "destination": {"deviceId": "x", "deviceName": "iPhone", "architecture": "arm64", "modelName": "x", "osVersion": "18.0"},
+        "startTime": 0.0,
+        "endTime": 1.0,
+        "status": "failed",
+        "errorCount": 3,
+        "warningCount": 0,
+        "analyzerWarningCount": 0,
+        "analyzerWarnings": [],
+        "warnings": [],
+        "errors": [
+            {
+                "issueType": "Swift Compiler Error",
+                "message": "cannot find 'Foo' in scope",
+                "targetName": "MyTarget",
+                "sourceURL": "file:///x/y.swift",
+            },
+            {
+                "issueType": "Swift Compiler Error",
+                "message": "expected expression",
+                "targetName": "MyTarget",
+            },
+            {
+                # malformed entry — no message field — should be picked
+                # up but produce empty strings, not crash.
+                "issueType": "Misc",
+            },
+            "garbage non-dict entry — must be silently dropped",
+        ],
+    }
+    out = _parse_xcresult_build_results(fixture, limit=10)
+    _assert(len(out) == 3, f"expected 3 parsed errors, got {len(out)}")
+    _assert(out[0]["target"] == "MyTarget", f"first target: {out[0]}")
+    _assert("Foo" in out[0]["message"], f"first message: {out[0]}")
+    _assert("y.swift" in out[0]["source"], f"first source: {out[0]}")
+    # Limit honored
+    out2 = _parse_xcresult_build_results(fixture, limit=2)
+    _assert(len(out2) == 2, f"limit=2 returned {len(out2)}")
+    # Bad shapes return []
+    _assert(_parse_xcresult_build_results({}, limit=5) == [], "empty dict")
+    _assert(_parse_xcresult_build_results({"errors": "not a list"}, limit=5) == [], "non-list errors")
+    _assert(_parse_xcresult_build_results("not a dict", limit=5) == [], "non-dict input")
+
+
+def _selftest_unsupported_swift_constructs() -> None:
+    """The Prepare safety net rejects Package.swift files containing Swift
+    constructs the balanced-paren walker can't reason about: raw strings,
+    triple-quoted strings, and string interpolation. Each variant should
+    raise PrepareError with a targeted message rather than allowing the
+    walker to silently mis-parse.
+    """
+    # Plain manifests pass through.
+    _assert_no_unsupported_swift_constructs(
+        '// swift-tools-version:5.7\nlet x = "ok"\n'
+    )
+
+    def _expect_raise(text: str, hint: str) -> None:
+        try:
+            _assert_no_unsupported_swift_constructs(text)
+        except PrepareError as exc:
+            _assert(hint in str(exc), f"expected '{hint}' in error, got: {exc}")
+            return
+        raise AssertionError(f"expected PrepareError for {hint!r}")
+
+    _expect_raise('let x = #"hi"#\n', "raw string")
+    _expect_raise('let x = """\nhi\n"""\n', "triple-quoted")
+    _expect_raise('let x = "name=\\(foo)"\n', "interpolation")
+
+
+def _selftest_select_active_manifest() -> None:
+    """The active-manifest selector mirrors SPM's rule: pick the highest
+    Package@swift-X.Y[.Z].swift whose version is <= the toolchain version,
+    falling back to Package.swift. Without `swift` on PATH (or with an
+    unparseable version) it falls back to Package.swift unconditionally.
+
+    Verifies that the patch component breaks ties correctly: a 5.9.1
+    variant wins over a bare 5.9 on a 5.9.1+ toolchain, but loses on 5.9.0.
+
+    We can't easily mock the toolchain version inside this fast test, so
+    we monkey-patch _swift_toolchain_version for the duration of the call.
+    """
+    import tempfile
+    global _swift_toolchain_version  # noqa: PLW0603
+    saved = _swift_toolchain_version
+    try:
+        with tempfile.TemporaryDirectory(prefix="spm2x-active-manifest-") as tmp:
+            d = Path(tmp)
+            (d / "Package.swift").write_text("// base\n")
+            (d / "Package@swift-5.9.swift").write_text("// 5.9\n")
+            (d / "Package@swift-5.9.1.swift").write_text("// 5.9.1\n")
+            (d / "Package@swift-5.10.swift").write_text("// 5.10\n")
+            (d / "Package@swift-6.0.swift").write_text("// 6.0\n")
+
+            _swift_toolchain_version = lambda: (6, 2, 0)  # noqa: E731
+            picked = _select_active_manifest(d)
+            _assert(picked.name == "Package@swift-6.0.swift", f"toolchain 6.2 picked {picked.name}")
+
+            _swift_toolchain_version = lambda: (5, 9, 5)  # noqa: E731
+            picked = _select_active_manifest(d)
+            _assert(picked.name == "Package@swift-5.9.1.swift",
+                    f"toolchain 5.9.5 should pick the .1 patch variant, picked {picked.name}")
+
+            _swift_toolchain_version = lambda: (5, 9, 0)  # noqa: E731
+            picked = _select_active_manifest(d)
+            _assert(picked.name == "Package@swift-5.9.swift",
+                    f"toolchain 5.9.0 should reject the .1 patch variant, picked {picked.name}")
+
+            _swift_toolchain_version = lambda: (5, 7, 0)  # noqa: E731
+            picked = _select_active_manifest(d)
+            _assert(picked.name == "Package.swift", f"toolchain 5.7 picked {picked.name}")
+
+            _swift_toolchain_version = lambda: None  # noqa: E731
+            picked = _select_active_manifest(d)
+            _assert(picked.name == "Package.swift", f"unknown toolchain picked {picked.name}")
+    finally:
+        _swift_toolchain_version = saved
+
+
+# --- Round-trip self-tests ------------------------------------------------
+#
+# These all require a real `swift` toolchain on PATH and write fixtures
+# to a temp dir before invoking `swift package dump-package`. They're the
+# core pre-merge gate for Prepare per REWRITE_DESIGN.md §9.
+
+
+def _roundtrip_apply_and_dump(
+    fixture_text: str,
+    edits: List[PackageSwiftEdit],
+    *,
+    plan: Optional[Plan] = None,
+) -> Tuple[Path, Plan, dict]:
+    """Helper: write the fixture, apply the planner-style edits via
+    apply_package_swift_edits, then run `swift package dump-package` and
+    return (staged_dir, plan, dumped_json).
+
+    The caller is responsible for cleaning up `staged_dir` (test harness
+    runs everything inside a top-level temp dir).
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="spm2xc-prep-"))
+    (tmp / "Package.swift").write_text(fixture_text)
+    if plan is None:
+        plan = Plan()
+        plan.package_swift_edits = list(edits)
+    else:
+        plan.package_swift_edits = list(edits)
+    apply_package_swift_edits(tmp, plan)
+    cp = subprocess.run(
+        ["swift", "package", "dump-package"],
+        cwd=str(tmp),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if cp.returncode != 0:
+        raise AssertionError(
+            f"swift package dump-package failed after edits:\n"
+            f"  {cp.stderr.strip()}\n  Edited Package.swift:\n"
+            f"{(tmp / 'Package.swift').read_text()}"
+        )
+    return tmp, plan, json.loads(cp.stdout)
+
+
+def _roundtrip_grdb() -> None:
+    """GRDB: force_dynamic on GRDB only. Verify GRDB ends up dynamic;
+    GRDBSQLite + GRDB-dynamic remain unchanged."""
+    edits = [PackageSwiftEdit(kind="force_dynamic", product_name="GRDB", targets=["GRDB"])]
+    staged, plan, dump = _roundtrip_apply_and_dump(GRDB_PACKAGE_SWIFT_FIXTURE, edits)
+    try:
+        prods = {p["name"]: p for p in dump["products"]}
+        _assert(prods["GRDB"]["type"]["library"][0] == "dynamic",
+                f"GRDB linkage: {prods['GRDB']['type']}")
+        _assert(prods["GRDB-dynamic"]["type"]["library"][0] == "dynamic",
+                f"GRDB-dynamic linkage: {prods['GRDB-dynamic']['type']}")
+        _assert(prods["GRDBSQLite"]["type"]["library"][0] == "automatic",
+                f"GRDBSQLite linkage: {prods['GRDBSQLite']['type']}")
+    finally:
+        shutil.rmtree(staged, ignore_errors=True)
+
+
+def _roundtrip_alamofire() -> None:
+    """Alamofire: force_dynamic on Alamofire (the automatic one). Verify
+    BOTH products survive and AlamofireDynamic isn't double-patched."""
+    edits = [PackageSwiftEdit(kind="force_dynamic", product_name="Alamofire", targets=["Alamofire"])]
+    staged, plan, dump = _roundtrip_apply_and_dump(ALAMOFIRE_PACKAGE_SWIFT_FIXTURE, edits)
+    try:
+        prods = {p["name"]: p for p in dump["products"]}
+        _assert(set(prods.keys()) == {"Alamofire", "AlamofireDynamic"},
+                f"Alamofire products: {sorted(prods.keys())}")
+        _assert(prods["Alamofire"]["type"]["library"][0] == "dynamic",
+                f"Alamofire linkage: {prods['Alamofire']['type']}")
+        _assert(prods["AlamofireDynamic"]["type"]["library"][0] == "dynamic",
+                f"AlamofireDynamic linkage: {prods['AlamofireDynamic']['type']}")
+    finally:
+        shutil.rmtree(staged, ignore_errors=True)
+
+
+def _roundtrip_stripe_force_dynamic_and_synthetic() -> None:
+    """Stripe: force_dynamic on Stripe + add_synthetic_library StripeCore.
+    Verify both edits land and the existing 4 products survive."""
+    edits = [
+        PackageSwiftEdit(kind="force_dynamic", product_name="Stripe", targets=["Stripe"]),
+        PackageSwiftEdit(kind="add_synthetic_library", product_name="StripeCore", targets=["StripeCore"]),
+    ]
+    staged, plan, dump = _roundtrip_apply_and_dump(STRIPE_PACKAGE_SWIFT_FIXTURE, edits)
+    try:
+        prods = {p["name"]: p for p in dump["products"]}
+        # All 4 original + 1 synthetic
+        expected = {"Stripe", "StripePayments", "StripeFinancialConnections", "StripeConnect", "StripeCore"}
+        _assert(set(prods.keys()) == expected,
+                f"Stripe products: {sorted(prods.keys())}; expected {sorted(expected)}")
+        _assert(prods["Stripe"]["type"]["library"][0] == "dynamic",
+                f"Stripe linkage: {prods['Stripe']['type']}")
+        _assert(prods["StripeCore"]["type"]["library"][0] == "dynamic",
+                f"StripeCore linkage: {prods['StripeCore']['type']}")
+        _assert(prods["StripeCore"]["targets"] == ["StripeCore"],
+                f"StripeCore targets: {prods['StripeCore']['targets']}")
+        # Untouched products should still be automatic
+        _assert(prods["StripePayments"]["type"]["library"][0] == "automatic",
+                f"StripePayments linkage: {prods['StripePayments']['type']}")
+    finally:
+        shutil.rmtree(staged, ignore_errors=True)
+
+
+def _roundtrip_system_library_left_alone() -> None:
+    """A package with a system library + a regular target: the planner
+    skips the system one, so Prepare only force_dynamics the regular
+    one. Validator must accept this without complaint."""
+    edits = [PackageSwiftEdit(kind="force_dynamic", product_name="Wrapper", targets=["Wrapper"])]
+    staged, plan, dump = _roundtrip_apply_and_dump(SYSTEM_LIB_PACKAGE_SWIFT_FIXTURE, edits)
+    try:
+        prods = {p["name"]: p for p in dump["products"]}
+        _assert(prods["Wrapper"]["type"]["library"][0] == "dynamic",
+                f"Wrapper linkage: {prods['Wrapper']['type']}")
+        # Sqlite3 left alone — still automatic.
+        _assert(prods["Sqlite3"]["type"]["library"][0] == "automatic",
+                f"Sqlite3 linkage: {prods['Sqlite3']['type']}")
+    finally:
+        shutil.rmtree(staged, ignore_errors=True)
+
+
+def _roundtrip_validator_catches_missing_product() -> None:
+    """The mandatory round-trip validator must raise PrepareError when
+    the planner asks Prepare to force_dynamic a product that doesn't
+    exist in the manifest. The exception is raised by the editor (it can't
+    find the .library() call), but the test confirms the path is wired up
+    end-to-end through `prepare()`."""
+    tmp = Path(tempfile.mkdtemp(prefix="spm2xc-prep-bad-"))
+    try:
+        (tmp / "Package.swift").write_text(GRDB_PACKAGE_SWIFT_FIXTURE)
+        plan = Plan()
+        plan.package_swift_edits = [
+            PackageSwiftEdit(kind="force_dynamic", product_name="DoesNotExist",
+                             targets=["DoesNotExist"]),
+        ]
+        try:
+            prepare(tmp, plan, verbose=False)
+        except PrepareError as exc:
+            _assert("DoesNotExist" in str(exc),
+                    f"PrepareError should mention DoesNotExist: {exc}")
+            return
+        raise AssertionError("expected PrepareError for non-existent product")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _roundtrip_full_prepare_grdb() -> None:
+    """End-to-end Prepare on a GRDB-shaped Plan: confirms validator
+    accepts the planner's exact edit list (force_dynamic on GRDB only,
+    leaving GRDB-dynamic and GRDBSQLite alone). This is the gate that
+    catches edit/planner drift across sessions."""
+    tmp = Path(tempfile.mkdtemp(prefix="spm2xc-prep-grdb-"))
+    try:
+        (tmp / "Package.swift").write_text(GRDB_PACKAGE_SWIFT_FIXTURE)
+        plan = Plan()
+        plan.package_swift_edits = [
+            PackageSwiftEdit(kind="force_dynamic", product_name="GRDB", targets=["GRDB"]),
+        ]
+        plan.build_units = [
+            BuildUnit(
+                name="GRDB",
+                scheme="GRDB",
+                framework_name="GRDB",
+                language=Language.SWIFT,
+                archive_strategy="archive",
+                source_targets=["GRDB"],
+            ),
+            BuildUnit(
+                name="GRDB-dynamic",
+                scheme="GRDB-dynamic",
+                framework_name="GRDB-dynamic",
+                language=Language.SWIFT,
+                archive_strategy="archive",
+                source_targets=["GRDB"],
+            ),
+        ]
+        prepared = prepare(tmp, plan, verbose=False)
+        prods = {p.name: p for p in prepared.package.products}
+        _assert(prods["GRDB"].linkage == Linkage.DYNAMIC,
+                f"GRDB linkage: {prods['GRDB'].linkage}")
+        _assert(prods["GRDB-dynamic"].linkage == Linkage.DYNAMIC,
+                f"GRDB-dynamic linkage: {prods['GRDB-dynamic'].linkage}")
+        # GRDBSQLite was not in build_units (planner skipped it), so the
+        # validator's "every build_unit's product is present" check
+        # doesn't fire on it. The product itself is still in the dump.
+        _assert("GRDBSQLite" in prods, "GRDBSQLite missing from dumped products")
+        _assert(prods["GRDBSQLite"].linkage == Linkage.AUTOMATIC,
+                f"GRDBSQLite should be untouched, got {prods['GRDBSQLite'].linkage}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 # Test registry. Tuples of (name, callable, requires_swift). The fast mode
 # only runs entries with requires_swift=False.
 def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
@@ -2459,7 +4157,42 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          _selftest_planner_language_inference, False),
         ("print_plan label derivation (SCP / URL / local)",
          _selftest_derive_package_label, False),
+        ("balanced paren walker basic", _selftest_balanced_close_basic, False),
+        ("balanced paren walker strings", _selftest_balanced_close_strings, False),
+        ("balanced paren walker comments", _selftest_balanced_close_comments, False),
+        ("edit_force_dynamic GRDB three-library hazard",
+         _selftest_edit_force_dynamic_grdb_targets_correct_library, False),
+        ("edit_force_dynamic already-dynamic no-op",
+         _selftest_edit_force_dynamic_already_dynamic_is_noop, False),
+        ("edit_force_dynamic replaces existing type",
+         _selftest_edit_force_dynamic_replaces_existing_type, False),
+        ("edit_force_dynamic multiline arguments (Stripe)",
+         _selftest_edit_force_dynamic_multiline_arguments, False),
+        ("edit_force_dynamic missing product raises",
+         _selftest_edit_force_dynamic_missing_product_raises, False),
+        ("edit_add_synthetic_library no trailing comma (Stripe)",
+         _selftest_edit_add_synthetic_library_no_trailing_comma, False),
+        ("edit_add_synthetic_library with trailing comma (GRDB)",
+         _selftest_edit_add_synthetic_library_with_trailing_comma, False),
+        ("edit_add_synthetic_library empty products array",
+         _selftest_edit_add_synthetic_library_empty_array, False),
+        ("xcresulttool build-results parser",
+         _selftest_parse_xcresult_build_results, False),
+        ("unsupported Swift constructs guard",
+         _selftest_unsupported_swift_constructs, False),
+        ("active manifest selector (Package@swift-X.Y)",
+         _selftest_select_active_manifest, False),
         ("MiniMixed fetch+stage+inspect (real swift)", _selftest_minimixed_fetch_integration, True),
+        ("round-trip: GRDB (force_dynamic + skip system)", _roundtrip_grdb, True),
+        ("round-trip: Alamofire (force_dynamic regular, leave dynamic)",
+         _roundtrip_alamofire, True),
+        ("round-trip: Stripe (force_dynamic + add_synthetic_library)",
+         _roundtrip_stripe_force_dynamic_and_synthetic, True),
+        ("round-trip: system library left alone",
+         _roundtrip_system_library_left_alone, True),
+        ("round-trip: validator catches missing product (PrepareError)",
+         _roundtrip_validator_catches_missing_product, True),
+        ("round-trip: full prepare() flow on GRDB", _roundtrip_full_prepare_grdb, True),
     ]
 
 
@@ -2643,11 +4376,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 def _run_source_mode(config: Config) -> int:
-    """Source-mode pipeline: Fetch → Inspect → Plan → (Prepare/Execute/Verify).
+    """Source-mode pipeline: Fetch → Inspect → Plan → Prepare → Execute → Verify.
 
-    Session 2 stops after Plan for --dry-run and --inspect-only; full
-    builds still fall through to the Session 1 stub notice. Sessions 3+
-    will fill in the rest.
+    Session 3 wires Prepare and the device-only slice of Execute. Session 4
+    extends Execute with the simulator slice, parallelism,
+    static→dynamic promotion, and xcframework merge. Session 5 adds
+    Verify.
     """
     source_dir = fetch_source(config)
     staged_dir = stage_source(config, source_dir)
@@ -2660,20 +4394,26 @@ def _run_source_mode(config: Config) -> int:
     plan = plan_source_build(config, package)
     for w in plan.warnings:
         warn(w)
+    print_plan(plan, package=package, config=config)
 
     if config.dry_run:
-        print_plan(plan, package=package, config=config)
         return 0
 
-    # Past Plan, Session 2 has no more work. The Session 1 stub notice
-    # still applies until Session 3 wires in Prepare + Execute.
-    print_package(package)
-    print_plan(plan, package=package, config=config)
+    prepared = prepare(staged_dir, plan, verbose=config.verbose)
+    executed = execute_source_plan_device_only(prepared, config)
+
+    bold("\n=== Session 3 results (device slice only) ===")
+    for unit in executed:
+        marker = ""
+        if unit.framework_path is None:
+            marker = "  (no framework located — Session 4 will handle static promotion)"
+        print(f"  - {unit.name}: {unit.archive_path}{marker}")
     warn(
-        "\nNote: this is a Session 2 build of the Python rewrite — "
-        "Prepare / Execute / Verify are stubs. Use --dry-run to silence "
-        "this notice. The legacy bash spm-to-xcframework still handles "
-        "full builds until the rewrite lands."
+        "\nNote: this is a Session 3 build of the Python rewrite — only "
+        "the device slice of Execute runs. Simulator builds, xcframework "
+        "merge, header / swiftmodule injection, and Verify land in "
+        "Sessions 4–5. The legacy bash spm-to-xcframework still handles "
+        "production builds until the rewrite lands."
     )
     return 0
 
@@ -2706,8 +4446,11 @@ def _run_binary_mode(config: Config) -> int:
 
 
 # Phase classification for main()'s exception handler. Stays in sync with
-# the design's "user-facing vs tool-bug" split (§7).
-_USER_FACING_ERRORS = (FetchError, InspectError, PlanError)
+# the design's "user-facing vs tool-bug" split (§7). ExecuteError sits in
+# the user-facing tier because the message body already includes the
+# parsed xcresult diagnostics + the build log path; a Python traceback on
+# top of that would just be noise.
+_USER_FACING_ERRORS = (FetchError, InspectError, PlanError, ExecuteError)
 _BUG_CLASS_ERRORS = (PrepareError,)
 
 
