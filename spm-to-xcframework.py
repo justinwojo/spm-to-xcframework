@@ -29,7 +29,7 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, List, NoReturn, Optional, Sequence, Tuple
+from typing import Callable, Iterable, List, NoReturn, Optional, Sequence, Set, Tuple
 
 # ============================================================================
 # --- Logging + color output ---
@@ -312,7 +312,18 @@ class StageSpec:
 @dataclass
 class PackageSwiftEdit:
     """Whitelisted Package.swift edit, produced by Plan and consumed by
-    Prepare. Filled in by session 2."""
+    Prepare. Two kinds:
+
+      - "force_dynamic"           — rewrite an existing library product's
+                                    linkage to `.dynamic`. `product_name`
+                                    is the product to edit; `targets` is
+                                    informational (the product's backing
+                                    targets at planning time).
+      - "add_synthetic_library"   — inject a brand-new `.library(name: T,
+                                    type: .dynamic, targets: [T])` entry.
+                                    `product_name == T`, `targets == [T]`.
+                                    The --target escape hatch from §5.2.
+    """
 
     kind: str  # "force_dynamic" | "add_synthetic_library"
     product_name: str
@@ -321,23 +332,67 @@ class PackageSwiftEdit:
 
 @dataclass
 class BuildUnit:
-    """One unit of work the executor will run. Filled in by session 2."""
+    """One unit of work the executor will run.
+
+    `archive_strategy` discriminates the execute path:
+      - "archive"         — run `xcodebuild archive` against the scheme.
+      - "static-promote"  — xcodebuild produced a .a; clang -dynamiclib it.
+                            Currently unused at plan time (Execute decides).
+      - "copy-artifact"   — binary mode: the xcframework already exists on
+                            disk at `artifact_path`; Execute just copies it.
+    """
 
     name: str
     scheme: str
     framework_name: str
     language: str
-    archive_strategy: str  # "Archive" | "StaticPromote" | "CopyArtifact"
+    archive_strategy: str
     source_targets: List[str] = field(default_factory=list)
+    # True iff this unit exists because of `--target T` — i.e. the plan
+    # injects a synthetic `.library()` entry for it. Affects dry-run labels
+    # and Verify's per-unit error messages.
+    synthetic: bool = False
+    # Populated only for archive_strategy == "copy-artifact". Absolute path
+    # to the xcframework discovered under `.build/artifacts/` by Fetch.
+    artifact_path: Optional[Path] = None
+
+
+@dataclass
+class BinaryArtifact:
+    """A pre-built xcframework discovered via binary-mode SPM resolve.
+
+    The planner takes a list of these (from `discover_binary_artifacts`)
+    and filters by --product. Each surviving record becomes a build unit
+    whose execute strategy is "copy-artifact".
+    """
+
+    product_name: str  # the xcframework name without the .xcframework suffix
+    path: Path         # absolute path to the .xcframework directory
 
 
 @dataclass
 class Plan:
-    """Output of the planner. Stub in session 1."""
+    """Output of the planner: a typed description of what the downstream
+    phases will do. Pure data — no side effects, no filesystem handles
+    beyond what inspect already gave us."""
 
     stage: StageSpec = field(default_factory=StageSpec)
     package_swift_edits: List[PackageSwiftEdit] = field(default_factory=list)
     build_units: List[BuildUnit] = field(default_factory=list)
+    # Products the planner dropped, with a human-readable reason. Printed
+    # by --dry-run and surfaced in the final run summary.
+    skipped: List[Tuple[str, str]] = field(default_factory=list)
+    # Planner diagnostics that aren't errors — surfaced to stderr by the
+    # caller after planning completes. Kept as data so the planner stays
+    # a pure function (§5.2 contract).
+    warnings: List[str] = field(default_factory=list)
+    # --include-deps flag forwarded to Execute. The planner can't enumerate
+    # transitive deps ahead of time (they only exist after xcodebuild runs),
+    # so this is just a gate.
+    include_deps: bool = False
+    # True for binary-mode plans. Execute uses this to skip xcodebuild
+    # entirely. The planner is the only thing that sets it.
+    binary_mode: bool = False
 
 
 # ============================================================================
@@ -638,6 +693,118 @@ def stage_source(config: Config, source_dir: Path) -> Path:
         verbose_log(config.verbose, f"  Removed {removed_count} excluded path(s) from staged tree")
 
     return staged_dir
+
+
+def discover_binary_artifacts(config: Config) -> List[BinaryArtifact]:
+    """Resolve a binary-mode SPM shim and walk `.build/artifacts/` for
+    xcframeworks. Used by binary mode instead of fetch_source + stage.
+
+    Side effects: writes a shim Package.swift under
+    `WORK_DIR/binary-resolve/`, runs `swift package resolve`, walks the
+    resulting `.build/artifacts/` tree. The planner that consumes the
+    returned list is still a pure function.
+
+    Two structural fixes live here (bugs 1 and 3 in
+    SPM_TO_XCFRAMEWORK_NOTES.md):
+
+      1. The shim's `exact:` string is `config.user_version` with a
+         leading "v" stripped. That's the bare semver SPM's resolver
+         requires, regardless of whether the user typed "7.6.2" or
+         "v7.6.2".
+      2. `os.walk` prunes any `__MACOSX` directories before descending,
+         so AppleDouble ghost xcframeworks never make it into the
+         returned list.
+
+    Session 2 only needs this for `--dry-run`. Session 4 will call it
+    from the real Execute path; the function is intentionally shaped
+    so the return value feeds straight into `plan_binary_build`.
+    """
+    assert config.work_dir is not None
+    if not config.is_remote:
+        raise FetchError("--binary requires a remote package URL.")
+    if not config.user_version:
+        raise FetchError("--binary requires --version.")
+
+    shim_dir = config.work_dir / "binary-resolve"
+    shim_dir.mkdir(parents=True, exist_ok=True)
+
+    # Bug 1 fix: feed the bare semver, not the git-tag form. Strip a
+    # leading "v" so `--version v7.6.2` also resolves cleanly.
+    exact_version = config.user_version[1:] if config.user_version.startswith("v") else config.user_version
+
+    # Minimum iOS for the shim. SPM resolve doesn't actually care about
+    # the version, but the manifest needs to be self-consistent. Use the
+    # major version from config.min_ios.
+    try:
+        major = int(config.min_ios.split(".")[0])
+    except (ValueError, IndexError):
+        major = 15
+
+    manifest = (
+        "// swift-tools-version:5.7\n"
+        "import PackageDescription\n"
+        "\n"
+        "let package = Package(\n"
+        '    name: "binary-resolver",\n'
+        f"    platforms: [.iOS(.v{major})],\n"
+        "    dependencies: [\n"
+        f'        .package(url: "{config.package_source}", exact: "{exact_version}"),\n'
+        "    ],\n"
+        "    targets: [\n"
+        '        .target(name: "Dummy", path: "Sources"),\n'
+        "    ]\n"
+        ")\n"
+    )
+    (shim_dir / "Package.swift").write_text(manifest)
+    sources_dir = shim_dir / "Sources"
+    sources_dir.mkdir(parents=True, exist_ok=True)
+    (sources_dir / "Dummy.swift").write_text("// placeholder\n")
+
+    info(f"Resolving binary artifacts from {config.package_source} @ {exact_version}...")
+    cp = subprocess.run(
+        ["swift", "package", "resolve"],
+        cwd=str(shim_dir),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if cp.returncode != 0:
+        tail = "\n".join((cp.stderr or "").rstrip().splitlines()[-10:])
+        raise FetchError(
+            "Failed to resolve binary package dependencies:\n"
+            + (tail or "  (no stderr)")
+        )
+
+    artifacts_root = shim_dir / ".build" / "artifacts"
+    if not artifacts_root.is_dir():
+        raise FetchError(
+            "No .build/artifacts directory after resolve — this package "
+            "may not ship binary xcframeworks."
+        )
+
+    found: List[BinaryArtifact] = []
+    for dirpath, dirnames, _filenames in os.walk(artifacts_root):
+        # Bug 3 fix: prune __MACOSX ghosts before descending or matching.
+        dirnames[:] = [d for d in dirnames if d != "__MACOSX"]
+        # Collect .xcframework directories at the current level without
+        # descending into them (they have their own internal structure
+        # that we don't want to walk).
+        remaining: List[str] = []
+        for d in dirnames:
+            if d.endswith(".xcframework"):
+                name = d[: -len(".xcframework")]
+                found.append(BinaryArtifact(product_name=name, path=Path(dirpath) / d))
+            else:
+                remaining.append(d)
+        dirnames[:] = remaining
+
+    if not found:
+        raise FetchError(
+            "No xcframeworks discovered under .build/artifacts/. "
+            "Is this actually a binary-target SPM package?"
+        )
+
+    return found
 
 
 def _default_target_path(target_name: str, target_kind: str) -> Optional[str]:
@@ -1008,18 +1175,441 @@ def print_package(pkg: Package) -> None:
 
 
 # ============================================================================
-# --- Phase 2: Plan (stub) ---
+# --- Phase 2: Plan ---
 # ============================================================================
+#
+# The planner is a PURE FUNCTION over (Config, Package) -> Plan. It never
+# touches the filesystem, never runs subprocesses, and never mutates its
+# inputs. All the decisions the rest of the tool makes flow from here, so
+# keeping this layer side-effect-free is load-bearing: any test that
+# exercises a planning rule can do so with a hand-rolled Package fixture
+# and trust that the production behavior matches.
+#
+# See REWRITE_DESIGN.md §5.2 for the rules this implements.
+
+
+def resolve_scheme(product_name: str, schemes: Sequence[str]) -> str:
+    """Pick the best scheme for `product_name` out of the discovered list.
+
+    Resolution order (design §5.2 rule 4, plus the session-1 inversion
+    noted in the Session 2 brief: prefer the literal name over the
+    `-Package` form when both exist):
+
+      1. exact match
+      2. case-insensitive exact match
+      3. `<product>-Package`
+      4. `<product> iOS`, `<product>-iOS`, `<product> (iOS)`
+      5. fall back to `product_name` unchanged — xcodebuild will
+         auto-generate the SPM scheme at build time, which works
+         against our clean staged directory.
+    """
+    if not schemes:
+        return product_name
+    # 1. exact
+    if product_name in schemes:
+        return product_name
+    # 2. case-insensitive exact
+    lowered = {s.lower(): s for s in schemes}
+    if product_name.lower() in lowered:
+        return lowered[product_name.lower()]
+    # 3. <product>-Package
+    pkg_form = f"{product_name}-Package"
+    if pkg_form in schemes:
+        return pkg_form
+    # 4. iOS-suffix variants
+    for suffix in (" iOS", "-iOS", " (iOS)"):
+        candidate = product_name + suffix
+        if candidate in schemes:
+            return candidate
+    # 5. fall back to product name
+    return product_name
+
+
+def _derive_product_language(product: Product, package: Package) -> str:
+    """Union of all backing target languages → one of Language._VALUES.
+
+    Rules (design §5.2 item 6):
+      Swift + Swift        → Swift
+      ObjC  + ObjC         → ObjC
+      Swift + ObjC         → Mixed
+      anything + Mixed     → Mixed
+      nothing classified   → N/A
+    """
+    has_swift = False
+    has_objc = False
+    has_mixed = False
+    for tname in product.targets:
+        t = package.target_by_name(tname)
+        if t is None:
+            continue
+        if t.language == Language.SWIFT:
+            has_swift = True
+        elif t.language == Language.OBJC:
+            has_objc = True
+        elif t.language == Language.MIXED:
+            has_mixed = True
+    if has_mixed or (has_swift and has_objc):
+        return Language.MIXED
+    if has_swift:
+        return Language.SWIFT
+    if has_objc:
+        return Language.OBJC
+    return Language.NA
+
+
+def _is_system_only_product(product: Product, package: Package) -> bool:
+    """True iff every backing target of `product` is TargetKind.SYSTEM.
+
+    This is the rule for dropping a product entirely (design §5.2 rule 2 +
+    bug 5 in SPM_TO_XCFRAMEWORK_NOTES.md). An empty target list is NOT
+    considered system-only — that's a malformed product, not a system
+    wrapper, and we leave it to xcodebuild to complain.
+    """
+    if not product.targets:
+        return False
+    for tname in product.targets:
+        t = package.target_by_name(tname)
+        if t is None or t.kind != TargetKind.SYSTEM:
+            return False
+    return True
 
 
 def plan_source_build(config: Config, package: Package) -> Plan:
-    """Stub for session 2."""
-    raise NotImplementedError("Plan phase is implemented in session 2.")
+    """Pure planner for source-mode builds.
+
+    Takes the inspected Package and the user's Config and returns a Plan
+    describing (a) the Package.swift edits Prepare should apply, (b) the
+    list of build units Execute should run, and (c) the list of products
+    the planner consciously skipped with a reason. See REWRITE_DESIGN.md
+    §5.2 for the full rule set.
+    """
+    plan = Plan()
+    plan.include_deps = config.include_deps
+
+    product_filter: Optional[Set[str]] = (
+        set(config.product_filters) if config.product_filters else None
+    )
+    product_filter_matches: Set[str] = set()
+
+    # First pass: walk the package products. Three possible outcomes per
+    # product: (a) filtered out by --product, (b) dropped because it's a
+    # system-library wrapper, (c) promoted to a build unit.
+    for product in package.products:
+        if product_filter is not None and product.name not in product_filter:
+            continue
+        if product_filter is not None:
+            product_filter_matches.add(product.name)
+
+        if _is_system_only_product(product, package):
+            plan.skipped.append((product.name, "system-library product"))
+            continue
+
+        # force_dynamic edit — only if the product isn't already dynamic.
+        # This is the Alamofire/GRDB-dynamic invariant from the Session 2
+        # brief: planning both GRDB and GRDB-dynamic is correct; emitting
+        # a force_dynamic edit for the already-dynamic one is not.
+        if product.linkage != Linkage.DYNAMIC:
+            plan.package_swift_edits.append(
+                PackageSwiftEdit(
+                    kind="force_dynamic",
+                    product_name=product.name,
+                    targets=list(product.targets),
+                )
+            )
+
+        language = _derive_product_language(product, package)
+        scheme = resolve_scheme(product.name, package.schemes)
+        plan.build_units.append(
+            BuildUnit(
+                name=product.name,
+                scheme=scheme,
+                framework_name=product.name,
+                language=language,
+                archive_strategy="archive",
+                source_targets=list(product.targets),
+                synthetic=False,
+            )
+        )
+
+    # Second pass: --target escape hatch. For each requested target we
+    # synthesize a fresh .library() entry unless one already exists with
+    # the same name (in which case we use the existing one and warn).
+    existing_product_names = {p.name for p in package.products}
+    existing_planned_names = {bu.name for bu in plan.build_units}
+    for target_name in config.target_filters:
+        tgt = package.target_by_name(target_name)
+        if tgt is None:
+            raise PlanError(
+                f"--target {target_name!r}: no such target in package "
+                f"(available: {sorted(t.name for t in package.targets)})"
+            )
+        if tgt.kind in (TargetKind.SYSTEM, TargetKind.BINARY,
+                        TargetKind.PLUGIN, TargetKind.MACRO):
+            raise PlanError(
+                f"--target {target_name!r}: target kind is {tgt.kind!r}; "
+                "only regular source targets can be synthesized into a "
+                ".library() product."
+            )
+        if tgt.kind == TargetKind.TEST:
+            raise PlanError(
+                f"--target {target_name!r}: test targets cannot be built "
+                "as xcframeworks."
+            )
+
+        if target_name in existing_product_names:
+            plan.warnings.append(
+                f"--target {target_name}: already exposed as a .library() "
+                "product; using the existing product instead of synthesizing "
+                "a duplicate."
+            )
+            # If the existing product wasn't already planned (e.g. it was
+            # filtered out by --product), surface it now — the user's
+            # explicit --target is a stronger signal than --product.
+            if target_name not in existing_planned_names:
+                existing = next(p for p in package.products if p.name == target_name)
+                if _is_system_only_product(existing, package):
+                    raise PlanError(
+                        f"--target {target_name!r}: existing product has "
+                        "only system targets and cannot be built."
+                    )
+                if existing.linkage != Linkage.DYNAMIC:
+                    plan.package_swift_edits.append(
+                        PackageSwiftEdit(
+                            kind="force_dynamic",
+                            product_name=existing.name,
+                            targets=list(existing.targets),
+                        )
+                    )
+                language = _derive_product_language(existing, package)
+                scheme = resolve_scheme(existing.name, package.schemes)
+                plan.build_units.append(
+                    BuildUnit(
+                        name=existing.name,
+                        scheme=scheme,
+                        framework_name=existing.name,
+                        language=language,
+                        archive_strategy="archive",
+                        source_targets=list(existing.targets),
+                        synthetic=False,
+                    )
+                )
+                existing_planned_names.add(existing.name)
+                if product_filter is not None:
+                    product_filter_matches.add(existing.name)
+            continue
+
+        # Synthesize. Package.swift edit + build unit, both tagged with
+        # synthetic=True for display purposes. The build unit's language
+        # comes from the target itself (there's no "union" — it's one
+        # target).
+        plan.package_swift_edits.append(
+            PackageSwiftEdit(
+                kind="add_synthetic_library",
+                product_name=target_name,
+                targets=[target_name],
+            )
+        )
+        language = tgt.language if tgt.language in (
+            Language.SWIFT, Language.OBJC, Language.MIXED
+        ) else Language.NA
+        scheme = resolve_scheme(target_name, package.schemes)
+        plan.build_units.append(
+            BuildUnit(
+                name=target_name,
+                scheme=scheme,
+                framework_name=target_name,
+                language=language,
+                archive_strategy="archive",
+                source_targets=[target_name],
+                synthetic=True,
+            )
+        )
+        existing_planned_names.add(target_name)
+
+    # --product filter validation: if the user asked for something we
+    # never saw, fail loudly. The synthetic pass may have broadened the
+    # effective match set, so do this check last.
+    if product_filter is not None:
+        unmatched = sorted(product_filter - product_filter_matches)
+        if unmatched:
+            available = sorted(p.name for p in package.products)
+            raise PlanError(
+                f"--product filter matched no products: {unmatched}\n"
+                f"Available products: {available}"
+            )
+
+    if not plan.build_units:
+        raise PlanError(
+            "Plan produced zero build units. Did --product filter out "
+            "everything, or does this package declare only non-library "
+            "products?"
+        )
+
+    return plan
 
 
-def plan_binary_build(config: Config) -> Plan:
-    """Stub for session 2."""
-    raise NotImplementedError("Plan phase is implemented in session 2.")
+def plan_binary_build(config: Config, artifacts: Sequence[BinaryArtifact]) -> Plan:
+    """Pure planner for binary-mode builds.
+
+    Input is the list of artifacts discovered by Fetch (see
+    `discover_binary_artifacts`). This function just applies the
+    --product filter and turns each surviving artifact into a build unit
+    whose strategy is "copy-artifact" — Execute will literally `cp -R`
+    it into the output directory.
+    """
+    if config.target_filters:
+        raise PlanError(
+            "--target is a source-build escape hatch and cannot be used "
+            "with --binary."
+        )
+
+    plan = Plan()
+    plan.binary_mode = True
+    plan.include_deps = config.include_deps
+
+    product_filter: Optional[Set[str]] = (
+        set(config.product_filters) if config.product_filters else None
+    )
+
+    # Dedupe: a vendor artifactbundle can contain the same-named
+    # xcframework in multiple locations (usually a bug — cf. the
+    # `__MACOSX` ghost already pruned in Fetch), but even legit
+    # multi-slice packages occasionally list duplicates. Keep the first
+    # occurrence, record the rest on plan.skipped so --dry-run explains
+    # why they disappeared from the plan.
+    seen_names: Set[str] = set()
+    for art in artifacts:
+        if art.product_name in seen_names:
+            plan.skipped.append(
+                (art.product_name, f"duplicate artifact at {art.path}")
+            )
+            continue
+        seen_names.add(art.product_name)
+        if product_filter is not None and art.product_name not in product_filter:
+            continue
+        plan.build_units.append(
+            BuildUnit(
+                name=art.product_name,
+                scheme="",  # n/a — nothing to archive
+                framework_name=art.product_name,
+                language=Language.NA,  # binary — we don't inspect the bytes
+                archive_strategy="copy-artifact",
+                source_targets=[],
+                synthetic=False,
+                artifact_path=art.path,
+            )
+        )
+
+    if product_filter is not None:
+        matched = {bu.name for bu in plan.build_units}
+        unmatched = sorted(product_filter - matched)
+        if unmatched:
+            available = sorted(a.product_name for a in artifacts)
+            raise PlanError(
+                f"--product filter matched no binary artifacts: {unmatched}\n"
+                f"Available artifacts: {available}"
+            )
+
+    if not plan.build_units:
+        raise PlanError(
+            "Binary plan produced zero build units. Did the vendor package "
+            "actually ship xcframeworks under .build/artifacts/?"
+        )
+
+    return plan
+
+
+def _derive_package_label(src: str) -> str:
+    """Return a human label for a package source URL/path.
+
+    Handles the three shapes we see in practice:
+      - https/ssh URLs ending in `.git`  → repo name without .git
+      - SCP-style `git@host:org/repo.git` → repo name without .git
+      - local filesystem paths           → basename
+    """
+    src = src.rstrip("/")
+    if ":" in src and "@" in src and not src.startswith(("http://", "https://", "ssh://")):
+        # SCP-style: `git@github.com:org/repo.git`
+        after_colon = src.rsplit(":", 1)[-1]
+        base = os.path.basename(after_colon)
+    else:
+        base = os.path.basename(src)
+    if base.endswith(".git"):
+        base = base[:-4]
+    return base or "(unknown)"
+
+
+def print_plan(
+    plan: Plan,
+    *,
+    package: Optional[Package],
+    config: Config,
+) -> None:
+    """Render a Plan in the human-readable dry-run format.
+
+    Matches the shape documented in the Session 2 brief. One horizontal
+    rule per section; sections are elided when empty. Keeps alignment
+    tidy by computing column widths up front so the output stays readable
+    even for 12-target Stripe runs.
+    """
+    if package is not None:
+        name = package.name
+    else:
+        # Binary mode has no Package model — derive the label from the
+        # package source URL's basename. Handle SCP-style `git@host:org/repo.git`
+        # specially because os.path.basename returns the whole string for it.
+        name = _derive_package_label(config.package_source or "(unknown)")
+
+    version = config.user_version or "(unversioned)"
+    mode = "binary" if plan.binary_mode else "source"
+    bold(f"\nPlan for {name} @ {version}  ({mode} mode)")
+
+    if plan.package_swift_edits:
+        print("  Package edits:")
+        for edit in plan.package_swift_edits:
+            if edit.kind == "force_dynamic":
+                print(f"    - force_dynamic: {edit.product_name}")
+            elif edit.kind == "add_synthetic_library":
+                tgts = ", ".join(edit.targets)
+                print(f"    - add_synthetic_library: {edit.product_name} → targets=[{tgts}]")
+            else:
+                print(f"    - {edit.kind}: {edit.product_name}")
+    elif not plan.binary_mode:
+        print("  Package edits: (none)")
+
+    if plan.build_units:
+        print("  Build units:")
+        name_w = max(len(bu.name) for bu in plan.build_units)
+        scheme_w = max(len(bu.scheme or "-") for bu in plan.build_units)
+        lang_w = max(len(bu.language or "-") for bu in plan.build_units)
+        name_w = max(name_w, 10)
+        scheme_w = max(scheme_w, 8)
+        lang_w = max(lang_w, 5)
+        for i, bu in enumerate(plan.build_units, start=1):
+            markers = []
+            if bu.synthetic:
+                markers.append("[synthetic library]")
+            if bu.archive_strategy == "copy-artifact":
+                markers.append("[binary artifact]")
+            marker = ("  " + " ".join(markers)) if markers else ""
+            scheme_disp = bu.scheme or "-"
+            print(
+                f"    [{i}] {bu.name:<{name_w}}  "
+                f"scheme={scheme_disp:<{scheme_w}}  "
+                f"language={bu.language:<{lang_w}}  "
+                f"→ {bu.framework_name}.xcframework{marker}"
+            )
+    else:
+        print("  Build units: (none)")
+
+    if plan.skipped:
+        print("  Skipped:")
+        for sname, reason in plan.skipped:
+            print(f"    - {sname} ({reason})")
+
+    if plan.include_deps:
+        print("  Note: --include-deps is enabled; transitive frameworks will "
+              "be discovered after Execute runs.")
 
 
 # ============================================================================
@@ -1105,6 +1695,41 @@ GRDB_DUMP_SNAPSHOT: dict = {
     ],
 }
 
+# Stripe's shape exercises the --target escape hatch: the `Stripe` library
+# product is the only exposed product in this slice of the real dump, and
+# the other 11 frameworks (StripeCore, StripeUICore, …) are internal
+# targets that downstream consumers reach via --target. Only the subset
+# used by the planner tests is included here — the real Stripe package
+# has a dozen more targets.
+STRIPE_DUMP_SNAPSHOT: dict = {
+    "name": "stripe-ios",
+    "toolsVersion": {"_version": "5.7.0"},
+    "platforms": [
+        {"options": [], "platformName": "ios", "version": "13.0"},
+    ],
+    "products": [
+        {"name": "Stripe", "type": {"library": ["automatic"]}, "targets": ["Stripe"]},
+        {"name": "StripePayments", "type": {"library": ["automatic"]}, "targets": ["StripePayments"]},
+        {"name": "StripePaymentSheet", "type": {"library": ["automatic"]}, "targets": ["StripePaymentSheet"]},
+    ],
+    "targets": [
+        {"name": "Stripe", "type": "regular", "path": "Stripe/StripeiOS", "publicHeadersPath": None,
+         "dependencies": [{"byName": ["StripeCore", None]}, {"byName": ["StripePayments", None]}, {"byName": ["StripeApplePay", None]}]},
+        {"name": "StripeCore", "type": "regular", "path": "StripeCore/StripeCore", "publicHeadersPath": None,
+         "dependencies": []},
+        {"name": "StripeUICore", "type": "regular", "path": "StripeUICore/StripeUICore", "publicHeadersPath": None,
+         "dependencies": [{"byName": ["StripeCore", None]}]},
+        {"name": "StripePayments", "type": "regular", "path": "StripePayments/StripePayments", "publicHeadersPath": None,
+         "dependencies": [{"byName": ["StripeCore", None]}]},
+        {"name": "StripePaymentSheet", "type": "regular", "path": "StripePaymentSheet/StripePaymentSheet",
+         "publicHeadersPath": None,
+         "dependencies": [{"byName": ["StripeCore", None]}, {"byName": ["StripeUICore", None]}, {"byName": ["StripePayments", None]}]},
+        # A binary target — confirms the planner refuses to synthesize
+        # a library for it.
+        {"name": "Stripe3DS2", "type": "binary", "path": None, "publicHeadersPath": None, "dependencies": []},
+    ],
+}
+
 # Alamofire's interesting shape is "automatic + already-dynamic on the same
 # target", which session 2's planner needs to handle without double-patching.
 ALAMOFIRE_DUMP_SNAPSHOT: dict = {
@@ -1159,6 +1784,24 @@ def _selftest_parse_grdb_skips_systems_correctly() -> None:
     _assert(by_tname["GRDBTests"].kind == TargetKind.TEST, "GRDBTests target kind")
     # The test target should record its dependency-by-target.
     _assert(by_tname["GRDB"].dependencies == ["GRDBSQLite"], "GRDB target deps")
+
+
+def _mk_package_from_snapshot(snap: dict, *, schemes: Optional[List[str]] = None) -> Package:
+    """Wrap `_parse_dump` → Package for use in planner fixtures. Targets
+    are returned with `language == N/A` (we don't have a real filesystem
+    to scan); individual tests set the languages they care about.
+    """
+    raw, products, targets, platforms, name, tv = _parse_dump(snap)
+    return Package(
+        name=name,
+        tools_version=tv,
+        platforms=platforms,
+        products=products,
+        targets=targets,
+        schemes=list(schemes or []),
+        raw_dump=raw,
+        staged_dir=Path("/tmp/fake-staged"),
+    )
 
 
 def _selftest_parse_alamofire_already_dynamic() -> None:
@@ -1324,6 +1967,462 @@ def _selftest_minimixed_fetch_integration() -> None:
                 f"MiniMixed language was {lang_by_target.get('MiniMixed')!r}")
 
 
+# --- Planner self-tests ---------------------------------------------------
+
+
+def _selftest_scheme_resolver() -> None:
+    # 1. exact wins over -Package and iOS suffixes
+    _assert(
+        resolve_scheme("GRDB", ["GRDB", "GRDB-dynamic", "GRDB-Package"]) == "GRDB",
+        "exact match should win over -Package form",
+    )
+    # 2. case-insensitive exact
+    _assert(
+        resolve_scheme("grdb", ["GRDB"]) == "GRDB",
+        "case-insensitive exact match",
+    )
+    # 3. -Package fallback
+    _assert(
+        resolve_scheme("Nuke", ["Nuke-Package"]) == "Nuke-Package",
+        "-Package fallback",
+    )
+    # 4. iOS suffix variants
+    _assert(resolve_scheme("Foo", ["Foo iOS"]) == "Foo iOS", "Foo iOS")
+    _assert(resolve_scheme("Foo", ["Foo-iOS"]) == "Foo-iOS", "Foo-iOS")
+    _assert(resolve_scheme("Foo", ["Foo (iOS)"]) == "Foo (iOS)", "Foo (iOS)")
+    # 5. final fallback: returns the product name unchanged
+    _assert(resolve_scheme("Nothing", []) == "Nothing", "empty schemes")
+    _assert(
+        resolve_scheme("Nothing", ["SomethingElse"]) == "Nothing",
+        "no candidate matches",
+    )
+
+
+def _selftest_planner_grdb() -> None:
+    """GRDB: force_dynamic on GRDB, NO force_dynamic on GRDB-dynamic,
+    GRDBSQLite dropped entirely because it's a system-target wrapper.
+    """
+    pkg = _mk_package_from_snapshot(
+        GRDB_DUMP_SNAPSHOT,
+        schemes=["GRDB", "GRDB-dynamic", "GRDB-Package"],
+    )
+    config = Config(
+        package_source="https://github.com/groue/GRDB.swift.git",
+        user_version="7.9.0",
+        resolved_version="v7.9.0",
+    )
+    plan = plan_source_build(config, pkg)
+
+    names = [bu.name for bu in plan.build_units]
+    _assert("GRDB" in names, f"GRDB must be built; got {names}")
+    _assert("GRDB-dynamic" in names, f"GRDB-dynamic must be built; got {names}")
+    _assert("GRDBSQLite" not in names, f"GRDBSQLite must be skipped; got {names}")
+
+    edits = {(e.kind, e.product_name) for e in plan.package_swift_edits}
+    _assert(
+        ("force_dynamic", "GRDB") in edits,
+        f"force_dynamic on GRDB missing; got {edits}",
+    )
+    _assert(
+        ("force_dynamic", "GRDB-dynamic") not in edits,
+        f"must not force_dynamic the already-dynamic GRDB-dynamic; got {edits}",
+    )
+    _assert(
+        ("force_dynamic", "GRDBSQLite") not in edits,
+        "must not emit force_dynamic for the skipped system product",
+    )
+
+    skipped_names = [n for n, _ in plan.skipped]
+    _assert(
+        skipped_names == ["GRDBSQLite"],
+        f"expected GRDBSQLite in skipped list; got {plan.skipped}",
+    )
+
+    # Scheme resolution: GRDB should pick the literal scheme, not
+    # GRDB-Package. This is the session-1 inversion noted in the brief.
+    grdb_bu = next(bu for bu in plan.build_units if bu.name == "GRDB")
+    _assert(
+        grdb_bu.scheme == "GRDB",
+        f"GRDB scheme should be literal 'GRDB' not '{grdb_bu.scheme}'",
+    )
+
+
+def _selftest_planner_alamofire() -> None:
+    """Alamofire-shape: two products over the same target — plan both,
+    but only force_dynamic the non-dynamic one."""
+    pkg = _mk_package_from_snapshot(
+        ALAMOFIRE_DUMP_SNAPSHOT,
+        schemes=["Alamofire", "AlamofireDynamic", "Alamofire-Package"],
+    )
+    config = Config(
+        package_source="https://github.com/Alamofire/Alamofire.git",
+        user_version="5.10.2",
+        resolved_version="5.10.2",
+    )
+    plan = plan_source_build(config, pkg)
+
+    names = {bu.name for bu in plan.build_units}
+    _assert(
+        names == {"Alamofire", "AlamofireDynamic"},
+        f"Alamofire should plan both build units, got {names}",
+    )
+
+    edits = {(e.kind, e.product_name) for e in plan.package_swift_edits}
+    _assert(
+        ("force_dynamic", "Alamofire") in edits,
+        f"force_dynamic on Alamofire; got {edits}",
+    )
+    _assert(
+        ("force_dynamic", "AlamofireDynamic") not in edits,
+        f"must not force_dynamic the already-dynamic AlamofireDynamic; got {edits}",
+    )
+
+
+def _selftest_planner_stripe_synthetic_libraries() -> None:
+    """Stripe: --product Stripe narrows the product set to one, --target
+    StripeCore / --target StripeUICore add two synthetic libraries, for
+    three build units total.
+    """
+    pkg = _mk_package_from_snapshot(STRIPE_DUMP_SNAPSHOT, schemes=[])
+    config = Config(
+        package_source="https://github.com/stripe/stripe-ios.git",
+        user_version="25.6.2",
+        resolved_version="25.6.2",
+        product_filters=["Stripe"],
+        target_filters=["StripeCore", "StripeUICore"],
+    )
+    plan = plan_source_build(config, pkg)
+
+    names = {bu.name for bu in plan.build_units}
+    _assert(
+        names == {"Stripe", "StripeCore", "StripeUICore"},
+        f"expected 3 build units {{Stripe, StripeCore, StripeUICore}}, got {names}",
+    )
+    _assert(
+        len(plan.build_units) == 3,
+        f"expected exactly 3 units, got {len(plan.build_units)}",
+    )
+
+    by_name = {bu.name: bu for bu in plan.build_units}
+    _assert(by_name["StripeCore"].synthetic, "StripeCore should be marked synthetic")
+    _assert(by_name["StripeUICore"].synthetic, "StripeUICore should be marked synthetic")
+    _assert(
+        not by_name["Stripe"].synthetic,
+        "Stripe is a real product, not synthetic",
+    )
+
+    synthetic_edits = {
+        e.product_name for e in plan.package_swift_edits
+        if e.kind == "add_synthetic_library"
+    }
+    _assert(
+        synthetic_edits == {"StripeCore", "StripeUICore"},
+        f"synthetic edits should be {{StripeCore, StripeUICore}}, got {synthetic_edits}",
+    )
+    force_names = {
+        e.product_name for e in plan.package_swift_edits
+        if e.kind == "force_dynamic"
+    }
+    _assert(
+        "Stripe" in force_names,
+        f"Stripe should get force_dynamic; got {force_names}",
+    )
+    _assert(
+        "StripeCore" not in force_names,
+        "synthetic library StripeCore should NOT get force_dynamic "
+        "(the synthetic edit is already .dynamic)",
+    )
+    _assert(
+        "StripeUICore" not in force_names,
+        "synthetic library StripeUICore should NOT get force_dynamic",
+    )
+
+
+def _selftest_planner_stripe_rejects_binary_target() -> None:
+    """--target on a TargetKind.BINARY target (Stripe3DS2 in this fixture)
+    must fail with PlanError."""
+    pkg = _mk_package_from_snapshot(STRIPE_DUMP_SNAPSHOT, schemes=[])
+    config = Config(
+        package_source="https://github.com/stripe/stripe-ios.git",
+        user_version="25.6.2",
+        target_filters=["Stripe3DS2"],
+    )
+    try:
+        plan_source_build(config, pkg)
+    except PlanError as exc:
+        _assert(
+            "Stripe3DS2" in str(exc),
+            f"PlanError should mention Stripe3DS2, got: {exc}",
+        )
+        return
+    raise AssertionError("plan_source_build should have raised PlanError for a binary target")
+
+
+def _selftest_planner_target_matching_existing_product_uses_existing() -> None:
+    """If --target T matches an existing .library(name: T, ...) product,
+    the planner must warn and reuse the existing product rather than
+    synthesize a duplicate."""
+    # Use GRDB: `--target GRDB` matches the existing GRDB product.
+    pkg = _mk_package_from_snapshot(
+        GRDB_DUMP_SNAPSHOT,
+        schemes=["GRDB", "GRDB-dynamic", "GRDB-Package"],
+    )
+    config = Config(
+        package_source="https://github.com/groue/GRDB.swift.git",
+        user_version="7.9.0",
+        product_filters=["GRDB"],           # narrow products to just GRDB
+        target_filters=["GRDB"],            # and ALSO pass --target GRDB
+    )
+    plan = plan_source_build(config, pkg)
+    # The planner records the warning on plan.warnings rather than
+    # writing to stderr (§5.2 purity contract). Assert it's present.
+    _assert(
+        any("already exposed" in w for w in plan.warnings),
+        f"expected warning about existing product; got {plan.warnings}",
+    )
+
+    # No synthetic edit should be added — the existing product is reused.
+    synthetic = [e for e in plan.package_swift_edits if e.kind == "add_synthetic_library"]
+    _assert(
+        not synthetic,
+        f"no synthetic library should be added when --target matches an "
+        f"existing product; got {synthetic}",
+    )
+    # Exactly one GRDB build unit.
+    grdb_units = [bu for bu in plan.build_units if bu.name == "GRDB"]
+    _assert(
+        len(grdb_units) == 1,
+        f"exactly one GRDB build unit expected, got {len(grdb_units)}",
+    )
+    _assert(not grdb_units[0].synthetic, "reused GRDB must not be marked synthetic")
+
+
+def _selftest_planner_target_reinstates_filtered_product() -> None:
+    """If `--product` excludes a product but `--target T` names that same
+    product, the planner must re-include it exactly once and emit a
+    force_dynamic edit for it (since it's still a non-dynamic product).
+    This covers the otherwise-untested branch where the existing product
+    hasn't already been planned.
+    """
+    # Use Alamofire: --product AlamofireDynamic narrows to just the
+    # already-dynamic one, then --target Alamofire forces the non-dynamic
+    # regular product back in via the "existing product" branch.
+    pkg = _mk_package_from_snapshot(
+        ALAMOFIRE_DUMP_SNAPSHOT,
+        schemes=["Alamofire", "AlamofireDynamic"],
+    )
+    config = Config(
+        package_source="https://github.com/Alamofire/Alamofire.git",
+        user_version="5.10.2",
+        product_filters=["AlamofireDynamic"],
+        target_filters=["Alamofire"],
+    )
+    plan = plan_source_build(config, pkg)
+
+    names = [bu.name for bu in plan.build_units]
+    _assert(
+        sorted(names) == ["Alamofire", "AlamofireDynamic"],
+        f"expected both Alamofire and AlamofireDynamic, got {names}",
+    )
+    # Alamofire appears exactly once (not duplicated as synthetic).
+    _assert(
+        names.count("Alamofire") == 1,
+        f"Alamofire should appear once, got {names}",
+    )
+    by_name = {bu.name: bu for bu in plan.build_units}
+    _assert(
+        not by_name["Alamofire"].synthetic,
+        "reinstated Alamofire should not be marked synthetic",
+    )
+    # Force_dynamic on Alamofire, but not on AlamofireDynamic.
+    force_names = {
+        e.product_name for e in plan.package_swift_edits
+        if e.kind == "force_dynamic"
+    }
+    _assert(
+        force_names == {"Alamofire"},
+        f"force_dynamic should be exactly {{Alamofire}}, got {force_names}",
+    )
+    # And no synthetic edits — we reused the existing product.
+    synthetic = [e for e in plan.package_swift_edits if e.kind == "add_synthetic_library"]
+    _assert(not synthetic, f"no synthetic edits expected, got {synthetic}")
+
+
+def _selftest_planner_binary_dedupes_duplicate_artifacts() -> None:
+    """Duplicate BinaryArtifact entries (same product_name) collapse to a
+    single build unit and the dropped copies land on plan.skipped."""
+    artifacts = [
+        BinaryArtifact("BlinkID", Path("/fake/a/BlinkID.xcframework")),
+        BinaryArtifact("BlinkID", Path("/fake/b/BlinkID.xcframework")),
+        BinaryArtifact("BlinkID", Path("/fake/c/BlinkID.xcframework")),
+    ]
+    config = Config(
+        package_source="https://github.com/BlinkID/blinkid-swift-package.git",
+        user_version="7.6.2",
+        binary_mode=True,
+    )
+    plan = plan_binary_build(config, artifacts)
+    _assert(
+        len(plan.build_units) == 1,
+        f"expected 1 build unit after dedupe, got {len(plan.build_units)}",
+    )
+    _assert(
+        len(plan.skipped) == 2,
+        f"expected 2 skipped duplicates, got {plan.skipped}",
+    )
+    for name, reason in plan.skipped:
+        _assert(name == "BlinkID", f"skipped name should be BlinkID, got {name}")
+        _assert("duplicate" in reason, f"skipped reason should mention duplicate: {reason}")
+
+
+def _selftest_derive_package_label() -> None:
+    """SCP-style and URL forms both round-trip to a bare repo name."""
+    _assert(
+        _derive_package_label("https://github.com/groue/GRDB.swift.git") == "GRDB.swift",
+        "https URL",
+    )
+    _assert(
+        _derive_package_label("git@github.com:groue/GRDB.swift.git") == "GRDB.swift",
+        "SCP-style URL",
+    )
+    _assert(
+        _derive_package_label("ssh://git@github.com/groue/GRDB.swift.git") == "GRDB.swift",
+        "ssh URL",
+    )
+    _assert(
+        _derive_package_label("/Users/me/local-pkg") == "local-pkg",
+        "local path",
+    )
+    _assert(
+        _derive_package_label("/Users/me/local-pkg/") == "local-pkg",
+        "local path with trailing slash",
+    )
+
+
+def _selftest_planner_unmatched_product_filter() -> None:
+    """--product listing a name that doesn't exist in the package raises PlanError."""
+    pkg = _mk_package_from_snapshot(GRDB_DUMP_SNAPSHOT, schemes=[])
+    config = Config(
+        package_source="https://github.com/groue/GRDB.swift.git",
+        user_version="7.9.0",
+        product_filters=["NotAProduct"],
+    )
+    try:
+        plan_source_build(config, pkg)
+    except PlanError as exc:
+        _assert("NotAProduct" in str(exc), f"error mentions NotAProduct: {exc}")
+        return
+    raise AssertionError("expected PlanError for unknown product filter")
+
+
+def _selftest_planner_binary_filter() -> None:
+    """Binary-mode planner filters a synthetic artifact list by --product.
+    Also confirms the archive_strategy lands as 'copy-artifact' and
+    --target is rejected in binary mode.
+    """
+    artifacts = [
+        BinaryArtifact("BlinkID", Path("/fake/BlinkID/BlinkID.xcframework")),
+        BinaryArtifact("BlinkIDVerify", Path("/fake/BlinkIDVerify/BlinkIDVerify.xcframework")),
+        BinaryArtifact("BlinkIDUX", Path("/fake/BlinkIDUX/BlinkIDUX.xcframework")),
+    ]
+
+    # Filter to just BlinkID
+    config = Config(
+        package_source="https://github.com/BlinkID/blinkid-swift-package.git",
+        user_version="7.6.2",
+        binary_mode=True,
+        product_filters=["BlinkID"],
+    )
+    plan = plan_binary_build(config, artifacts)
+    _assert(plan.binary_mode, "binary_mode flag should be set")
+    _assert(
+        len(plan.build_units) == 1,
+        f"expected 1 build unit, got {len(plan.build_units)}",
+    )
+    unit = plan.build_units[0]
+    _assert(unit.name == "BlinkID", f"expected BlinkID, got {unit.name}")
+    _assert(
+        unit.archive_strategy == "copy-artifact",
+        f"expected copy-artifact, got {unit.archive_strategy}",
+    )
+    _assert(unit.artifact_path == Path("/fake/BlinkID/BlinkID.xcframework"),
+            f"artifact_path mismatch: {unit.artifact_path}")
+
+    # No filter → all three
+    config_all = Config(
+        package_source="https://github.com/BlinkID/blinkid-swift-package.git",
+        user_version="7.6.2",
+        binary_mode=True,
+    )
+    plan_all = plan_binary_build(config_all, artifacts)
+    _assert(
+        len(plan_all.build_units) == 3,
+        f"expected 3 build units, got {len(plan_all.build_units)}",
+    )
+
+    # Unknown product → PlanError
+    config_bad = Config(
+        package_source="https://github.com/BlinkID/blinkid-swift-package.git",
+        user_version="7.6.2",
+        binary_mode=True,
+        product_filters=["NotThere"],
+    )
+    try:
+        plan_binary_build(config_bad, artifacts)
+    except PlanError as exc:
+        _assert("NotThere" in str(exc), f"error message: {exc}")
+    else:
+        raise AssertionError("expected PlanError for unmatched --product")
+
+    # --target in binary mode → PlanError
+    config_target = Config(
+        package_source="https://github.com/BlinkID/blinkid-swift-package.git",
+        user_version="7.6.2",
+        binary_mode=True,
+        target_filters=["Dummy"],
+    )
+    try:
+        plan_binary_build(config_target, artifacts)
+    except PlanError as exc:
+        _assert("target" in str(exc).lower(), f"error message: {exc}")
+    else:
+        raise AssertionError("expected PlanError for --target in binary mode")
+
+
+def _selftest_planner_language_inference() -> None:
+    """Language on a build unit is the union of its target languages."""
+    snap = {
+        "name": "LangTest",
+        "toolsVersion": {"_version": "5.7.0"},
+        "platforms": [{"options": [], "platformName": "ios", "version": "15.0"}],
+        "products": [
+            {"name": "SwiftLib", "type": {"library": ["automatic"]}, "targets": ["SwiftOnly"]},
+            {"name": "ObjCLib", "type": {"library": ["automatic"]}, "targets": ["ObjCOnly"]},
+            {"name": "MixedLib", "type": {"library": ["automatic"]}, "targets": ["SwiftOnly", "ObjCOnly"]},
+        ],
+        "targets": [
+            {"name": "SwiftOnly", "type": "regular", "path": None, "publicHeadersPath": None, "dependencies": []},
+            {"name": "ObjCOnly", "type": "regular", "path": None, "publicHeadersPath": None, "dependencies": []},
+        ],
+    }
+    pkg = _mk_package_from_snapshot(snap, schemes=[])
+    # Language is populated by scan_target_languages in the real flow;
+    # for the unit test we set it directly.
+    pkg.target_by_name("SwiftOnly").language = Language.SWIFT  # type: ignore[union-attr]
+    pkg.target_by_name("ObjCOnly").language = Language.OBJC    # type: ignore[union-attr]
+
+    config = Config(package_source="/fake", user_version="")
+    plan = plan_source_build(config, pkg)
+
+    by_name = {bu.name: bu for bu in plan.build_units}
+    _assert(by_name["SwiftLib"].language == Language.SWIFT, f"SwiftLib: {by_name['SwiftLib'].language}")
+    _assert(by_name["ObjCLib"].language == Language.OBJC, f"ObjCLib: {by_name['ObjCLib'].language}")
+    _assert(
+        by_name["MixedLib"].language == Language.MIXED,
+        f"MixedLib: {by_name['MixedLib'].language}",
+    )
+
+
 # Test registry. Tuples of (name, callable, requires_swift). The fast mode
 # only runs entries with requires_swift=False.
 def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
@@ -1337,6 +2436,29 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
         ("dependency parser shapes", _selftest_dependency_parser, False),
         ("toxic-entry filter", _selftest_toxic_filter, False),
         ("language counter (synthetic tree)", lambda: _selftest_language_counter(tmp_root), False),
+        ("scheme resolver", _selftest_scheme_resolver, False),
+        ("planner: GRDB (force_dynamic + skip system + leave dynamic alone)",
+         _selftest_planner_grdb, False),
+        ("planner: Alamofire (regular + already-dynamic over same target)",
+         _selftest_planner_alamofire, False),
+        ("planner: Stripe (--product + --target synthetic libraries)",
+         _selftest_planner_stripe_synthetic_libraries, False),
+        ("planner: Stripe3DS2 binary target rejection",
+         _selftest_planner_stripe_rejects_binary_target, False),
+        ("planner: --target reuses existing .library() product",
+         _selftest_planner_target_matching_existing_product_uses_existing, False),
+        ("planner: --target reinstates product filtered out by --product",
+         _selftest_planner_target_reinstates_filtered_product, False),
+        ("planner: unmatched --product filter raises PlanError",
+         _selftest_planner_unmatched_product_filter, False),
+        ("planner: BlinkID binary filter + copy-artifact strategy",
+         _selftest_planner_binary_filter, False),
+        ("planner: binary dedupe of duplicate artifacts",
+         _selftest_planner_binary_dedupes_duplicate_artifacts, False),
+        ("planner: language inference (Swift / ObjC / Mixed)",
+         _selftest_planner_language_inference, False),
+        ("print_plan label derivation (SCP / URL / local)",
+         _selftest_derive_package_label, False),
         ("MiniMixed fetch+stage+inspect (real swift)", _selftest_minimixed_fetch_integration, True),
     ]
 
@@ -1475,8 +2597,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         die("--target is a source-build escape hatch and cannot be combined with --binary.")
 
     # Resolve the version tag now, before any clones, so we can populate
-    # both user_version and resolved_version (bug 1 fix).
-    if config.is_remote and config.user_version:
+    # both user_version and resolved_version (bug 1 fix). Binary mode
+    # doesn't clone the vendor repo — it uses SPM's resolver instead —
+    # so skip normalization there. `discover_binary_artifacts` strips a
+    # leading `v` from user_version so the `exact:` field gets the bare
+    # semver SPM requires; SPM then handles the v-prefix fallback when
+    # matching against actual git tags.
+    if config.is_remote and config.user_version and not config.binary_mode:
         resolved, rewritten = normalize_version_tag(config.package_source, config.user_version)
         if rewritten:
             warn(f"Tag '{config.user_version}' not found, using '{resolved}'")
@@ -1488,9 +2615,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     keep = config.keep_work
     try:
         try:
-            source_dir = fetch_source(config)
-            staged_dir = stage_source(config, source_dir)
-            package = inspect_package(config, staged_dir)
+            if config.binary_mode:
+                return _run_binary_mode(config)
+            return _run_source_mode(config)
         except _USER_FACING_ERRORS as exc:
             # User-facing phase errors (Fetch, Inspect, Plan): print a clean
             # one-line "Error (<phase>): <msg>" and exit with the
@@ -1508,25 +2635,74 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # the xcresult bundle. The structured handling lives in session 4
         # where the executor is wired up.
 
-        # Session 1: nothing past Inspect is wired up. Always print the
-        # package; emit an extra notice when the user wasn't expecting an
-        # inspect-only run.
-        print_package(package)
-        if not config.inspect_only:
-            warn(
-                "\nNote: this is a Session 1 build of the Python rewrite — "
-                "Plan / Prepare / Execute / Verify are stubs. Use "
-                "--inspect-only to silence this notice. The legacy bash "
-                "spm-to-xcframework still handles full builds until the "
-                "rewrite lands."
-            )
-        return 0
-
     finally:
         if keep:
             dim(f"Work directory retained: {work_dir}")
         else:
             shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def _run_source_mode(config: Config) -> int:
+    """Source-mode pipeline: Fetch → Inspect → Plan → (Prepare/Execute/Verify).
+
+    Session 2 stops after Plan for --dry-run and --inspect-only; full
+    builds still fall through to the Session 1 stub notice. Sessions 3+
+    will fill in the rest.
+    """
+    source_dir = fetch_source(config)
+    staged_dir = stage_source(config, source_dir)
+    package = inspect_package(config, staged_dir)
+
+    if config.inspect_only:
+        print_package(package)
+        return 0
+
+    plan = plan_source_build(config, package)
+    for w in plan.warnings:
+        warn(w)
+
+    if config.dry_run:
+        print_plan(plan, package=package, config=config)
+        return 0
+
+    # Past Plan, Session 2 has no more work. The Session 1 stub notice
+    # still applies until Session 3 wires in Prepare + Execute.
+    print_package(package)
+    print_plan(plan, package=package, config=config)
+    warn(
+        "\nNote: this is a Session 2 build of the Python rewrite — "
+        "Prepare / Execute / Verify are stubs. Use --dry-run to silence "
+        "this notice. The legacy bash spm-to-xcframework still handles "
+        "full builds until the rewrite lands."
+    )
+    return 0
+
+
+def _run_binary_mode(config: Config) -> int:
+    """Binary-mode pipeline: discover_binary_artifacts → Plan →
+    (Execute/Verify).
+
+    Session 2 stops after Plan for --dry-run. Full binary Execute lands
+    in Session 4.
+    """
+    if config.inspect_only:
+        die("--inspect-only is not supported for --binary.")
+
+    artifacts = discover_binary_artifacts(config)
+    plan = plan_binary_build(config, artifacts)
+
+    if config.dry_run:
+        print_plan(plan, package=None, config=config)
+        return 0
+
+    print_plan(plan, package=None, config=config)
+    warn(
+        "\nNote: this is a Session 2 build of the Python rewrite — "
+        "binary-mode Execute lands in Session 4. Use --dry-run to "
+        "silence this notice. The legacy bash spm-to-xcframework still "
+        "handles full builds until the rewrite lands."
+    )
+    return 0
 
 
 # Phase classification for main()'s exception handler. Stays in sync with
