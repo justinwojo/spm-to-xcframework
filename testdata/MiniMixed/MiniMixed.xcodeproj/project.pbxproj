@@ -1,0 +1,9 @@
+// !$*UTF8*$!
+// Bogus xcodeproj — exists only so the staging step has something to drop.
+{
+    archiveVersion = 1;
+    classes = { };
+    objectVersion = 56;
+    objects = { };
+    rootObject = "";
+}

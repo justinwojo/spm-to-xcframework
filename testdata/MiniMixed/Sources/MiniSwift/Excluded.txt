@@ -1,0 +1,3 @@
+This file is listed in MiniSwift's exclude: array. The staging
+two-pass cleanup must drop it from WORK_DIR/staged after the first
+swift package dump-package call.
