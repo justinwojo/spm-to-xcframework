@@ -44,6 +44,8 @@ spm-to-xcframework <package-url-or-path> --version <ver> [options]
 | `--verbose` | Show full xcodebuild output |
 | `--dry-run` | Show what would be produced without completing the final build/copy step. In binary mode this still resolves artifacts so the reported set is exact. |
 | `--keep-work` | Keep temporary work directory (for debugging) |
+| `--no-cleanup-stale` | Skip cleanup of stale xcframeworks from prior runs this time, but keep them tracked in the manifest so a subsequent normal run will clean them. See "Stale-output cleanup" below. |
+| `--inspect-only` | Run Fetch + Inspect and print the parsed Package model, then exit (debugging aid) |
 | `-h, --help` | Show help |
 
 ## Examples
@@ -137,6 +139,18 @@ Note: the older `MACH_O_TYPE=mh_dylib` global override is gone. Synthetic librar
 
 Every source-mode build runs against a freshly-staged copy of the package with `.git`, `.build`, `DerivedData`, `node_modules`, and any sibling `.xcodeproj`/`.xcworkspace` files pruned. Pruning the Xcode projects forces `xcodebuild` to use SPM-generated schemes, which sidesteps both the "multiple projects with the current extension" error (GRDB ships `GRDB.xcodeproj` + `GRDBCustom.xcodeproj`) and the "does not contain a scheme" wording mismatch that the legacy bash had to grep around.
 
+### Stale-output cleanup
+
+The tool drops a `.spm-to-xcframework-manifest.json` file in the output directory recording exactly which xcframeworks each successful run produced (primary outputs and, when `--include-deps` is set, transitive dependency outputs too). Before the next run finishes, anything tracked by that manifest that the new run no longer produces is removed.
+
+Cleanup runs **only after every output passes the strict per-unit verify pass** — a failed run leaves the prior manifest and prior xcframeworks untouched so you can retry against a known-good baseline. Files in the output directory that the tool didn't put there (your own xcframeworks, READMEs, build outputs from other tools) are never touched: only entries listed in the manifest are eligible for cleanup, and entry names are constrained to plain basenames inside the output dir (no `..`, no absolute paths, no path separators).
+
+Pass `--no-cleanup-stale` to skip cleanup for one run while keeping the orphans tracked. The preserved entries are merged into the new manifest, so a subsequent run *without* the flag will clean them naturally — opting out once doesn't leak orphans forever.
+
+### Input validation
+
+Source URLs and tag/revision arguments are validated before they reach `git`. Package sources must be either an absolute local path or a URL with a known remote prefix (`http://`, `https://`, `git@`, `ssh://`); tag and revision values are restricted to a small character set with a length cap, and `--` separators are passed to every git invocation so a value starting with `-` cannot be reinterpreted as a git flag.
+
 ## Output
 
 ```
@@ -173,6 +187,8 @@ Xcframeworks:
   Alamofire.xcframework         (16.0M) [Swift]
   AlamofireDynamic.xcframework  (16.0M) [Swift]
 ```
+
+The output directory will also contain a `.spm-to-xcframework-manifest.json` file used to track which outputs the tool owns across runs (see "Stale-output cleanup" above). It is safe to commit, ignore, or delete; the tool re-creates it on the next successful run.
 
 ## Using with Swift.Bindings
 
