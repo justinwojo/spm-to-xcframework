@@ -20,8 +20,10 @@ annotations` so they remain strings).
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
+import plistlib
 import re
 import shutil
 import subprocess
@@ -29,7 +31,7 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, List, NoReturn, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, Iterable, List, NoReturn, Optional, Sequence, Set, Tuple
 
 # ============================================================================
 # --- Logging + color output ---
@@ -413,25 +415,46 @@ class PreparedPlan:
 
 
 @dataclass
+class ArchiveSlice:
+    """One (build unit, slice) pair's outputs from xcodebuild archive.
+
+    A "slice" is one of the two architectures we feed -create-xcframework
+    (device arm64 and the iOS simulator fat archive). Both slices are
+    archived in parallel by Session 4's `_archive_pair_parallel` and the
+    located framework / static lib paths are recorded here so Execute's
+    static-promote and injection passes don't need to re-walk the archive.
+    """
+
+    arch_suffix: str              # "arm64" (device) or "simulator"
+    sdk_name: str                 # "iphoneos" or "iphonesimulator"
+    archive_path: Path            # .xcarchive directory
+    dd_path: Path                 # derived data path
+    log_path: Path                # build log
+    result_bundle_path: Path      # xcresult bundle
+    framework_path: Optional[Path] = None
+    static_lib_path: Optional[Path] = None
+
+
+@dataclass
 class ExecutedUnit:
     """Output of Execute for a single build unit.
 
-    Session 3 captures only what the device-only slice produces (the
-    archive directory plus the located primary framework, if any). Session 4
-    will extend this with simulator slices, xcframework paths, and
-    static-promote diagnostics. The dataclass is intentionally additive so
-    Session 4 can grow it without rewriting Session 3 callers.
+    Holds both archive slices (device + simulator) and the final
+    xcframework path the merge step produced. The optional fields are
+    populated only when the unit's archive_strategy is "archive". For
+    binary-mode units (`copy-artifact`) the slices are empty and only
+    `xcframework_path` is set, pointing at the copied artifact in
+    `<output_dir>/`.
     """
 
     name: str                     # build unit name (matches plan.build_units[i].name)
-    archive_path: Path            # device .xcarchive directory
-    # Path to the located <X>.framework anywhere under <archive>/Products/.
-    # SPM library archives typically land at Products/usr/local/lib/<X>.framework
-    # but the lookup is recursive (matches the legacy bash strategy).
-    framework_path: Optional[Path]
-    log_path: Path                # WORK_DIR/.build-output-<name>-device
-    result_bundle_path: Path      # WORK_DIR/results/<name>-device.xcresult
-    static_lib_path: Optional[Path] = None  # set when xcodebuild produced a .a instead of a framework
+    device: Optional[ArchiveSlice] = None
+    simulator: Optional[ArchiveSlice] = None
+    xcframework_path: Optional[Path] = None
+    framework_name: Optional[str] = None  # the resolved <fw_name>, may differ from unit.name
+    framework_type: str = ""              # "Swift" / "ObjC" / "Mixed" / "Unknown" — for summary printing
+    is_binary_copy: bool = False
+    dependency_xcframeworks: List[Path] = field(default_factory=list)
 
 
 # ============================================================================
@@ -2310,20 +2333,24 @@ def prepare(staged_dir: Path, plan: Plan, *, verbose: bool = False) -> PreparedP
 # --- Phase 4: Execute ---
 # ============================================================================
 #
-# Session 3 lands the device-only slice in source mode. Sessions 4 and 5
-# fill in: parallel device + simulator builds, static→dynamic promotion,
-# swiftmodule + ObjC header injection, xcframework merge, binary mode,
-# and --include-deps. Until then, the executor's contract is narrow:
-# given a PreparedPlan, run `xcodebuild archive` once per source build
-# unit (target = generic/platform=iOS), locate the produced framework in
-# the archive, and surface any failure as an ExecuteError populated with
-# parsed xcresult diagnostics.
+# Sessions 3 + 4 split this phase across two checkpoints:
 #
-# Pure-function discipline matters here even before parallelism arrives:
-# Session 4 will lift `_archive_one_build_unit` into a thread pool, and
-# any hidden global state (a shared mutable list, a lazy module cache,
-# etc.) would race. Every helper below takes its inputs as parameters and
-# returns its outputs as values. No module-level mutation.
+# - Session 3 ran a single device-slice build per unit, recorded the
+#   archive path + located framework, and stopped there. No xcframework,
+#   no injection, no static promotion.
+# - Session 4 turns that into the full pipeline: device + simulator
+#   archives in parallel via ThreadPoolExecutor, static→dynamic promotion
+#   when xcodebuild produced a `.a`, swiftmodule + ObjC header injection,
+#   `xcodebuild -create-xcframework` merge, --include-deps walking, and
+#   binary-mode artifact copies sharing the same `BinaryArtifact` model
+#   that Fetch builds.
+#
+# Pure-function discipline matters because the parallel slice builds run
+# under a thread pool: every helper below takes its inputs as parameters
+# and returns its outputs as values. No module-level mutation, no shared
+# mutable state. The only globally observable side effect is filesystem
+# I/O scoped to `WORK_DIR` and `OUTPUT_DIR`, which are unique per
+# invocation.
 
 
 def _archive_framework_path(archive_path: Path, framework_name: str) -> Optional[Path]:
@@ -2569,34 +2596,59 @@ def _format_execute_error(unit_name: str, log_path: Path, errors: List[dict]) ->
     return "\n".join(lines)
 
 
-def _archive_one_build_unit(
+def _slice_paths(work_dir: Path, unit_name: str, arch_suffix: str) -> Tuple[Path, Path, Path, Path]:
+    """Pure path computation for one (build unit, slice). Centralised so
+    the parallel scheduler and the post-build framework lookup agree on
+    where each artifact lives.
+
+    Returns (archive_path, dd_path, result_bundle_path, log_path).
+    """
+    archive_path = work_dir / "archives" / f"{unit_name}-ios-{arch_suffix}.xcarchive"
+    dd_path = work_dir / "dd" / unit_name / arch_suffix
+    result_bundle_path = work_dir / "results" / f"{unit_name}-{arch_suffix}.xcresult"
+    log_path = work_dir / f".build-output-{unit_name}-{arch_suffix}"
+    return archive_path, dd_path, result_bundle_path, log_path
+
+
+# Two slices per build unit. Order is fixed so the printed summary and
+# the xcframework merge command consume them in a stable order
+# (device first, then simulator).
+_SLICES: Tuple[Tuple[str, str, str], ...] = (
+    ("arm64", "iphoneos", "generic/platform=iOS"),
+    ("simulator", "iphonesimulator", "generic/platform=iOS Simulator"),
+)
+
+
+def _archive_one_slice(
     unit: BuildUnit,
     *,
+    arch_suffix: str,
+    sdk_name: str,
+    destination: str,
     staged_dir: Path,
     work_dir: Path,
     min_ios: str,
     verbose: bool,
-) -> ExecutedUnit:
-    """Run xcodebuild archive once for one build unit, device slice only.
+) -> Tuple[ArchiveSlice, int]:
+    """Run xcodebuild archive once for one (build unit, slice) combination
+    and return the slice metadata plus the xcodebuild return code.
 
-    Pure with respect to module-level state: every input is a parameter
-    and every output is part of the returned ExecutedUnit. Designed to be
-    safe for `concurrent.futures.ThreadPoolExecutor` lifting in Session 4.
+    Does NOT raise on xcodebuild failure — the caller (`_archive_pair_parallel`)
+    needs both futures to settle so it can tail both logs and surface a
+    consolidated error. Locating the framework / static lib also happens
+    here so the caller can decide whether to trigger static promotion
+    without re-walking the archive.
 
-    Raises ExecuteError on xcodebuild failure (with parsed xcresult
-    context). On success, returns the ExecutedUnit; the caller is
-    responsible for printing whatever summary it wants.
+    Pure with respect to module-level state: thread-safe under
+    `ThreadPoolExecutor`.
     """
-    archive_path = work_dir / "archives" / f"{unit.name}-ios-arm64.xcarchive"
-    dd_path = work_dir / "dd" / unit.name / "device"
-    result_bundle_path = work_dir / "results" / f"{unit.name}-device.xcresult"
-    log_path = work_dir / f".build-output-{unit.name}-device"
-
-    info(f"  Building {unit.name} — device (arm64)...")
+    archive_path, dd_path, result_bundle_path, log_path = _slice_paths(
+        work_dir, unit.name, arch_suffix
+    )
     rc = run_xcodebuild_archive(
         staged_dir=staged_dir,
         scheme=unit.scheme,
-        destination="generic/platform=iOS",
+        destination=destination,
         archive_path=archive_path,
         dd_path=dd_path,
         result_bundle_path=result_bundle_path,
@@ -2604,79 +2656,1128 @@ def _archive_one_build_unit(
         min_ios=min_ios,
         verbose=verbose,
     )
-    if rc != 0:
-        errors = read_xcresult_errors(result_bundle_path, limit=5)
-        msg = _format_execute_error(unit.name, log_path, errors)
-        raise ExecuteError(msg)
-
-    framework_path = _archive_framework_path(archive_path, unit.framework_name)
+    framework_path = None
     static_lib_path = None
-    if framework_path is None:
-        # Session 3 doesn't promote static archives — Session 4 will. We
-        # still record the .a path here so the diagnostic at end-of-run
-        # tells the user the unit produced a static archive instead of a
-        # framework, rather than reporting it as a totally empty build.
-        static_lib_path = _archive_static_lib_path(archive_path)
-        if static_lib_path is not None:
-            warn(
-                f"  {unit.name}: xcodebuild produced a static archive "
-                f"({static_lib_path.name}) instead of a .framework — "
-                f"static→dynamic promotion lands in Session 4."
+    if rc == 0:
+        framework_path = _archive_framework_path(archive_path, unit.framework_name)
+        if framework_path is None:
+            static_lib_path = _archive_static_lib_path(archive_path)
+
+    slice_obj = ArchiveSlice(
+        arch_suffix=arch_suffix,
+        sdk_name=sdk_name,
+        archive_path=archive_path,
+        dd_path=dd_path,
+        log_path=log_path,
+        result_bundle_path=result_bundle_path,
+        framework_path=framework_path,
+        static_lib_path=static_lib_path,
+    )
+    return slice_obj, rc
+
+
+def _tail_log(log_path: Path, n: int = 5) -> str:
+    """Return the last `n` lines of a log file as a single string. Empty
+    string if the file is missing or unreadable. Used for the post-build
+    summary tails after both parallel slices settle (avoids interleaving
+    output during the build itself)."""
+    if not log_path.is_file():
+        return ""
+    try:
+        with open(log_path, "r", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return ""
+    return "".join(lines[-n:])
+
+
+def _archive_pair_parallel(
+    unit: BuildUnit,
+    *,
+    staged_dir: Path,
+    work_dir: Path,
+    min_ios: str,
+    verbose: bool,
+) -> Tuple[ArchiveSlice, ArchiveSlice]:
+    """Build the device + simulator archives for one build unit in parallel
+    via `ThreadPoolExecutor(max_workers=2)`.
+
+    Both futures must settle before this function returns — the caller
+    needs the consolidated state to decide whether the unit succeeded
+    completely, partially, or failed. Slice logs are captured to separate
+    files (`_slice_paths` enforces uniqueness) and tailed only after both
+    settle, so device + sim output never interleave on the user's
+    terminal.
+
+    Raises ExecuteError if either slice's xcodebuild call exited non-zero,
+    with the parsed xcresult diagnostics for whichever slice(s) failed.
+    On success, returns (device_slice, simulator_slice).
+    """
+    info(f"  Building {unit.name} — device (arm64) + simulator (parallel)...")
+
+    # Submit both archives. We use a fixed-size pool of 2 because that's
+    # the only parallelism the iOS pipeline benefits from per build unit
+    # — the device and simulator archives share scheme metadata but
+    # otherwise touch disjoint paths under `work_dir`.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        futures: Dict[concurrent.futures.Future, Tuple[str, str, str]] = {}
+        for arch_suffix, sdk_name, destination in _SLICES:
+            fut = pool.submit(
+                _archive_one_slice,
+                unit,
+                arch_suffix=arch_suffix,
+                sdk_name=sdk_name,
+                destination=destination,
+                staged_dir=staged_dir,
+                work_dir=work_dir,
+                min_ios=min_ios,
+                verbose=verbose,
             )
-        else:
-            warn(
-                f"  {unit.name}: archive completed but no "
-                f"{unit.framework_name}.framework found anywhere under "
-                f"{archive_path}/Products/. "
-                f"Subsequent injection / xcframework steps will surface this."
-            )
+            futures[fut] = (arch_suffix, sdk_name, destination)
+        results: Dict[str, Tuple[ArchiveSlice, int]] = {}
+        for fut in concurrent.futures.as_completed(futures):
+            arch_suffix, _sdk, _dest = futures[fut]
+            try:
+                slice_obj, rc = fut.result()
+            except Exception as exc:  # pragma: no cover — defensive
+                # Any unexpected exception (a missing xcodebuild on PATH,
+                # a permissions error, etc.) is reported as an
+                # ExecuteError tagged to the slice that blew up.
+                raise ExecuteError(
+                    f"unexpected failure during {unit.name} {arch_suffix} archive: {exc}"
+                ) from exc
+            results[arch_suffix] = (slice_obj, rc)
+
+    device_slice, device_rc = results["arm64"]
+    sim_slice, sim_rc = results["simulator"]
+
+    # Tail both logs after both settle. This is the legacy bash strategy
+    # (build_archive at lines 814-820) — interleaved live output is
+    # unreadable so the bash tool deferred summaries until both PIDs
+    # exited. Verbose mode already streams everything live so we skip the
+    # extra tail there to avoid double-printing.
+    if not verbose:
+        for slice_obj in (device_slice, sim_slice):
+            tail = _tail_log(slice_obj.log_path)
+            if tail:
+                sys.stdout.write(tail)
+                if not tail.endswith("\n"):
+                    sys.stdout.write("\n")
+        sys.stdout.flush()
+
+    failed_slices: List[Tuple[ArchiveSlice, int]] = []
+    if device_rc != 0:
+        failed_slices.append((device_slice, device_rc))
+    if sim_rc != 0:
+        failed_slices.append((sim_slice, sim_rc))
+    if failed_slices:
+        sections: List[str] = []
+        for slice_obj, _rc in failed_slices:
+            errors = read_xcresult_errors(slice_obj.result_bundle_path, limit=5)
+            slice_label = f"{unit.name} ({slice_obj.arch_suffix})"
+            sections.append(_format_execute_error(slice_label, slice_obj.log_path, errors))
+        raise ExecuteError("\n\n".join(sections))
+
+    return device_slice, sim_slice
+
+
+# ----- detect_system_frameworks --------------------------------------------
+#
+# Ported from the legacy bash spm-to-xcframework lines 896-976. Used by
+# `promote_static_to_framework` when xcodebuild produced a static archive
+# instead of a dynamic .framework. The legacy implementation embedded a
+# python heredoc inside bash; we collapse it back to native Python here
+# because the rewrite has the package dump as a typed model already.
+
+# Directories we never recurse into when scanning a target's source tree
+# for ObjC `#import <Framework/...>` lines. These are the SPM convention
+# names for things that aren't part of the shipped library — running into
+# them produces noise (a Demo app's `#import <UIKit/UIKit.h>` shouldn't
+# count as a system-framework dependency of the library itself, even
+# though UIKit happens to be a real system framework).
+_TARGET_SOURCE_SCAN_EXCLUDES: Set[str] = {
+    "Tests",
+    "Demo",
+    "Example",
+    "Examples",
+    "Samples",
+    "Playground",
+}
+
+# Compiled regexes for ObjC system-framework imports. Both forms appear
+# in the wild — `#import <UIKit/UIKit.h>` is the historical spelling and
+# `@import UIKit;` is the module-aware form modern ObjC code prefers.
+_RE_OBJC_HASH_IMPORT = re.compile(r"#import\s*<([A-Za-z_]+)/")
+_RE_OBJC_AT_IMPORT = re.compile(r"@import\s+([A-Za-z_]+)")
+
+
+def _scan_target_for_frameworks(
+    target: Target,
+    staged_dir: Path,
+    frameworks: Set[str],
+) -> None:
+    """Scan one target's linker settings + source tree for system-framework
+    references. Mutates `frameworks` in place.
+
+    The two sources are unioned (legacy behaviour). Linker settings come
+    from `swift package dump-package`'s `settings[].kind.linkedFramework`
+    where `tool == "linker"`. Source-tree scanning walks the target's
+    `path` (relative to staged_dir) and applies the same regex pair the
+    legacy bash uses, with the same exclude list.
+    """
+    # NOTE: linker settings come from raw_dump in `dump_package`, but
+    # `Target` doesn't currently store them — fall back to scanning the
+    # raw dump via the package model. Caller passes the staged_dir for
+    # filesystem access; raw_dump is read from `Package.raw_dump` in the
+    # caller and threaded into `_resolve_target_linker_frameworks`.
+    target_path_str = target.path or _default_target_path(target.name, target.kind)
+    if not target_path_str:
+        return
+    target_path = staged_dir / target_path_str
+    if not target_path.is_dir():
+        return
+    for root, dirs, files in os.walk(target_path):
+        # Prune the walk in place. Pruning at the directory level (rather
+        # than skipping in the file loop) saves a lot of work in repos
+        # with large `Tests/` trees.
+        dirs[:] = [d for d in dirs if d not in _TARGET_SOURCE_SCAN_EXCLUDES]
+        for f in files:
+            if not f.endswith((".h", ".m", ".mm")):
+                continue
+            try:
+                with open(os.path.join(root, f), "r", errors="replace") as fp:
+                    content = fp.read()
+            except OSError:
+                continue
+            for m in _RE_OBJC_HASH_IMPORT.finditer(content):
+                frameworks.add(m.group(1))
+            for m in _RE_OBJC_AT_IMPORT.finditer(content):
+                frameworks.add(m.group(1))
+
+
+def _resolve_target_linker_frameworks(raw_target: dict, frameworks: Set[str]) -> None:
+    """Pull `linkedFramework` entries out of a raw dump-package target's
+    settings list. Mutates `frameworks` in place.
+
+    The dump-package schema for linker settings is
+    `{"tool": "linker", "kind": {"linkedFramework": "Foo"}}`. We accept
+    any shape close to that and silently ignore everything else — this
+    is best-effort detection, not a contract.
+    """
+    for s in raw_target.get("settings", []) or []:
+        if not isinstance(s, dict):
+            continue
+        if s.get("tool") != "linker":
+            continue
+        kind = s.get("kind")
+        if isinstance(kind, dict):
+            fw = kind.get("linkedFramework")
+            if isinstance(fw, str) and fw:
+                frameworks.add(fw)
+
+
+def detect_system_frameworks(package: Package, product_name: str) -> List[str]:
+    """Return the sorted list of system frameworks the named product/target
+    appears to need. Union of linker settings (from the package dump) and
+    `#import <Framework/…>` / `@import Framework` references in target
+    sources.
+
+    `product_name` may name a `.library()` product OR a target (the
+    `--target` escape hatch case). Direct dependencies of those targets
+    are also scanned, matching the legacy bash behaviour at lines 954-966.
+    Self-references (the product name itself, the scanned target names)
+    are removed from the result so a library named `Stripe` doesn't
+    spuriously appear to depend on a system framework called `Stripe`.
+    """
+    # Find the targets backing this product. First check products[], then
+    # fall back to interpreting `product_name` as a bare target name (the
+    # --target escape hatch case).
+    raw_targets_by_name: Dict[str, dict] = {}
+    for raw_t in package.raw_dump.get("targets", []) or []:
+        if isinstance(raw_t, dict) and isinstance(raw_t.get("name"), str):
+            raw_targets_by_name[raw_t["name"]] = raw_t
+
+    product_targets: List[str] = []
+    for raw_p in package.raw_dump.get("products", []) or []:
+        if isinstance(raw_p, dict) and raw_p.get("name") == product_name:
+            tlist = raw_p.get("targets")
+            if isinstance(tlist, list):
+                product_targets = [t for t in tlist if isinstance(t, str)]
+            break
+    if not product_targets and product_name in raw_targets_by_name:
+        product_targets = [product_name]
+    if not product_targets:
+        return []
+
+    frameworks: Set[str] = set()
+    scanned: Set[str] = set()
+
+    def scan(name: str) -> None:
+        if name in scanned:
+            return
+        scanned.add(name)
+        target = package.target_by_name(name)
+        if target is not None:
+            _scan_target_for_frameworks(target, package.staged_dir, frameworks)
+        raw = raw_targets_by_name.get(name)
+        if raw is not None:
+            _resolve_target_linker_frameworks(raw, frameworks)
+
+    # Direct product targets first.
+    for tname in product_targets:
+        scan(tname)
+        # First-level internal dependencies. Mirrors the legacy bash
+        # behaviour: only walk one level deep, and only via `byName`
+        # (which is the dump-package shape for an internal target dep).
+        raw = raw_targets_by_name.get(tname)
+        if raw is None:
+            continue
+        for dep in raw.get("dependencies", []) or []:
+            if not isinstance(dep, dict):
+                continue
+            by_name = dep.get("byName")
+            if isinstance(by_name, list) and by_name and isinstance(by_name[0], str):
+                dep_name = by_name[0]
+                if dep_name in raw_targets_by_name:
+                    scan(dep_name)
+
+    # Strip self-references — the product name and any scanned target
+    # name should never appear in the system-framework list.
+    frameworks.discard(product_name)
+    for tname in scanned:
+        frameworks.discard(tname)
+    return sorted(frameworks)
+
+
+# ----- promote_static_to_framework -----------------------------------------
+#
+# Ported from the legacy bash spm-to-xcframework lines 985-1064. Triggered
+# from `_run_one_unit` when neither slice produced a `.framework` and at
+# least one slice produced a static archive instead.
+
+_INFO_PLIST_FORMAT = (
+    '<?xml version="1.0" encoding="UTF-8"?>\n'
+    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+    '<plist version="1.0">\n'
+    '<dict>\n'
+    '    <key>CFBundleExecutable</key>\n'
+    '    <string>{product}</string>\n'
+    '    <key>CFBundleIdentifier</key>\n'
+    '    <string>com.spm-to-xcframework.{product}</string>\n'
+    '    <key>CFBundleName</key>\n'
+    '    <string>{product}</string>\n'
+    '    <key>CFBundlePackageType</key>\n'
+    '    <string>FMWK</string>\n'
+    '    <key>MinimumOSVersion</key>\n'
+    '    <string>{min_ios}</string>\n'
+    '</dict>\n'
+    '</plist>\n'
+)
+
+
+def _lipo_archs(static_lib: Path) -> List[str]:
+    """Return the architectures present in a Mach-O static archive, via
+    `lipo -archs`. Empty list on failure (lipo missing, file is not a
+    Mach-O object, etc.) — the caller treats that as "can't promote"."""
+    cp = subprocess.run(
+        ["lipo", "-archs", str(static_lib)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if cp.returncode != 0:
+        return []
+    return [a for a in cp.stdout.strip().split() if a]
+
+
+def promote_static_to_framework(
+    *,
+    static_lib: Path,
+    product: str,
+    sdk_name: str,
+    min_ios: str,
+    archive_path: Path,
+    system_frameworks: Sequence[str],
+    verbose: bool,
+) -> Path:
+    """Re-link a `.a` static archive into a dynamic `.framework` bundle.
+
+    Same algorithm as the legacy bash promote_static_to_framework:
+      1. `lipo -archs` to discover the slice's archs.
+      2. `xcrun --sdk <sdk> clang -dynamiclib` with one `-arch` per arch,
+         the appropriate `-m{iphoneos,ios-simulator}-version-min` flag,
+         `-install_name @rpath/<X>.framework/<X>`, `-Xlinker -all_load`,
+         every `-framework <Foo>` we detected for the product, and
+         `-Xlinker -undefined dynamic_lookup` as a safety net for
+         indirect dependencies the scanner missed.
+      3. Wrap the resulting Mach-O in a minimal `.framework` bundle with
+         a CFBundlePackageType=FMWK Info.plist.
+
+    Returns the path to the newly-created `.framework` directory. Raises
+    `ExecuteError` if any step fails.
+    """
+    fw_dir = archive_path / "Products" / "Library" / "Frameworks" / f"{product}.framework"
+    if fw_dir.exists():
+        shutil.rmtree(fw_dir)
+    fw_dir.mkdir(parents=True, exist_ok=True)
+
+    archs = _lipo_archs(static_lib)
+    if not archs:
+        raise ExecuteError(
+            f"Failed to determine architectures from {static_lib} via lipo -archs."
+        )
+
+    if sdk_name == "iphonesimulator":
+        min_ver_flag = f"-mios-simulator-version-min={min_ios}"
     else:
-        success(f"  {unit.name}: {framework_path.relative_to(archive_path.parent)}")
+        min_ver_flag = f"-miphoneos-version-min={min_ios}"
+
+    dim(f"  Re-linking static → dynamic ({sdk_name}: {' '.join(archs)})")
+
+    cmd: List[str] = ["xcrun", "--sdk", sdk_name, "clang", "-dynamiclib"]
+    for a in archs:
+        cmd.extend(["-arch", a])
+    cmd.extend([
+        min_ver_flag,
+        "-install_name", f"@rpath/{product}.framework/{product}",
+        "-Xlinker", "-all_load",
+        str(static_lib),
+    ])
+    for fw in system_frameworks:
+        cmd.extend(["-framework", fw])
+    # Safety net for any unresolved symbols (legacy line 1030). Indirect
+    # transitive deps that the source-tree scan missed will resolve at
+    # runtime via dyld instead of failing the link here.
+    cmd.extend(["-Xlinker", "-undefined", "-Xlinker", "dynamic_lookup"])
+    cmd.extend(["-o", str(fw_dir / product)])
+
+    verbose_log(verbose, f"  $ {' '.join(cmd)}")
+
+    log_path = archive_path / "relink.log"
+    with open(log_path, "w") as logf:
+        cp = subprocess.run(
+            cmd,
+            stdout=logf,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    if cp.returncode != 0:
+        tail = _tail_log(log_path, n=10)
+        raise ExecuteError(
+            f"Failed to re-link static library {static_lib} as dynamic framework "
+            f"{product}.framework (sdk={sdk_name}). Last lines of relink log "
+            f"({log_path}):\n{tail}"
+        )
+
+    plist_text = _INFO_PLIST_FORMAT.format(product=product, min_ios=min_ios)
+    (fw_dir / "Info.plist").write_text(plist_text)
+
+    return fw_dir
+
+
+# ----- inject_swiftmodule + inject_objc_headers ----------------------------
+#
+# Both ports of the legacy bash injection passes (lines 1273-1453). They
+# operate on a single slice's framework path and DerivedData; called
+# twice per build unit (once per slice).
+
+
+def _find_swiftmodule_in_dd(
+    dd_path: Path,
+    fw_name: str,
+    scheme: str,
+    extra_module_names: Sequence[str] = (),
+) -> Optional[Tuple[Path, str]]:
+    """Locate a `<name>.swiftmodule` directory under DerivedData.
+
+    Search order:
+      1. `*/<fw_name>.swiftmodule` anywhere under DerivedData.
+      2. `ArchiveIntermediates/<scheme>/BuildProductsPath/*/<fw_name>.swiftmodule`
+         (legacy bash 1296-1301 fallback for scheme/product name mismatch).
+      3. For each name in extra_module_names (typically the underlying
+         source targets), the same two passes. This handles cases like
+         GRDB-dynamic, where the framework binary is named "GRDB-dynamic"
+         but the Swift module the targets actually emit is "GRDB".
+
+    Returns (path, module_name) so the caller knows which name to use
+    for the destination directory inside the framework's Modules/.
+    """
+
+    def _find_for(name: str) -> Optional[Path]:
+        target = f"{name}.swiftmodule"
+        if dd_path.is_dir():
+            for path in dd_path.rglob(target):
+                if path.is_dir():
+                    return path
+        if scheme != name and dd_path.is_dir():
+            intermediate = (
+                dd_path / "Build" / "Intermediates.noindex"
+                / "ArchiveIntermediates" / scheme / "BuildProductsPath"
+            )
+            if intermediate.is_dir():
+                for path in intermediate.rglob(target):
+                    if path.is_dir():
+                        return path
+        return None
+
+    found = _find_for(fw_name)
+    if found is not None:
+        return found, fw_name
+    for name in extra_module_names:
+        if name == fw_name:
+            continue
+        found = _find_for(name)
+        if found is not None:
+            return found, name
+    return None
+
+
+def inject_swiftmodule(
+    *,
+    fw_path: Path,
+    fw_name: str,
+    scheme: str,
+    dd_path: Path,
+    variant: str,
+    verbose: bool,
+    extra_module_names: Sequence[str] = (),
+) -> bool:
+    """Copy `.swiftmodule/.swiftinterface` files from DerivedData into a
+    framework's Modules directory if they're missing.
+
+    `extra_module_names` lets the caller pass underlying source target
+    names so that frameworks whose binary name doesn't match the actual
+    Swift module name (e.g. GRDB-dynamic.framework whose module is
+    `GRDB`) can still get their interfaces injected.
+
+    Returns True iff anything was injected. Idempotent: if any
+    `Modules/<X>.swiftmodule/` already contains `.swiftinterface` files
+    this is a no-op.
+    """
+    modules_dir = fw_path / "Modules"
+    if modules_dir.is_dir():
+        for sm in modules_dir.glob("*.swiftmodule"):
+            if sm.is_dir():
+                for child in sm.iterdir():
+                    if child.suffix == ".swiftinterface":
+                        verbose_log(verbose, f"  Swift interfaces present in {variant} framework")
+                        return False
+
+    found = _find_swiftmodule_in_dd(dd_path, fw_name, scheme, extra_module_names)
+    if found is None:
+        verbose_log(
+            verbose,
+            f"  No Swift module found in DerivedData for {fw_name} ({variant})",
+        )
+        return False
+    swiftmod, module_name = found
+
+    dim(f"  Injecting Swift module interfaces ({variant})")
+    modules_dir.mkdir(parents=True, exist_ok=True)
+    dest = modules_dir / f"{module_name}.swiftmodule"
+    if dest.exists():
+        shutil.rmtree(dest)
+    shutil.copytree(swiftmod, dest)
+    return True
+
+
+def _find_objc_headers_dir(
+    package: Package,
+    product_name: str,
+    fw_name: str,
+) -> Optional[Path]:
+    """Find a directory of public ObjC headers for the named product.
+
+    Priority (matches legacy bash 1352-1397):
+      1. A direct product target whose name == fw_name with a
+         publicHeadersPath that exists and contains *.h files.
+      2. A direct product target whose name == product_name.
+      3. Any direct product target with headers.
+      4. First-level dependencies of direct product targets, with the
+         same fw_name > product_name > anything-with-headers priority.
+
+    Returns the absolute path of the public-headers directory, or None.
+    """
+    raw_targets_by_name: Dict[str, dict] = {}
+    for raw_t in package.raw_dump.get("targets", []) or []:
+        if isinstance(raw_t, dict) and isinstance(raw_t.get("name"), str):
+            raw_targets_by_name[raw_t["name"]] = raw_t
+
+    product_targets: List[str] = []
+    for raw_p in package.raw_dump.get("products", []) or []:
+        if isinstance(raw_p, dict) and raw_p.get("name") == product_name:
+            tlist = raw_p.get("targets")
+            if isinstance(tlist, list):
+                product_targets = [t for t in tlist if isinstance(t, str)]
+            break
+    if not product_targets and product_name in raw_targets_by_name:
+        product_targets = [product_name]
+    if not product_targets:
+        return None
+
+    def headers_dir_for(target_name: str) -> Optional[Path]:
+        target = package.target_by_name(target_name)
+        if target is None or not target.public_headers_path:
+            return None
+        target_path = target.path or _default_target_path(target.name, target.kind)
+        if not target_path:
+            return None
+        full_path = package.staged_dir / target_path / target.public_headers_path
+        if not full_path.is_dir():
+            return None
+        # Has at least one .h file (recursively).
+        for _root, _dirs, files in os.walk(full_path):
+            if any(f.endswith(".h") for f in files):
+                return full_path
+        return None
+
+    product_match: Optional[Path] = None
+    any_match: Optional[Path] = None
+    for tname in product_targets:
+        d = headers_dir_for(tname)
+        if d is None:
+            continue
+        if tname == fw_name:
+            return d
+        if tname == product_name:
+            if product_match is None:
+                product_match = d
+        else:
+            if any_match is None:
+                any_match = d
+    if product_match is not None:
+        return product_match
+    if any_match is not None:
+        return any_match
+
+    # First-level dependencies of direct product targets.
+    dep_fw_match: Optional[Path] = None
+    dep_product_match: Optional[Path] = None
+    dep_any_match: Optional[Path] = None
+    for tname in product_targets:
+        raw = raw_targets_by_name.get(tname)
+        if raw is None:
+            continue
+        for dep in raw.get("dependencies", []) or []:
+            if not isinstance(dep, dict):
+                continue
+            by_name = dep.get("byName")
+            if not (isinstance(by_name, list) and by_name and isinstance(by_name[0], str)):
+                continue
+            dep_name = by_name[0]
+            d = headers_dir_for(dep_name)
+            if d is None:
+                continue
+            if dep_name == fw_name and dep_fw_match is None:
+                dep_fw_match = d
+            elif dep_name == product_name and dep_product_match is None:
+                dep_product_match = d
+            elif dep_any_match is None:
+                dep_any_match = d
+    if dep_fw_match is not None:
+        return dep_fw_match
+    if dep_product_match is not None:
+        return dep_product_match
+    return dep_any_match
+
+
+def _generate_modulemap(fw_path: Path, fw_name: str) -> None:
+    """Write `Modules/module.modulemap` for a framework that has ObjC
+    headers but no module map. Uses an umbrella header if `<fw_name>.h`
+    exists, otherwise lists every header explicitly. Same shape as the
+    legacy bash 1430-1450.
+    """
+    modules_dir = fw_path / "Modules"
+    modules_dir.mkdir(parents=True, exist_ok=True)
+    headers_dir = fw_path / "Headers"
+    umbrella = headers_dir / f"{fw_name}.h"
+    if umbrella.is_file():
+        text = (
+            f"framework module {fw_name} {{\n"
+            f"  umbrella header \"{fw_name}.h\"\n"
+            f"  export *\n"
+            f"  module * {{ export * }}\n"
+            f"}}\n"
+        )
+    else:
+        header_names = sorted(p.name for p in headers_dir.glob("*.h"))
+        lines = [f"framework module {fw_name} {{"]
+        for h in header_names:
+            lines.append(f"  header \"{h}\"")
+        lines.append("  export *")
+        lines.append("}")
+        text = "\n".join(lines) + "\n"
+    (modules_dir / "module.modulemap").write_text(text)
+
+
+def inject_objc_headers(
+    *,
+    package: Package,
+    product_name: str,
+    fw_name: str,
+    fw_path: Path,
+    verbose: bool,
+) -> bool:
+    """Copy public ObjC headers + a generated modulemap into a framework
+    bundle. No-op if the framework already has `*.h` headers (excluding
+    the auto-generated `*-Swift.h` bridge header).
+
+    Returns True iff anything was injected.
+    """
+    headers_target = fw_path / "Headers"
+    if headers_target.is_dir():
+        for p in headers_target.glob("*.h"):
+            if not p.name.endswith("-Swift.h"):
+                verbose_log(verbose, "  Public headers already present in framework")
+                return False
+
+    headers_dir = _find_objc_headers_dir(package, product_name, fw_name)
+    if headers_dir is None:
+        verbose_log(verbose, f"  No ObjC public headers found in source tree for {fw_name}")
+        return False
+
+    dim(f"  Injecting ObjC headers ({fw_name})")
+    headers_target.mkdir(parents=True, exist_ok=True)
+
+    # SPM convention (legacy 1411-1420): headers may be in a subdirectory
+    # named after the module (e.g., Public/FirebaseCore/*.h) or directly
+    # in the public headers dir.
+    module_subdir = headers_dir / fw_name
+    copied = 0
+    if module_subdir.is_dir():
+        for h in module_subdir.rglob("*.h"):
+            if h.is_file():
+                shutil.copy2(h, headers_target / h.name)
+                copied += 1
+    else:
+        for h in headers_dir.glob("*.h"):
+            if h.is_file():
+                shutil.copy2(h, headers_target / h.name)
+                copied += 1
+
+    if copied == 0:
+        verbose_log(verbose, f"  No headers copied from {headers_dir}")
+        return False
+
+    _generate_modulemap(fw_path, fw_name)
+    verbose_log(verbose, f"  Injected {copied} header(s) + modulemap")
+    return True
+
+
+# ----- create_xcframework + dependency walker ------------------------------
+
+
+def create_xcframework(
+    *,
+    output_xcframework: Path,
+    device_fw: Path,
+    sim_fw: Path,
+    verbose: bool,
+) -> None:
+    """Shell out to `xcodebuild -create-xcframework` for one (device, sim)
+    framework pair. Removes any pre-existing output directory first
+    (xcodebuild refuses to overwrite). Raises `ExecuteError` on failure.
+    """
+    if output_xcframework.exists():
+        shutil.rmtree(output_xcframework)
+    output_xcframework.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        "xcodebuild", "-create-xcframework",
+        "-framework", str(device_fw),
+        "-framework", str(sim_fw),
+        "-output", str(output_xcframework),
+    ]
+    verbose_log(verbose, f"  $ {' '.join(cmd)}")
+    cp = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    if cp.returncode != 0:
+        # Tail the output for diagnostics — same shape the legacy bash
+        # uses (`tail -3` on the create-xcframework call).
+        tail = "\n".join((cp.stdout or "").rstrip().splitlines()[-10:])
+        raise ExecuteError(
+            f"xcodebuild -create-xcframework failed for {output_xcframework.name}:\n"
+            + (tail or "  (no output)")
+        )
+
+
+def detect_framework_type(xcfw_path: Path) -> str:
+    """Classify an xcframework as Swift / ObjC / Mixed / Unknown by walking
+    its contents. Used by Execute's per-unit summary line and (in
+    Session 5) by the Verify phase. Same logic as the legacy bash
+    detect_framework_type."""
+    has_swift = False
+    has_objc = False
+    if xcfw_path.is_dir():
+        for path in xcfw_path.rglob("*"):
+            name = path.name
+            if not has_swift and (name.endswith(".swiftinterface") or name.endswith(".swiftmodule")):
+                has_swift = True
+            if not has_objc and name.endswith(".h") and not name.endswith("-Swift.h"):
+                # Only count headers under a Headers/ directory — that's
+                # the SPM convention for public ObjC API. Bridge headers
+                # outside Headers/ are framework-internal noise.
+                if "Headers" in path.parts:
+                    has_objc = True
+            if has_swift and has_objc:
+                break
+    if has_swift and has_objc:
+        return "Mixed"
+    if has_swift:
+        return "Swift"
+    if has_objc:
+        return "ObjC"
+    return "Unknown"
+
+
+def _build_dependency_xcframeworks(
+    *,
+    unit: BuildUnit,
+    package: Package,
+    device_slice: ArchiveSlice,
+    sim_slice: ArchiveSlice,
+    primary_fw_name: str,
+    output_dir: Path,
+    verbose: bool,
+) -> List[Path]:
+    """Walk the device archive for `.framework` bundles that aren't the
+    primary, inject swiftmodule + ObjC headers into each, and merge them
+    into per-dependency xcframeworks under `output_dir`.
+
+    Mirrors the legacy bash `build_dependency_xcframeworks` (lines
+    1228-1270). Skips:
+      - the primary framework itself (matched by both unit name and
+        resolved fw_name in case those differ)
+      - dependencies that already have a built `<X>.xcframework` in
+        `output_dir` (avoids re-creating Stripe-style sub-frameworks
+        that the user explicitly asked for via `--target`)
+      - dependencies whose simulator counterpart isn't present (a
+        device-only framework can't be merged)
+    """
+    products_dir = device_slice.archive_path / "Products"
+    if not products_dir.is_dir():
+        return []
+    built: List[Path] = []
+    for fw_path in sorted(products_dir.rglob("*.framework")):
+        if not fw_path.is_dir():
+            continue
+        fw_name = fw_path.stem
+        if fw_name in (unit.name, primary_fw_name):
+            continue
+        if (output_dir / f"{fw_name}.xcframework").is_dir():
+            continue
+        sim_products = sim_slice.archive_path / "Products"
+        sim_fw: Optional[Path] = None
+        if sim_products.is_dir():
+            for candidate in sim_products.rglob(f"{fw_name}.framework"):
+                if candidate.is_dir():
+                    sim_fw = candidate
+                    break
+        if sim_fw is None:
+            continue
+        dim(f"  Dependency: {fw_name}")
+        inject_swiftmodule(
+            fw_path=fw_path,
+            fw_name=fw_name,
+            scheme=fw_name,
+            dd_path=device_slice.dd_path,
+            variant="device",
+            verbose=verbose,
+        )
+        inject_swiftmodule(
+            fw_path=sim_fw,
+            fw_name=fw_name,
+            scheme=fw_name,
+            dd_path=sim_slice.dd_path,
+            variant="simulator",
+            verbose=verbose,
+        )
+        # Use the dependency name as both product_name and fw_name when
+        # looking for ObjC headers — we don't have a richer mapping.
+        inject_objc_headers(
+            package=package,
+            product_name=fw_name,
+            fw_name=fw_name,
+            fw_path=fw_path,
+            verbose=verbose,
+        )
+        inject_objc_headers(
+            package=package,
+            product_name=fw_name,
+            fw_name=fw_name,
+            fw_path=sim_fw,
+            verbose=verbose,
+        )
+        dep_xcframework = output_dir / f"{fw_name}.xcframework"
+        try:
+            create_xcframework(
+                output_xcframework=dep_xcframework,
+                device_fw=fw_path,
+                sim_fw=sim_fw,
+                verbose=verbose,
+            )
+        except ExecuteError as exc:
+            warn(f"  Failed to create {fw_name}.xcframework (dependency): {exc}")
+            continue
+        fw_type = detect_framework_type(dep_xcframework)
+        success(f"  {fw_name}.xcframework ready (dependency) [{fw_type}]")
+        built.append(dep_xcframework)
+    return built
+
+
+def _run_one_unit(
+    unit: BuildUnit,
+    *,
+    prepared: PreparedPlan,
+    config: Config,
+) -> ExecutedUnit:
+    """End-to-end Execute pipeline for a single source-mode build unit.
+
+    1. Parallel device + simulator archive.
+    2. Locate framework, fall back to static-promote if both slices
+       produced a `.a` instead.
+    3. Inject swiftmodule + ObjC headers per slice.
+    4. Merge slices via `xcodebuild -create-xcframework`.
+    5. (Optional) walk dependency frameworks if `--include-deps` is set.
+    """
+    assert config.work_dir is not None
+    work_dir = config.work_dir
+    staged_dir = prepared.package.staged_dir
+
+    device_slice, sim_slice = _archive_pair_parallel(
+        unit,
+        staged_dir=staged_dir,
+        work_dir=work_dir,
+        min_ios=config.min_ios,
+        verbose=config.verbose,
+    )
+
+    # If neither slice located a `.framework` for `unit.framework_name`
+    # but both have a static archive, run the StaticPromote strategy and
+    # re-locate the framework. This is the MBProgressHUD path.
+    if device_slice.framework_path is None and sim_slice.framework_path is None:
+        if device_slice.static_lib_path is not None and sim_slice.static_lib_path is not None:
+            warn(f"  {unit.name}: static archive(s) found — promoting to dynamic framework")
+            system_frameworks = detect_system_frameworks(prepared.package, unit.name)
+            if system_frameworks:
+                verbose_log(
+                    config.verbose,
+                    f"  Linking system frameworks: {' '.join(system_frameworks)}",
+                )
+            promote_static_to_framework(
+                static_lib=device_slice.static_lib_path,
+                product=unit.framework_name,
+                sdk_name=device_slice.sdk_name,
+                min_ios=config.min_ios,
+                archive_path=device_slice.archive_path,
+                system_frameworks=system_frameworks,
+                verbose=config.verbose,
+            )
+            promote_static_to_framework(
+                static_lib=sim_slice.static_lib_path,
+                product=unit.framework_name,
+                sdk_name=sim_slice.sdk_name,
+                min_ios=config.min_ios,
+                archive_path=sim_slice.archive_path,
+                system_frameworks=system_frameworks,
+                verbose=config.verbose,
+            )
+            device_slice.framework_path = _archive_framework_path(
+                device_slice.archive_path, unit.framework_name
+            )
+            sim_slice.framework_path = _archive_framework_path(
+                sim_slice.archive_path, unit.framework_name
+            )
+
+    if device_slice.framework_path is None:
+        # Last-resort: scan for any .framework in the archive and use it
+        # as a best-guess (handles the rare case where the framework
+        # binary name differs from both the product name and the target
+        # name). Same fallback the legacy bash uses at lines 1097-1110.
+        any_fw = None
+        products = device_slice.archive_path / "Products"
+        if products.is_dir():
+            for candidate in sorted(products.rglob("*.framework")):
+                if candidate.is_dir():
+                    any_fw = candidate
+                    break
+        if any_fw is not None:
+            actual_name = any_fw.stem
+            warn(f"  Using {actual_name} instead of {unit.framework_name}")
+            device_slice.framework_path = any_fw
+            sim_products = sim_slice.archive_path / "Products"
+            if sim_products.is_dir():
+                for candidate in sim_products.rglob(f"{actual_name}.framework"):
+                    if candidate.is_dir():
+                        sim_slice.framework_path = candidate
+                        break
+
+    if device_slice.framework_path is None:
+        raise ExecuteError(
+            f"{unit.name}: archive completed but no .framework found anywhere "
+            f"under {device_slice.archive_path}/Products/. Static promotion "
+            f"either failed or no .a was produced either."
+        )
+    if sim_slice.framework_path is None:
+        raise ExecuteError(
+            f"{unit.name}: simulator framework missing under "
+            f"{sim_slice.archive_path}/Products/."
+        )
+
+    fw_name = device_slice.framework_path.stem
+    success(f"  {unit.name}: device {device_slice.framework_path.relative_to(device_slice.archive_path.parent)}")
+
+    # Injection passes — both slices.
+    inject_swiftmodule(
+        fw_path=device_slice.framework_path,
+        fw_name=fw_name,
+        scheme=unit.scheme,
+        dd_path=device_slice.dd_path,
+        variant="device",
+        verbose=config.verbose,
+        extra_module_names=unit.source_targets,
+    )
+    inject_swiftmodule(
+        fw_path=sim_slice.framework_path,
+        fw_name=fw_name,
+        scheme=unit.scheme,
+        dd_path=sim_slice.dd_path,
+        variant="simulator",
+        verbose=config.verbose,
+        extra_module_names=unit.source_targets,
+    )
+    inject_objc_headers(
+        package=prepared.package,
+        product_name=unit.name,
+        fw_name=fw_name,
+        fw_path=device_slice.framework_path,
+        verbose=config.verbose,
+    )
+    inject_objc_headers(
+        package=prepared.package,
+        product_name=unit.name,
+        fw_name=fw_name,
+        fw_path=sim_slice.framework_path,
+        verbose=config.verbose,
+    )
+
+    output_xcframework = config.output_dir / f"{unit.name}.xcframework"
+    info(f"  Creating {unit.name}.xcframework...")
+    create_xcframework(
+        output_xcframework=output_xcframework,
+        device_fw=device_slice.framework_path,
+        sim_fw=sim_slice.framework_path,
+        verbose=config.verbose,
+    )
+    fw_type = detect_framework_type(output_xcframework)
+    success(f"  {unit.name}.xcframework ready [{fw_type}]")
+
+    dep_xcframeworks: List[Path] = []
+    if prepared.plan.include_deps:
+        dep_xcframeworks = _build_dependency_xcframeworks(
+            unit=unit,
+            package=prepared.package,
+            device_slice=device_slice,
+            sim_slice=sim_slice,
+            primary_fw_name=fw_name,
+            output_dir=config.output_dir,
+            verbose=config.verbose,
+        )
 
     return ExecutedUnit(
         name=unit.name,
-        archive_path=archive_path,
-        framework_path=framework_path,
-        log_path=log_path,
-        result_bundle_path=result_bundle_path,
-        static_lib_path=static_lib_path,
+        device=device_slice,
+        simulator=sim_slice,
+        xcframework_path=output_xcframework,
+        framework_name=fw_name,
+        framework_type=fw_type,
+        dependency_xcframeworks=dep_xcframeworks,
     )
 
 
-def execute_source_plan_device_only(
+def execute_source_plan(
     prepared: PreparedPlan,
     config: Config,
 ) -> List[ExecutedUnit]:
-    """Run the device-only slice of every source-mode build unit in
-    `prepared.plan`. Sequential, no parallelism — Session 4 lifts to
-    `ThreadPoolExecutor(max_workers=2)` for device + sim concurrency.
+    """Run the full Execute pipeline for every source-mode unit in the
+    plan. Sequential across units (each unit's slices already build in
+    parallel internally).
 
-    Skips any unit with `archive_strategy == "copy-artifact"` (binary
-    mode). Returns the list of ExecutedUnits in plan order. Raises
-    ExecuteError on the first failure (later units are not attempted —
-    fail fast keeps the diagnostic small for the user).
+    Skips any unit with `archive_strategy == "copy-artifact"` — binary
+    mode is handled by `execute_binary_plan` below. Returns the list of
+    ExecutedUnits in plan order. Raises `ExecuteError` on the first
+    failure (later units are not attempted, matching Session 3's
+    fail-fast contract).
     """
     if config.work_dir is None:
-        # `main()` always allocates work_dir before reaching this code path.
-        # If we get here something is structurally broken; surface it as
-        # ExecuteError so the user gets a clean phase-tagged message rather
-        # than an AssertionError that disappears under `python -O`.
         raise ExecuteError("internal error: config.work_dir was not allocated before Execute")
-    work_dir = config.work_dir
-    results: List[ExecutedUnit] = []
     archive_units = [u for u in prepared.plan.build_units if u.archive_strategy != "copy-artifact"]
     if not archive_units:
-        return results
-    bold(f"\nExecuting {len(archive_units)} build unit(s) — device slice only...")
+        return []
+    bold(f"\nExecuting {len(archive_units)} build unit(s)...")
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    results: List[ExecutedUnit] = []
     for unit in archive_units:
-        executed = _archive_one_build_unit(
-            unit,
-            staged_dir=prepared.package.staged_dir,
-            work_dir=work_dir,
-            min_ios=config.min_ios,
-            verbose=config.verbose,
-        )
+        executed = _run_one_unit(unit, prepared=prepared, config=config)
         results.append(executed)
+    return results
+
+
+def execute_binary_plan(
+    plan: Plan,
+    config: Config,
+) -> List[ExecutedUnit]:
+    """Copy each `copy-artifact` build unit's xcframework into
+    `config.output_dir`.
+
+    The artifact paths come from the planner (which got them from
+    `discover_binary_artifacts` during Fetch — same code path Execute
+    would otherwise reach for, so the two phases never disagree about
+    which xcframeworks exist). The only Execute-side responsibility is
+    the copy itself plus a paranoia guard against `__MACOSX` slipping
+    in.
+    """
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    copy_units = [u for u in plan.build_units if u.archive_strategy == "copy-artifact"]
+    if not copy_units:
+        return []
+    bold(f"\nCopying {len(copy_units)} binary artifact(s)...")
+    results: List[ExecutedUnit] = []
+    for unit in copy_units:
+        if unit.artifact_path is None:
+            raise ExecuteError(
+                f"binary build unit {unit.name!r} has no artifact_path — "
+                f"plan_binary_build did not record one. This is a bug."
+            )
+        src = unit.artifact_path
+        if "__MACOSX" in src.parts:
+            raise ExecuteError(
+                f"refusing to copy ghost xcframework from {src} (path contains __MACOSX)"
+            )
+        if not src.is_dir():
+            raise ExecuteError(f"binary artifact missing on disk: {src}")
+        dest = config.output_dir / src.name
+        if "__MACOSX" in dest.parts:
+            raise ExecuteError(f"refusing to write to {dest} (path contains __MACOSX)")
+        if dest.exists():
+            shutil.rmtree(dest)
+        info(f"  Copying {src.name}...")
+        shutil.copytree(src, dest, symlinks=True)
+        fw_type = detect_framework_type(dest)
+        success(f"  {dest.name} ready [{fw_type}]")
+        results.append(
+            ExecutedUnit(
+                name=unit.name,
+                xcframework_path=dest,
+                framework_name=src.stem,
+                framework_type=fw_type,
+                is_binary_copy=True,
+            )
+        )
     return results
 
 
@@ -3928,6 +5029,424 @@ def _selftest_select_active_manifest() -> None:
         _swift_toolchain_version = saved
 
 
+# --- Execute self-tests ---------------------------------------------------
+#
+# Session 4 introduces the parallel slice builder, static-promote,
+# swiftmodule + ObjC header injection, and binary copy. Most of those
+# functions touch xcodebuild / lipo / clang and aren't directly unit
+# testable, so the self-tests below focus on the pure helpers (path
+# layout, framework type detection, ObjC header lookup against the
+# raw_dump model, modulemap generation) and on the round-trip fixture
+# for `edit_force_dynamic` -> `swift package dump-package`.
+
+_FOO_PACKAGE_SWIFT_FIXTURE = """// swift-tools-version:5.7
+import PackageDescription
+
+let package = Package(
+    name: "Foo",
+    platforms: [.iOS(.v15)],
+    products: [
+        .library(name: "Foo", targets: ["Foo"]),
+    ],
+    targets: [
+        .target(name: "Foo", path: "Sources/Foo"),
+    ]
+)
+"""
+
+
+def _selftest_slice_paths_unique() -> None:
+    """Device + simulator slice paths must be disjoint so the parallel
+    builder can run both at once without stomping on each other's
+    archives, derived data, xcresult bundles, or log files."""
+    work = Path("/tmp/spm2xc-fake-work")
+    dev = _slice_paths(work, "MyUnit", "arm64")
+    sim = _slice_paths(work, "MyUnit", "simulator")
+    for d, s in zip(dev, sim):
+        _assert(d != s, f"slice paths collided: device={d} sim={s}")
+    # Within each slice the four paths must also be distinct (no two
+    # files at the same target). Catches accidental dedupe in the
+    # path-derivation logic.
+    _assert(len(set(dev)) == 4, f"device slice has duplicate paths: {dev}")
+    _assert(len(set(sim)) == 4, f"sim slice has duplicate paths: {sim}")
+
+
+def _selftest_detect_framework_type_swift_objc_mixed(tmp_root: Path) -> None:
+    """detect_framework_type classifies a synthetic xcframework tree."""
+    base = tmp_root / "fwtype"
+    base.mkdir()
+    # Swift only.
+    swift_xc = base / "Swift.xcframework"
+    sw_modules = swift_xc / "ios-arm64" / "Swift.framework" / "Modules" / "Swift.swiftmodule"
+    sw_modules.mkdir(parents=True)
+    (sw_modules / "arm64.swiftinterface").write_text("// interface")
+    _assert(detect_framework_type(swift_xc) == "Swift",
+            f"Swift xcfw misclassified: {detect_framework_type(swift_xc)}")
+    # ObjC only.
+    objc_xc = base / "ObjC.xcframework"
+    obj_headers = objc_xc / "ios-arm64" / "ObjC.framework" / "Headers"
+    obj_headers.mkdir(parents=True)
+    (obj_headers / "ObjC.h").write_text("// header")
+    _assert(detect_framework_type(objc_xc) == "ObjC",
+            f"ObjC xcfw misclassified: {detect_framework_type(objc_xc)}")
+    # Mixed.
+    mixed_xc = base / "Mixed.xcframework"
+    mx_modules = mixed_xc / "ios-arm64" / "Mixed.framework" / "Modules" / "Mixed.swiftmodule"
+    mx_modules.mkdir(parents=True)
+    (mx_modules / "arm64.swiftinterface").write_text("// interface")
+    mx_headers = mixed_xc / "ios-arm64" / "Mixed.framework" / "Headers"
+    mx_headers.mkdir(parents=True)
+    (mx_headers / "Mixed.h").write_text("// header")
+    _assert(detect_framework_type(mixed_xc) == "Mixed",
+            f"Mixed xcfw misclassified: {detect_framework_type(mixed_xc)}")
+    # Auto-generated -Swift.h must NOT be counted as ObjC.
+    bridge_xc = base / "Bridge.xcframework"
+    br_modules = bridge_xc / "ios-arm64" / "Bridge.framework" / "Modules" / "Bridge.swiftmodule"
+    br_modules.mkdir(parents=True)
+    (br_modules / "arm64.swiftinterface").write_text("// interface")
+    br_headers = bridge_xc / "ios-arm64" / "Bridge.framework" / "Headers"
+    br_headers.mkdir(parents=True)
+    (br_headers / "Bridge-Swift.h").write_text("// generated bridge")
+    _assert(detect_framework_type(bridge_xc) == "Swift",
+            f"Bridge xcfw misclassified (Swift-only with bridge header): {detect_framework_type(bridge_xc)}")
+    # Empty -> Unknown.
+    empty_xc = base / "Empty.xcframework"
+    empty_xc.mkdir()
+    _assert(detect_framework_type(empty_xc) == "Unknown",
+            f"Empty xcfw misclassified: {detect_framework_type(empty_xc)}")
+
+
+def _selftest_inject_objc_headers_with_umbrella(tmp_root: Path) -> None:
+    """End-to-end: synthetic ObjC target with a `<fw>.h` umbrella header
+    + per-class headers; inject_objc_headers must copy them into the
+    framework Headers/ dir and generate a module.modulemap that
+    references the umbrella header."""
+    base = tmp_root / "objc_inject_umbrella"
+    staged = base / "staged"
+    staged.mkdir(parents=True)
+    target_dir = staged / "Sources" / "MyObjC"
+    public_headers = target_dir / "include"
+    public_headers.mkdir(parents=True)
+    (public_headers / "MyObjC.h").write_text("// umbrella")
+    (public_headers / "MyObjCHelper.h").write_text("// helper")
+    (target_dir / "MyObjC.m").write_text("// impl")
+
+    raw_dump = {
+        "name": "MyObjC",
+        "products": [
+            {"name": "MyObjC", "type": {"library": ["automatic"]}, "targets": ["MyObjC"]},
+        ],
+        "targets": [
+            {
+                "name": "MyObjC",
+                "type": "regular",
+                "path": "Sources/MyObjC",
+                "publicHeadersPath": "include",
+                "dependencies": [],
+            },
+        ],
+    }
+    package = Package(
+        name="MyObjC",
+        tools_version="5.7.0",
+        platforms=[],
+        products=[Product(name="MyObjC", linkage=Linkage.AUTOMATIC, targets=["MyObjC"])],
+        targets=[Target(
+            name="MyObjC",
+            kind=TargetKind.REGULAR,
+            path="Sources/MyObjC",
+            public_headers_path="include",
+            dependencies=[],
+            exclude=[],
+            language=Language.OBJC,
+        )],
+        schemes=[],
+        raw_dump=raw_dump,
+        staged_dir=staged,
+    )
+
+    fw = base / "MyObjC.framework"
+    fw.mkdir()
+    injected = inject_objc_headers(
+        package=package,
+        product_name="MyObjC",
+        fw_name="MyObjC",
+        fw_path=fw,
+        verbose=False,
+    )
+    _assert(injected, "inject_objc_headers should have returned True")
+    _assert((fw / "Headers" / "MyObjC.h").is_file(), "umbrella header missing")
+    _assert((fw / "Headers" / "MyObjCHelper.h").is_file(), "helper header missing")
+    modulemap = (fw / "Modules" / "module.modulemap").read_text()
+    _assert("umbrella header \"MyObjC.h\"" in modulemap,
+            f"modulemap missing umbrella header reference:\n{modulemap}")
+    _assert("framework module MyObjC" in modulemap,
+            f"modulemap missing framework module decl:\n{modulemap}")
+
+    # Idempotency: a second call must be a no-op (returns False, doesn't
+    # blow up because Headers/*.h is already present).
+    second = inject_objc_headers(
+        package=package,
+        product_name="MyObjC",
+        fw_name="MyObjC",
+        fw_path=fw,
+        verbose=False,
+    )
+    _assert(not second, "inject_objc_headers should be idempotent")
+
+
+def _selftest_inject_objc_headers_explicit_modulemap(tmp_root: Path) -> None:
+    """No umbrella header → modulemap should explicitly list every header."""
+    base = tmp_root / "objc_inject_explicit"
+    staged = base / "staged"
+    staged.mkdir(parents=True)
+    target_dir = staged / "Sources" / "Bar"
+    public_headers = target_dir / "include"
+    public_headers.mkdir(parents=True)
+    (public_headers / "Alpha.h").write_text("// a")
+    (public_headers / "Beta.h").write_text("// b")
+    (target_dir / "Bar.m").write_text("// impl")
+
+    raw_dump = {
+        "name": "Bar",
+        "products": [{"name": "Bar", "type": {"library": ["automatic"]}, "targets": ["Bar"]}],
+        "targets": [
+            {
+                "name": "Bar",
+                "type": "regular",
+                "path": "Sources/Bar",
+                "publicHeadersPath": "include",
+                "dependencies": [],
+            }
+        ],
+    }
+    package = Package(
+        name="Bar",
+        tools_version="5.7.0",
+        platforms=[],
+        products=[Product(name="Bar", linkage=Linkage.AUTOMATIC, targets=["Bar"])],
+        targets=[Target(
+            name="Bar",
+            kind=TargetKind.REGULAR,
+            path="Sources/Bar",
+            public_headers_path="include",
+            dependencies=[],
+            exclude=[],
+            language=Language.OBJC,
+        )],
+        schemes=[],
+        raw_dump=raw_dump,
+        staged_dir=staged,
+    )
+
+    fw = base / "Bar.framework"
+    fw.mkdir()
+    injected = inject_objc_headers(
+        package=package,
+        product_name="Bar",
+        fw_name="Bar",
+        fw_path=fw,
+        verbose=False,
+    )
+    _assert(injected, "explicit-modulemap inject should succeed")
+    modulemap = (fw / "Modules" / "module.modulemap").read_text()
+    _assert("umbrella header" not in modulemap,
+            f"explicit modulemap should not use umbrella:\n{modulemap}")
+    _assert("header \"Alpha.h\"" in modulemap, f"missing Alpha header line:\n{modulemap}")
+    _assert("header \"Beta.h\"" in modulemap, f"missing Beta header line:\n{modulemap}")
+
+
+def _selftest_detect_system_frameworks_linker_settings(tmp_root: Path) -> None:
+    """detect_system_frameworks unions linker settings with source-tree
+    imports. This test exercises the linker-settings half: a target with
+    no source files but a `linkedFramework` setting must still be picked
+    up."""
+    base = tmp_root / "detect_linker"
+    staged = base / "staged"
+    target_dir = staged / "Sources" / "Linked"
+    target_dir.mkdir(parents=True)
+    raw_dump = {
+        "products": [{"name": "Linked", "type": {"library": ["automatic"]}, "targets": ["Linked"]}],
+        "targets": [
+            {
+                "name": "Linked",
+                "type": "regular",
+                "path": "Sources/Linked",
+                "publicHeadersPath": None,
+                "dependencies": [],
+                "settings": [
+                    {"tool": "linker", "kind": {"linkedFramework": "CoreLocation"}},
+                    {"tool": "linker", "kind": {"linkedFramework": "Security"}},
+                    {"tool": "swift", "kind": {"define": "FOO"}},
+                ],
+            }
+        ],
+    }
+    package = Package(
+        name="Linked",
+        tools_version="5.7.0",
+        platforms=[],
+        products=[Product(name="Linked", linkage=Linkage.AUTOMATIC, targets=["Linked"])],
+        targets=[Target(
+            name="Linked",
+            kind=TargetKind.REGULAR,
+            path="Sources/Linked",
+            public_headers_path=None,
+            dependencies=[],
+            exclude=[],
+            language=Language.SWIFT,
+        )],
+        schemes=[],
+        raw_dump=raw_dump,
+        staged_dir=staged,
+    )
+    fws = detect_system_frameworks(package, "Linked")
+    _assert(fws == ["CoreLocation", "Security"],
+            f"linker frameworks not detected: {fws}")
+
+
+def _selftest_detect_system_frameworks_source_imports(tmp_root: Path) -> None:
+    """detect_system_frameworks scans target source files for
+    `#import <Framework/...>` and `@import Framework` lines. The Tests/
+    subdirectory must be excluded so a Demo app's UIKit import doesn't
+    leak into the library's framework list."""
+    base = tmp_root / "detect_source"
+    staged = base / "staged"
+    target_dir = staged / "Sources" / "Scan"
+    target_dir.mkdir(parents=True)
+    (target_dir / "Header.h").write_text(
+        "#import <UIKit/UIKit.h>\n"
+        "@import CoreFoundation;\n"
+    )
+    (target_dir / "Impl.m").write_text(
+        "#import <CoreGraphics/CoreGraphics.h>\n"
+    )
+    tests = target_dir / "Tests"
+    tests.mkdir()
+    (tests / "Junk.m").write_text("#import <CoreData/CoreData.h>\n")
+    raw_dump = {
+        "products": [{"name": "Scan", "type": {"library": ["automatic"]}, "targets": ["Scan"]}],
+        "targets": [
+            {
+                "name": "Scan",
+                "type": "regular",
+                "path": "Sources/Scan",
+                "publicHeadersPath": None,
+                "dependencies": [],
+            }
+        ],
+    }
+    package = Package(
+        name="Scan",
+        tools_version="5.7.0",
+        platforms=[],
+        products=[Product(name="Scan", linkage=Linkage.AUTOMATIC, targets=["Scan"])],
+        targets=[Target(
+            name="Scan",
+            kind=TargetKind.REGULAR,
+            path="Sources/Scan",
+            public_headers_path=None,
+            dependencies=[],
+            exclude=[],
+            language=Language.OBJC,
+        )],
+        schemes=[],
+        raw_dump=raw_dump,
+        staged_dir=staged,
+    )
+    fws = detect_system_frameworks(package, "Scan")
+    _assert("UIKit" in fws, f"UIKit missing from detected frameworks: {fws}")
+    _assert("CoreFoundation" in fws, f"CoreFoundation missing from detected frameworks: {fws}")
+    _assert("CoreGraphics" in fws, f"CoreGraphics missing from detected frameworks: {fws}")
+    _assert("CoreData" not in fws,
+            f"CoreData should not appear (Tests/ subdir should be pruned): {fws}")
+    _assert("Scan" not in fws, f"Scan should be removed as a self-reference: {fws}")
+
+
+def _selftest_find_objc_headers_dir_priority(tmp_root: Path) -> None:
+    """fw_name match wins over product_name match wins over any-target."""
+    base = tmp_root / "headers_priority"
+    staged = base / "staged"
+
+    # Three targets, each with its own publicHeadersPath:
+    #   - First (would-be-first-match)   includes one header.
+    #   - Second (matches product_name) includes one header.
+    #   - Third (matches fw_name)       includes one header.
+    for tname, header in [("FirstAny", "first.h"), ("Prod", "prod.h"), ("MyFW", "fw.h")]:
+        d = staged / "Sources" / tname / "include"
+        d.mkdir(parents=True)
+        (d / header).write_text("// h")
+
+    raw_dump = {
+        "products": [
+            {
+                "name": "Prod",
+                "type": {"library": ["automatic"]},
+                "targets": ["FirstAny", "Prod", "MyFW"],
+            }
+        ],
+        "targets": [
+            {
+                "name": tname,
+                "type": "regular",
+                "path": f"Sources/{tname}",
+                "publicHeadersPath": "include",
+                "dependencies": [],
+            }
+            for tname in ("FirstAny", "Prod", "MyFW")
+        ],
+    }
+    package = Package(
+        name="Prod",
+        tools_version="5.7.0",
+        platforms=[],
+        products=[Product(name="Prod", linkage=Linkage.AUTOMATIC,
+                          targets=["FirstAny", "Prod", "MyFW"])],
+        targets=[
+            Target(name=tname, kind=TargetKind.REGULAR,
+                   path=f"Sources/{tname}", public_headers_path="include",
+                   dependencies=[], exclude=[], language=Language.OBJC)
+            for tname in ("FirstAny", "Prod", "MyFW")
+        ],
+        schemes=[],
+        raw_dump=raw_dump,
+        staged_dir=staged,
+    )
+
+    # fw_name match wins (MyFW)
+    found = _find_objc_headers_dir(package, product_name="Prod", fw_name="MyFW")
+    _assert(found is not None and found.parent.name == "MyFW",
+            f"fw_name priority broken: {found}")
+    # No fw_name match → product_name match wins (Prod)
+    found = _find_objc_headers_dir(package, product_name="Prod", fw_name="NoSuch")
+    _assert(found is not None and found.parent.name == "Prod",
+            f"product_name priority broken: {found}")
+
+
+def _selftest_archive_static_lib_path_picks_first(tmp_root: Path) -> None:
+    """_archive_static_lib_path returns the first lib*.a it finds, sorted."""
+    base = tmp_root / "static_pick"
+    products = base / "Products" / "usr" / "local" / "lib"
+    products.mkdir(parents=True)
+    (products / "libBeta.a").write_text("")
+    (products / "libAlpha.a").write_text("")
+    found = _archive_static_lib_path(base)
+    _assert(found is not None and found.name == "libAlpha.a",
+            f"expected libAlpha.a (sorted), got {found}")
+
+
+def _selftest_archive_framework_path_recursive(tmp_root: Path) -> None:
+    """_archive_framework_path finds X.framework anywhere under Products/."""
+    base = tmp_root / "fw_locate"
+    deep = base / "Products" / "usr" / "local" / "lib" / "MyFW.framework"
+    deep.mkdir(parents=True)
+    found = _archive_framework_path(base, "MyFW")
+    _assert(found is not None and found == deep,
+            f"expected to find MyFW.framework, got {found}")
+    _assert(_archive_framework_path(base, "Other") is None,
+            "should return None when name doesn't match")
+
+
 # --- Round-trip self-tests ------------------------------------------------
 #
 # These all require a real `swift` toolchain on PATH and write fixtures
@@ -4075,6 +5594,43 @@ def _roundtrip_validator_catches_missing_product() -> None:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _roundtrip_foo_force_dynamic() -> None:
+    """Minimal Foo fixture: force_dynamic on the lone .library product
+    must produce a Package.swift that survives `swift package dump-package`
+    and ends up dynamic in the dumped JSON. This is the smallest possible
+    end-to-end gate for edit_force_dynamic against a real swift toolchain."""
+    edits = [PackageSwiftEdit(kind="force_dynamic", product_name="Foo", targets=["Foo"])]
+    tmp = Path(tempfile.mkdtemp(prefix="spm2xc-prep-foo-"))
+    try:
+        (tmp / "Package.swift").write_text(_FOO_PACKAGE_SWIFT_FIXTURE)
+        sources = tmp / "Sources" / "Foo"
+        sources.mkdir(parents=True)
+        (sources / "Foo.swift").write_text("public enum Foo { public static let answer = 42 }\n")
+        plan = Plan()
+        plan.package_swift_edits = list(edits)
+        apply_package_swift_edits(tmp, plan)
+        cp = subprocess.run(
+            ["swift", "package", "dump-package"],
+            cwd=str(tmp),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if cp.returncode != 0:
+            raise AssertionError(
+                f"swift package dump-package failed on Foo fixture:\n"
+                f"  {cp.stderr.strip()}\n  Edited Package.swift:\n"
+                f"{(tmp / 'Package.swift').read_text()}"
+            )
+        dump = json.loads(cp.stdout)
+        prods = {p["name"]: p for p in dump["products"]}
+        _assert("Foo" in prods, f"Foo product missing from dump: {sorted(prods.keys())}")
+        _assert(prods["Foo"]["type"]["library"][0] == "dynamic",
+                f"Foo linkage: {prods['Foo']['type']}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _roundtrip_full_prepare_grdb() -> None:
     """End-to-end Prepare on a GRDB-shaped Plan: confirms validator
     accepts the planner's exact edit list (force_dynamic on GRDB only,
@@ -4182,6 +5738,23 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          _selftest_unsupported_swift_constructs, False),
         ("active manifest selector (Package@swift-X.Y)",
          _selftest_select_active_manifest, False),
+        ("execute: slice paths are unique", _selftest_slice_paths_unique, False),
+        ("execute: detect_framework_type Swift/ObjC/Mixed/Bridge",
+         lambda: _selftest_detect_framework_type_swift_objc_mixed(tmp_root), False),
+        ("execute: inject_objc_headers umbrella + idempotency",
+         lambda: _selftest_inject_objc_headers_with_umbrella(tmp_root), False),
+        ("execute: inject_objc_headers explicit modulemap",
+         lambda: _selftest_inject_objc_headers_explicit_modulemap(tmp_root), False),
+        ("execute: detect_system_frameworks linker settings",
+         lambda: _selftest_detect_system_frameworks_linker_settings(tmp_root), False),
+        ("execute: detect_system_frameworks source imports + Tests/ pruning",
+         lambda: _selftest_detect_system_frameworks_source_imports(tmp_root), False),
+        ("execute: ObjC headers dir priority (fw_name > product_name > any)",
+         lambda: _selftest_find_objc_headers_dir_priority(tmp_root), False),
+        ("execute: archive static lib path picks first sorted",
+         lambda: _selftest_archive_static_lib_path_picks_first(tmp_root), False),
+        ("execute: archive framework path recursive search",
+         lambda: _selftest_archive_framework_path_recursive(tmp_root), False),
         ("MiniMixed fetch+stage+inspect (real swift)", _selftest_minimixed_fetch_integration, True),
         ("round-trip: GRDB (force_dynamic + skip system)", _roundtrip_grdb, True),
         ("round-trip: Alamofire (force_dynamic regular, leave dynamic)",
@@ -4193,6 +5766,7 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
         ("round-trip: validator catches missing product (PrepareError)",
          _roundtrip_validator_catches_missing_product, True),
         ("round-trip: full prepare() flow on GRDB", _roundtrip_full_prepare_grdb, True),
+        ("round-trip: Foo minimal fixture force_dynamic", _roundtrip_foo_force_dynamic, True),
     ]
 
 
@@ -4375,13 +5949,37 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             shutil.rmtree(work_dir, ignore_errors=True)
 
 
+def _print_session4_summary(executed: Sequence[ExecutedUnit]) -> None:
+    """Print a Session-4 results banner. Session 5 will replace this with
+    the formal Verify summary; until then this gives the user the same
+    `=== Summary ===` shape the legacy bash uses, scoped to whatever the
+    Execute phase actually produced."""
+    bold("\n=== Build summary ===")
+    primary_paths: List[Path] = []
+    dep_paths: List[Path] = []
+    for unit in executed:
+        if unit.xcframework_path is None:
+            print(f"  - {unit.name}: (no xcframework produced)")
+            continue
+        label = f"[{unit.framework_type}]" if unit.framework_type else ""
+        print(f"  ✓ {unit.xcframework_path.name} {label}".rstrip())
+        primary_paths.append(unit.xcframework_path)
+        for dep in unit.dependency_xcframeworks:
+            print(f"    + dependency: {dep.name}")
+            dep_paths.append(dep)
+    success(
+        f"\nBuilt {len(primary_paths)} xcframework(s)"
+        + (f" plus {len(dep_paths)} dependency xcframework(s)" if dep_paths else "")
+    )
+
+
 def _run_source_mode(config: Config) -> int:
     """Source-mode pipeline: Fetch → Inspect → Plan → Prepare → Execute → Verify.
 
-    Session 3 wires Prepare and the device-only slice of Execute. Session 4
-    extends Execute with the simulator slice, parallelism,
-    static→dynamic promotion, and xcframework merge. Session 5 adds
-    Verify.
+    Session 4 lights up the full Execute path: parallel device + sim
+    archives, static→dynamic promotion, swiftmodule + ObjC header
+    injection, xcframework merge, and `--include-deps` walking. Session 5
+    will add the strict Verify phase on top.
     """
     source_dir = fetch_source(config)
     staged_dir = stage_source(config, source_dir)
@@ -4400,48 +5998,33 @@ def _run_source_mode(config: Config) -> int:
         return 0
 
     prepared = prepare(staged_dir, plan, verbose=config.verbose)
-    executed = execute_source_plan_device_only(prepared, config)
-
-    bold("\n=== Session 3 results (device slice only) ===")
-    for unit in executed:
-        marker = ""
-        if unit.framework_path is None:
-            marker = "  (no framework located — Session 4 will handle static promotion)"
-        print(f"  - {unit.name}: {unit.archive_path}{marker}")
-    warn(
-        "\nNote: this is a Session 3 build of the Python rewrite — only "
-        "the device slice of Execute runs. Simulator builds, xcframework "
-        "merge, header / swiftmodule injection, and Verify land in "
-        "Sessions 4–5. The legacy bash spm-to-xcframework still handles "
-        "production builds until the rewrite lands."
-    )
+    executed = execute_source_plan(prepared, config)
+    _print_session4_summary(executed)
     return 0
 
 
 def _run_binary_mode(config: Config) -> int:
-    """Binary-mode pipeline: discover_binary_artifacts → Plan →
-    (Execute/Verify).
+    """Binary-mode pipeline: discover_binary_artifacts → Plan → Execute.
 
-    Session 2 stops after Plan for --dry-run. Full binary Execute lands
-    in Session 4.
+    Binary mode skips Inspect/Plan-as-source and the Prepare phase
+    entirely; the planner only needs the list of `BinaryArtifact` records
+    that `discover_binary_artifacts` discovered during Fetch, and Execute
+    just copies the surviving artifacts into `output_dir`.
     """
     if config.inspect_only:
         die("--inspect-only is not supported for --binary.")
 
     artifacts = discover_binary_artifacts(config)
     plan = plan_binary_build(config, artifacts)
+    for w in plan.warnings:
+        warn(w)
+    print_plan(plan, package=None, config=config)
 
     if config.dry_run:
-        print_plan(plan, package=None, config=config)
         return 0
 
-    print_plan(plan, package=None, config=config)
-    warn(
-        "\nNote: this is a Session 2 build of the Python rewrite — "
-        "binary-mode Execute lands in Session 4. Use --dry-run to "
-        "silence this notice. The legacy bash spm-to-xcframework still "
-        "handles full builds until the rewrite lands."
-    )
+    executed = execute_binary_plan(plan, config)
+    _print_session4_summary(executed)
     return 0
 
 
