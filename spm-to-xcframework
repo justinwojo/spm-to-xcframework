@@ -3717,6 +3717,209 @@ def _generate_modulemap(fw_path: Path, fw_name: str) -> None:
     (modules_dir / "module.modulemap").write_text(text)
 
 
+def _walk_system_library_target_deps(
+    package: Package,
+    source_targets: Sequence[str],
+) -> List[Target]:
+    """Return every transitive `.systemLibrary` target reachable from
+    `source_targets` via internal `byName` / `target` dependency edges.
+
+    Walks the raw dump rather than `Target.dependencies` because the typed
+    list flattens out the `byName` vs `target` shapes — same convention as
+    `_find_objc_headers_dir` and `detect_system_frameworks`. Result order
+    is the discovery order (BFS) to keep diagnostics deterministic.
+    """
+    raw_targets_by_name: Dict[str, dict] = {}
+    for raw_t in package.raw_dump.get("targets", []) or []:
+        if isinstance(raw_t, dict) and isinstance(raw_t.get("name"), str):
+            raw_targets_by_name[raw_t["name"]] = raw_t
+
+    found: List[Target] = []
+    seen: Set[str] = set()
+    queue: List[str] = list(source_targets)
+    while queue:
+        name = queue.pop(0)
+        if name in seen:
+            continue
+        seen.add(name)
+        target = package.target_by_name(name)
+        if target is None:
+            continue
+        if target.kind == TargetKind.SYSTEM:
+            found.append(target)
+            # System targets do not transitively depend on other targets
+            # in any shape we care about — they are leaves by SPM design.
+            continue
+        raw = raw_targets_by_name.get(name)
+        if raw is None:
+            continue
+        for dep_name in _raw_internal_dep_names(raw):
+            if dep_name not in seen:
+                queue.append(dep_name)
+    return found
+
+
+def _system_target_source_dir(target: Target, staged_dir: Path) -> Optional[Path]:
+    """Locate the on-disk source directory for a `.systemLibrary` target.
+
+    SPM convention: `Sources/<TargetName>/` unless `path:` is set
+    explicitly. `_default_target_path` only returns paths for regular /
+    executable / test kinds, so we duplicate the system-target convention
+    here rather than widening that helper.
+    """
+    if target.path:
+        full = staged_dir / target.path
+    else:
+        full = staged_dir / "Sources" / target.name
+    return full if full.is_dir() else None
+
+
+def _promote_modulemap_to_framework_form(modulemap_text: str) -> str:
+    """Rewrite an SPM `.systemLibrary` modulemap so it can live inside a
+    `.framework/Modules/module.modulemap` and be discovered via swiftc's
+    `-F` framework search.
+
+    Input  (SPM systemLibrary):  `module Foo [system] { header "shim.h" link "x" export * }`
+    Output (framework module):   `framework module Foo [system] { header "shim.h" link "x" export * }`
+
+    The only required change is the `framework ` qualifier on the
+    top-level `module` declaration. Modern swiftc accepts plain `header`
+    inside a framework module — `umbrella header` is not required when
+    the framework has a single shim header (verified empirically against
+    Swift 6.2.3, Xcode 26.2 simulator SDK).
+    """
+    return re.sub(
+        r"(?m)^(\s*)module(\s+\w+)",
+        r"\1framework module\2",
+        modulemap_text,
+        count=1,
+    )
+
+
+def inject_system_clang_modules(
+    *,
+    xcframework_path: Path,
+    package: Package,
+    source_targets: Sequence[str],
+    verbose: bool,
+) -> int:
+    """Bundle every transitive `.systemLibrary` Clang module that the
+    primary framework depends on as a sibling shim framework inside each
+    xcframework slice. No-op if `source_targets` has no system deps.
+
+    Background: when a regular Swift target depends on a `.systemLibrary`
+    target (e.g. GRDB → GRDBSQLite, which wraps `<sqlite3.h>`), the
+    Swift compiler always emits `import GRDBSQLite` into the framework's
+    `.swiftinterface`. Any consumer that has to rebuild GRDB from its
+    textual interface — every consumer whose Swift compiler version
+    differs from the build-time one — needs `GRDBSQLite` to resolve as a
+    Clang module, or the import fails with `error: no such module
+    'GRDBSQLite'` and the framework is unconsumable.
+
+    The system product itself is correctly dropped at planning time
+    (`_is_system_only_product`) because there is no Mach-O to build, but
+    its modulemap+headers must travel with the parent framework so the
+    Clang module can be loaded at consumer compile time. We bundle them
+    as a binary-less sibling `<Name>.framework` inside each slice
+    directory of the xcframework. swiftc auto-discovers it via `-F`
+    framework search — no extra `-I` / `-Xcc` flags required on the
+    consumer side, including non-spm-to-xcframework consumers like
+    plain Xcode app projects.
+
+    Returns the number of system shims injected (counted once per
+    distinct system target, not per slice). Idempotent: existing
+    `<Name>.framework` siblings are skipped.
+    """
+    if not xcframework_path.is_dir():
+        return 0
+
+    system_targets = _walk_system_library_target_deps(package, source_targets)
+    if not system_targets:
+        return 0
+
+    # Discover slice directories. The xcframework Info.plist lists them
+    # under AvailableLibraries[].LibraryIdentifier, but we don't need to
+    # parse it — every direct subdirectory of the xcframework other than
+    # Info.plist is a slice. This avoids a plistlib import in the hot
+    # path and matches what xcframework consumers do.
+    slice_dirs = [
+        p for p in sorted(xcframework_path.iterdir())
+        if p.is_dir()
+    ]
+    if not slice_dirs:
+        return 0
+
+    injected = 0
+    for sys_target in system_targets:
+        src_dir = _system_target_source_dir(sys_target, package.staged_dir)
+        if src_dir is None:
+            warn(
+                f"  System target {sys_target.name!r} has no resolvable "
+                f"source dir under {package.staged_dir}; consumers will "
+                f"fail to import {sys_target.name}"
+            )
+            continue
+        modulemap = src_dir / "module.modulemap"
+        if not modulemap.is_file():
+            warn(
+                f"  System target {sys_target.name!r} source dir {src_dir} "
+                f"has no module.modulemap; skipping shim injection"
+            )
+            continue
+        # Headers are every `.h` file under the system-target source
+        # dir, walked recursively. SPM `.systemLibrary` targets usually
+        # park a single `shim.h` next to the modulemap, but the modulemap
+        # text (which we preserve verbatim aside from the framework
+        # qualifier) is free to `header "Sub/foo.h"` into a nested path.
+        # We must preserve those relative paths into the shim's Headers/
+        # tree so the modulemap's references still resolve at consumer
+        # compile time (Codex [P2] follow-up — flat copy silently
+        # produced broken shims for nested layouts).
+        headers: List[Tuple[Path, Path]] = []
+        for p in sorted(src_dir.rglob("*.h")):
+            if not p.is_file():
+                continue
+            rel = p.relative_to(src_dir)
+            headers.append((p, rel))
+        framework_modulemap = _promote_modulemap_to_framework_form(
+            modulemap.read_text()
+        )
+
+        any_slice_injected = False
+        for slice_dir in slice_dirs:
+            shim_fw = slice_dir / f"{sys_target.name}.framework"
+            if shim_fw.exists():
+                continue  # idempotent — second run is a no-op
+            shim_fw_modules = shim_fw / "Modules"
+            shim_fw_headers = shim_fw / "Headers"
+            shim_fw_modules.mkdir(parents=True, exist_ok=True)
+            shim_fw_headers.mkdir(parents=True, exist_ok=True)
+            (shim_fw_modules / "module.modulemap").write_text(framework_modulemap)
+            for src_header, rel in headers:
+                dest = shim_fw_headers / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src_header, dest)
+            # Sentinel file used by `_is_system_shim_framework` to skip
+            # this directory during language classification and
+            # surface-check walks. Invisible to Xcode/swiftc consumers.
+            (shim_fw / _SYSTEM_SHIM_SENTINEL).write_text(
+                "spm-to-xcframework injected this framework as a Clang "
+                "module shim for a .systemLibrary SPM target. Do not "
+                "delete; removing it makes language classification "
+                "misclassify the parent xcframework.\n"
+            )
+            any_slice_injected = True
+
+        if any_slice_injected:
+            injected += 1
+            dim(
+                f"  Injected system Clang module shim: "
+                f"{sys_target.name}.framework (× {len(slice_dirs)} slice(s))"
+            )
+
+    return injected
+
+
 def inject_objc_headers(
     *,
     package: Package,
@@ -3817,26 +4020,158 @@ def create_xcframework(
         )
 
 
+_SYSTEM_SHIM_SENTINEL = ".spm-to-xcframework-system-shim"
+
+
+def _is_system_shim_framework(fw_path: Path) -> bool:
+    """True iff `fw_path` is a system Clang module shim framework
+    injected by `inject_system_clang_modules`. Detection is by sentinel
+    file (`.spm-to-xcframework-system-shim`) written at injection time
+    rather than structural inference, because a structural-only test
+    can't reliably distinguish a header-only shim from an ObjC framework
+    that hasn't been built yet (test fixtures, partial builds). The
+    sentinel is invisible to xcframework consumers — Xcode and swiftc
+    don't look for it — and writing it costs nothing.
+    """
+    if not fw_path.is_dir() or not fw_path.name.endswith(".framework"):
+        return False
+    return (fw_path / _SYSTEM_SHIM_SENTINEL).is_file()
+
+
+def _read_xcframework_library_paths(xcfw_path: Path) -> Dict[str, str]:
+    """Parse `Info.plist` and return `{LibraryIdentifier: LibraryPath}`.
+
+    Returns an empty dict on any failure (missing plist, parse error,
+    malformed AvailableLibraries) — the caller falls back to a direct-
+    child `*.framework` scan in that case, which is fine for the legacy
+    "framework lives directly under the slice" layout.
+
+    The reason we read the plist at all is that `LibraryPath` may be a
+    nested path like `Frameworks/Foo.framework`, in which case there is
+    no top-level `*.framework` for the direct-child scan to find. Codex
+    [P1]: without this lookup, `detect_framework_type` returns Unknown
+    and `_verify_one_unit` silently passes those layouts through with
+    no language surface checks at all.
+    """
+    info_plist = xcfw_path / "Info.plist"
+    if not info_plist.is_file():
+        return {}
+    try:
+        with info_plist.open("rb") as fh:
+            data = plistlib.load(fh)
+    except (plistlib.InvalidFileException, OSError, ValueError):
+        return {}
+    except Exception:  # noqa: BLE001 — defensive: any plist corruption → fall back
+        return {}
+    available = data.get("AvailableLibraries")
+    if not isinstance(available, list):
+        return {}
+    result: Dict[str, str] = {}
+    for entry in available:
+        if not isinstance(entry, dict):
+            continue
+        identifier = entry.get("LibraryIdentifier")
+        library_path = entry.get("LibraryPath")
+        if isinstance(identifier, str) and isinstance(library_path, str) and library_path:
+            result[identifier] = library_path
+    return result
+
+
+def _pick_primary_framework_in_slice(
+    slice_dir: Path,
+    library_path: Optional[str] = None,
+) -> Optional[Path]:
+    """Return the primary `.framework/` directory inside an xcframework
+    slice.
+
+    Resolution order:
+      1. If the caller passed `library_path` (the slice's `LibraryPath`
+         from `Info.plist`), resolve `slice_dir / library_path` and
+         return it as long as it exists and ends in `.framework`. This
+         is the only way to find frameworks that live in nested layouts
+         like `Frameworks/Foo.framework` (Codex [P1]).
+      2. Otherwise (or if the plist path doesn't resolve on disk), scan
+         direct children for `*.framework` directories, skip sibling
+         system Clang module shim frameworks injected by
+         `inject_system_clang_modules`, and return the alphabetically
+         first real framework.
+
+    Falling back to "alphabetically first" matters because real-world
+    xcframeworks always have a single primary framework per slice; the
+    only reason this function exists at all is to filter out the
+    binary-less system shims so they don't pollute language detection.
+    """
+    if not slice_dir.is_dir():
+        return None
+    if library_path:
+        # Strip any leading "./" but otherwise preserve the relative
+        # path verbatim — the plist is authoritative for nested layouts.
+        primary = slice_dir / library_path.lstrip("./")
+        if primary.is_dir() and primary.name.endswith(".framework"):
+            return primary
+        # Plist disagreement with disk; fall through to scan rather than
+        # silently returning None.
+    for entry in sorted(slice_dir.iterdir()):
+        if not entry.is_dir() or not entry.name.endswith(".framework"):
+            continue
+        if _is_system_shim_framework(entry):
+            continue
+        return entry
+    return None
+
+
+def _iter_primary_framework_paths(xcfw_path: Path) -> Iterable[Path]:
+    """Yield every file/dir path inside the primary framework of each
+    xcframework slice. Skips sibling system shim frameworks injected by
+    `inject_system_clang_modules` (they have no Mach-O binary).
+
+    Reads the xcframework's `Info.plist` once up front to learn each
+    slice's `LibraryPath`, so nested layouts (`Frameworks/Foo.framework`)
+    are picked up by the same walk that handles the conventional
+    `slice/Foo.framework` layout. If the plist is missing or malformed,
+    falls back to per-slice direct-child scanning.
+
+    Used by both `detect_framework_type` and the per-slice walk in
+    `_verify_one_unit` so language classification and surface checks
+    agree on what counts as "the framework" — and stay agnostic to
+    augmentations like the system Clang module shim.
+    """
+    if not xcfw_path.is_dir():
+        return
+    library_paths = _read_xcframework_library_paths(xcfw_path)
+    for slice_dir in sorted(xcfw_path.iterdir()):
+        if not slice_dir.is_dir():
+            continue
+        primary_fw = _pick_primary_framework_in_slice(
+            slice_dir,
+            library_path=library_paths.get(slice_dir.name),
+        )
+        if primary_fw is None:
+            continue
+        yield from primary_fw.rglob("*")
+
+
 def detect_framework_type(xcfw_path: Path) -> str:
     """Classify an xcframework as Swift / ObjC / Mixed / Unknown by walking
-    its contents. Used by Execute's per-unit summary line and (in
-    Session 5) by the Verify phase. Same logic as the legacy bash
-    detect_framework_type."""
+    its primary framework's contents. Used by Execute's per-unit summary
+    line and (in Session 5) by the Verify phase. Same logic as the legacy
+    bash detect_framework_type, refined to ignore sibling system shim
+    frameworks injected for `.systemLibrary` Clang module deps.
+    """
     has_swift = False
     has_objc = False
-    if xcfw_path.is_dir():
-        for path in xcfw_path.rglob("*"):
-            name = path.name
-            if not has_swift and (name.endswith(".swiftinterface") or name.endswith(".swiftmodule")):
-                has_swift = True
-            if not has_objc and name.endswith(".h") and not name.endswith("-Swift.h"):
-                # Only count headers under a Headers/ directory — that's
-                # the SPM convention for public ObjC API. Bridge headers
-                # outside Headers/ are framework-internal noise.
-                if "Headers" in path.parts:
-                    has_objc = True
-            if has_swift and has_objc:
-                break
+    for path in _iter_primary_framework_paths(xcfw_path):
+        name = path.name
+        if not has_swift and (name.endswith(".swiftinterface") or name.endswith(".swiftmodule")):
+            has_swift = True
+        if not has_objc and name.endswith(".h") and not name.endswith("-Swift.h"):
+            # Only count headers under a Headers/ directory — that's
+            # the SPM convention for public ObjC API. Bridge headers
+            # outside Headers/ are framework-internal noise.
+            if "Headers" in path.parts:
+                has_objc = True
+        if has_swift and has_objc:
+            break
     if has_swift and has_objc:
         return "Mixed"
     if has_swift:
@@ -4099,6 +4434,19 @@ def _run_one_unit(
         output_xcframework=output_xcframework,
         device_fw=device_slice.framework_path,
         sim_fw=sim_slice.framework_path,
+        verbose=config.verbose,
+    )
+    # Bundle any `.systemLibrary` Clang modules the build unit depends on
+    # as binary-less sibling shim frameworks inside each xcframework
+    # slice. This is what makes GRDB-style packages (regular Swift target
+    # → .systemLibrary wrapper around <sqlite3.h>) consumable: without
+    # the shim, swiftc fails to rebuild the framework's swiftinterface
+    # because `import GRDBSQLite` cannot resolve. See
+    # `inject_system_clang_modules` for the full rationale.
+    inject_system_clang_modules(
+        xcframework_path=output_xcframework,
+        package=prepared.package,
+        source_targets=unit.source_targets,
         verbose=config.verbose,
     )
     fw_type = detect_framework_type(output_xcframework)
@@ -4648,12 +4996,17 @@ def _verify_one_unit(unit: ExecutedUnit, output_dir: Path) -> VerifyResult:
     detected_type = detect_framework_type(xcframework_path)
     result.framework_type = detected_type
 
-    # Walk the xcframework once to gather the language-specific facts.
+    # Walk the xcframework's primary framework once to gather the
+    # language-specific facts. We deliberately scope this walk via
+    # `_iter_primary_framework_paths` so sibling system Clang module
+    # shims (injected by `inject_system_clang_modules`) don't masquerade
+    # as ObjC surface on a Swift unit and silently fill in
+    # has_public_header / has_modulemap.
     has_swiftinterface = False
     has_public_header = False
     has_modulemap = False
     has_abi_json = False
-    for path in xcframework_path.rglob("*"):
+    for path in _iter_primary_framework_paths(xcframework_path):
         name = path.name
         if not has_swiftinterface and name.endswith(".swiftinterface"):
             has_swiftinterface = True

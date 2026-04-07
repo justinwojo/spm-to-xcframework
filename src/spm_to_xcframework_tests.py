@@ -53,14 +53,19 @@ from spm_to_xcframework import (  # noqa: F401
     _parse_target_kind,
     _parse_xcresult_build_results,
     _phase_label_for,
+    _pick_primary_framework_in_slice,
+    _promote_modulemap_to_framework_form,
     _read_output_manifest,
+    _read_xcframework_library_paths,
     _select_active_manifest,
     _slice_paths,
     _swift_toolchain_version,
+    _system_target_source_dir,
     _USER_FACING_ERRORS,
     _validate_git_ref,
     _validate_package_source,
     _verify_one_unit,
+    _walk_system_library_target_deps,
 )
 
 # Logging helpers used by the harness.
@@ -3889,6 +3894,731 @@ def _roundtrip_full_prepare_grdb() -> None:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# --- inject_system_clang_modules tests ------------------------------------
+#
+# `.systemLibrary` targets like GRDBSQLite have no Mach-O of their own —
+# they're a Clang shim around a system header (`<sqlite3.h>`). The
+# planner correctly drops them as buildable products, but the parent
+# Swift framework's .swiftinterface still emits `import GRDBSQLite`, so
+# any consumer that has to rebuild from interface fails to resolve the
+# module. The fix bundles the system target's modulemap+headers into
+# each xcframework slice as a binary-less sibling shim framework.
+
+
+def _selftest_promote_modulemap_to_framework_form_grdb() -> None:
+    """The GRDBSQLite modulemap shape: `module Foo [system] { ... }`
+    must gain a `framework ` qualifier and otherwise stay byte-identical.
+    """
+    src = (
+        "module GRDBSQLite [system] {\n"
+        "    header \"shim.h\"\n"
+        "    link \"sqlite3\"\n"
+        "    export *\n"
+        "}\n"
+    )
+    out = _promote_modulemap_to_framework_form(src)
+    _assert(
+        out.startswith("framework module GRDBSQLite [system] {"),
+        f"expected framework qualifier on first line; got:\n{out}",
+    )
+    # Body is preserved verbatim.
+    _assert("header \"shim.h\"" in out, f"header line missing:\n{out}")
+    _assert("link \"sqlite3\"" in out, f"link line missing:\n{out}")
+    _assert("export *" in out, f"export line missing:\n{out}")
+    # Idempotent: re-promoting an already-framework modulemap is a no-op.
+    _assert(_promote_modulemap_to_framework_form(out) == out,
+            "second promotion changed the text — should be idempotent")
+
+
+def _selftest_promote_modulemap_to_framework_form_indented() -> None:
+    """Leading whitespace on the `module` line must be preserved when we
+    inject the `framework` qualifier — modulemap parsers don't care
+    about indentation but the file should still look reasonable in
+    diffs."""
+    src = "    module Foo {\n        header \"x.h\"\n    }\n"
+    out = _promote_modulemap_to_framework_form(src)
+    _assert(out.startswith("    framework module Foo {"),
+            f"expected indented framework decl; got:\n{out}")
+
+
+def _selftest_walk_system_library_target_deps_grdb() -> None:
+    """Direct dep edge: GRDB → GRDBSQLite. The walker should return
+    GRDBSQLite when seeded with `["GRDB"]`."""
+    package = _mk_package_from_snapshot(GRDB_DUMP_SNAPSHOT)
+    found = _walk_system_library_target_deps(package, ["GRDB"])
+    _assert(len(found) == 1, f"expected 1 system dep, got {len(found)}: {[t.name for t in found]}")
+    _assert(found[0].name == "GRDBSQLite", f"expected GRDBSQLite, got {found[0].name}")
+    _assert(found[0].kind == TargetKind.SYSTEM, f"expected SYSTEM kind, got {found[0].kind}")
+
+
+def _selftest_walk_system_library_target_deps_no_system() -> None:
+    """Stripe and Nuke have no `.systemLibrary` deps in our fixtures —
+    the walker must return an empty list, not crash on missing edges."""
+    pkg_stripe = _mk_package_from_snapshot(STRIPE_DUMP_SNAPSHOT)
+    found_stripe = _walk_system_library_target_deps(pkg_stripe, ["Stripe"])
+    _assert(found_stripe == [], f"Stripe should have no system deps, got {found_stripe}")
+
+    pkg_nuke = _mk_package_from_snapshot(NUKE_DUMP_SNAPSHOT)
+    found_nuke = _walk_system_library_target_deps(pkg_nuke, ["Nuke"])
+    _assert(found_nuke == [], f"Nuke should have no system deps, got {found_nuke}")
+
+
+def _selftest_walk_system_library_target_deps_transitive() -> None:
+    """A two-hop chain: regular → regular → system. The walker must
+    follow the intermediate regular target's dep edge to discover the
+    system grandchild."""
+    raw = {
+        "name": "Chain",
+        "products": [
+            {"name": "Top", "type": {"library": ["automatic"]}, "targets": ["Top"]},
+        ],
+        "targets": [
+            {"name": "Top", "type": "regular", "path": "Sources/Top",
+             "publicHeadersPath": None,
+             "dependencies": [{"target": ["Middle", None]}]},
+            {"name": "Middle", "type": "regular", "path": "Sources/Middle",
+             "publicHeadersPath": None,
+             "dependencies": [{"byName": ["LeafSys", None]}]},
+            {"name": "LeafSys", "type": "system", "path": None,
+             "publicHeadersPath": None, "dependencies": []},
+        ],
+    }
+    package = _mk_package_from_snapshot(raw)
+    found = _walk_system_library_target_deps(package, ["Top"])
+    _assert(len(found) == 1 and found[0].name == "LeafSys",
+            f"expected transitive LeafSys, got {[t.name for t in found]}")
+
+
+def _selftest_walk_system_library_target_deps_dedupes_diamond() -> None:
+    """Diamond shape: A→B→D and A→C→D where D is a system target.
+    D must appear once in the result, not twice."""
+    raw = {
+        "name": "Diamond",
+        "products": [
+            {"name": "A", "type": {"library": ["automatic"]}, "targets": ["A"]},
+        ],
+        "targets": [
+            {"name": "A", "type": "regular", "path": "Sources/A",
+             "publicHeadersPath": None,
+             "dependencies": [{"byName": ["B", None]}, {"byName": ["C", None]}]},
+            {"name": "B", "type": "regular", "path": "Sources/B",
+             "publicHeadersPath": None,
+             "dependencies": [{"byName": ["D", None]}]},
+            {"name": "C", "type": "regular", "path": "Sources/C",
+             "publicHeadersPath": None,
+             "dependencies": [{"byName": ["D", None]}]},
+            {"name": "D", "type": "system", "path": None,
+             "publicHeadersPath": None, "dependencies": []},
+        ],
+    }
+    package = _mk_package_from_snapshot(raw)
+    found = _walk_system_library_target_deps(package, ["A"])
+    _assert(len(found) == 1 and found[0].name == "D",
+            f"expected single dedup'd D, got {[t.name for t in found]}")
+
+
+def _selftest_system_target_source_dir_default(tmp_root: Path) -> None:
+    """SPM convention: `Sources/<TargetName>/` when `path:` is unset."""
+    base = tmp_root / "sysdir_default"
+    src = base / "Sources" / "MySys"
+    src.mkdir(parents=True)
+    (src / "module.modulemap").write_text("module MySys [system] {}\n")
+    target = Target(
+        name="MySys",
+        kind=TargetKind.SYSTEM,
+        path=None,
+        public_headers_path=None,
+        dependencies=[],
+        exclude=[],
+    )
+    found = _system_target_source_dir(target, base)
+    _assert(found is not None and found.resolve() == src.resolve(),
+            f"expected {src}, got {found}")
+
+
+def _selftest_system_target_source_dir_explicit(tmp_root: Path) -> None:
+    """When `path:` is set in Package.swift, honor it instead of the
+    `Sources/<name>` default."""
+    base = tmp_root / "sysdir_explicit"
+    explicit = base / "vendor" / "sqlite3-shim"
+    explicit.mkdir(parents=True)
+    target = Target(
+        name="MySys",
+        kind=TargetKind.SYSTEM,
+        path="vendor/sqlite3-shim",
+        public_headers_path=None,
+        dependencies=[],
+        exclude=[],
+    )
+    found = _system_target_source_dir(target, base)
+    _assert(found is not None and found.resolve() == explicit.resolve(),
+            f"expected {explicit}, got {found}")
+
+
+def _selftest_system_target_source_dir_missing(tmp_root: Path) -> None:
+    """If the source dir doesn't exist on disk, return None — the caller
+    warns instead of crashing on the missing modulemap."""
+    base = tmp_root / "sysdir_missing"
+    base.mkdir(parents=True)
+    target = Target(
+        name="GhostSys", kind=TargetKind.SYSTEM, path=None,
+        public_headers_path=None, dependencies=[], exclude=[],
+    )
+    _assert(_system_target_source_dir(target, base) is None,
+            "missing source dir should return None")
+
+
+def _selftest_inject_system_clang_modules_grdb_shape(tmp_root: Path) -> None:
+    """End-to-end on a synthetic GRDB-shaped fixture: a built xcframework
+    with two slices (device + sim), a regular Swift target with a
+    system-library dep, and an on-disk Sources/GRDBSQLite/ directory.
+    After injection, both slices must have a sibling
+    `GRDBSQLite.framework/Modules/module.modulemap` (with framework
+    qualifier) and `GRDBSQLite.framework/Headers/shim.h`.
+    """
+    base = tmp_root / "inject_sys_grdb"
+    staged = base / "staged"
+    sys_src = staged / "Sources" / "GRDBSQLite"
+    sys_src.mkdir(parents=True)
+    (sys_src / "module.modulemap").write_text(
+        "module GRDBSQLite [system] {\n"
+        "    header \"shim.h\"\n"
+        "    link \"sqlite3\"\n"
+        "    export *\n"
+        "}\n"
+    )
+    (sys_src / "shim.h").write_text("#include <sqlite3.h>\n")
+
+    package = Package(
+        name="GRDB",
+        tools_version="6.1.0",
+        platforms=[],
+        products=[Product(name="GRDB", linkage=Linkage.AUTOMATIC, targets=["GRDB"])],
+        targets=[
+            Target(name="GRDBSQLite", kind=TargetKind.SYSTEM, path=None,
+                   public_headers_path=None, dependencies=[], exclude=[]),
+            Target(name="GRDB", kind=TargetKind.REGULAR, path="GRDB",
+                   public_headers_path=None, dependencies=["GRDBSQLite"],
+                   exclude=[]),
+        ],
+        schemes=[],
+        raw_dump=GRDB_DUMP_SNAPSHOT,
+        staged_dir=staged,
+    )
+
+    # Synthetic xcframework with two slice dirs containing an empty
+    # GRDB.framework. We don't need a real binary — the helper only
+    # walks slice dirs and adds siblings.
+    xcfw = base / "GRDB.xcframework"
+    for slice_name in ("ios-arm64", "ios-arm64_x86_64-simulator"):
+        slice_dir = xcfw / slice_name
+        (slice_dir / "GRDB.framework").mkdir(parents=True)
+    (xcfw / "Info.plist").write_text("<plist></plist>")  # presence-only
+
+    n = inject_system_clang_modules(
+        xcframework_path=xcfw,
+        package=package,
+        source_targets=["GRDB"],
+        verbose=False,
+    )
+    _assert(n == 1, f"expected 1 system shim injected, got {n}")
+
+    for slice_name in ("ios-arm64", "ios-arm64_x86_64-simulator"):
+        shim_fw = xcfw / slice_name / "GRDBSQLite.framework"
+        _assert(shim_fw.is_dir(), f"missing shim framework dir in {slice_name}")
+        modulemap = shim_fw / "Modules" / "module.modulemap"
+        _assert(modulemap.is_file(), f"missing modulemap in {slice_name}")
+        text = modulemap.read_text()
+        _assert("framework module GRDBSQLite" in text,
+                f"modulemap not promoted to framework form in {slice_name}:\n{text}")
+        _assert("link \"sqlite3\"" in text,
+                f"sqlite3 link directive lost in {slice_name}:\n{text}")
+        shim_h = shim_fw / "Headers" / "shim.h"
+        _assert(shim_h.is_file(), f"missing shim.h header in {slice_name}")
+        _assert(shim_h.read_text() == "#include <sqlite3.h>\n",
+                f"shim.h content corrupted in {slice_name}")
+        # Sentinel file lets `_is_system_shim_framework` distinguish
+        # this shim from real ObjC frameworks. Required so that
+        # downstream language classification skips it.
+        sentinel = shim_fw / ".spm-to-xcframework-system-shim"
+        _assert(sentinel.is_file(), f"missing sentinel file in {slice_name}")
+
+
+def _selftest_inject_system_clang_modules_idempotent(tmp_root: Path) -> None:
+    """A second injection call must not regenerate or duplicate existing
+    shim frameworks. The return value drops to 0 because no NEW shim
+    was injected this round."""
+    base = tmp_root / "inject_sys_idempotent"
+    staged = base / "staged"
+    sys_src = staged / "Sources" / "GRDBSQLite"
+    sys_src.mkdir(parents=True)
+    (sys_src / "module.modulemap").write_text(
+        "module GRDBSQLite [system] { header \"shim.h\" link \"sqlite3\" export * }\n"
+    )
+    (sys_src / "shim.h").write_text("// shim\n")
+
+    package = Package(
+        name="GRDB", tools_version="6.1.0", platforms=[],
+        products=[Product(name="GRDB", linkage=Linkage.AUTOMATIC, targets=["GRDB"])],
+        targets=[
+            Target(name="GRDBSQLite", kind=TargetKind.SYSTEM, path=None,
+                   public_headers_path=None, dependencies=[], exclude=[]),
+            Target(name="GRDB", kind=TargetKind.REGULAR, path="GRDB",
+                   public_headers_path=None, dependencies=["GRDBSQLite"],
+                   exclude=[]),
+        ],
+        schemes=[], raw_dump=GRDB_DUMP_SNAPSHOT, staged_dir=staged,
+    )
+
+    xcfw = base / "GRDB.xcframework"
+    (xcfw / "ios-arm64" / "GRDB.framework").mkdir(parents=True)
+    (xcfw / "Info.plist").write_text("<plist></plist>")
+
+    first = inject_system_clang_modules(
+        xcframework_path=xcfw, package=package,
+        source_targets=["GRDB"], verbose=False,
+    )
+    _assert(first == 1, f"first call should report 1 injected, got {first}")
+
+    # Capture the modulemap mtime so we can prove the second call doesn't
+    # rewrite it.
+    mm = xcfw / "ios-arm64" / "GRDBSQLite.framework" / "Modules" / "module.modulemap"
+    first_mtime = mm.stat().st_mtime_ns
+
+    second = inject_system_clang_modules(
+        xcframework_path=xcfw, package=package,
+        source_targets=["GRDB"], verbose=False,
+    )
+    _assert(second == 0, f"second call should report 0 (already-present), got {second}")
+    _assert(mm.stat().st_mtime_ns == first_mtime,
+            "modulemap was rewritten on second call — not idempotent")
+
+
+def _selftest_inject_system_clang_modules_no_system_deps(tmp_root: Path) -> None:
+    """A package with no `.systemLibrary` targets must skip injection
+    entirely — no warnings, no created files."""
+    base = tmp_root / "inject_sys_nodeps"
+    staged = base / "staged"
+    staged.mkdir(parents=True)
+    package = Package(
+        name="Nuke", tools_version="5.6.0", platforms=[],
+        products=[Product(name="Nuke", linkage=Linkage.AUTOMATIC, targets=["Nuke"])],
+        targets=[Target(name="Nuke", kind=TargetKind.REGULAR, path=None,
+                        public_headers_path=None, dependencies=[], exclude=[])],
+        schemes=[], raw_dump=NUKE_DUMP_SNAPSHOT, staged_dir=staged,
+    )
+    xcfw = base / "Nuke.xcframework"
+    (xcfw / "ios-arm64" / "Nuke.framework").mkdir(parents=True)
+    (xcfw / "Info.plist").write_text("<plist></plist>")
+
+    n = inject_system_clang_modules(
+        xcframework_path=xcfw, package=package,
+        source_targets=["Nuke"], verbose=False,
+    )
+    _assert(n == 0, f"expected 0 injected for system-free package, got {n}")
+    # No new sibling frameworks created.
+    siblings = sorted(p.name for p in (xcfw / "ios-arm64").iterdir())
+    _assert(siblings == ["Nuke.framework"],
+            f"unexpected slice contents: {siblings}")
+
+
+def _selftest_detect_framework_type_skips_system_shim_sibling(tmp_root: Path) -> None:
+    """Regression test for the issue surfaced by GRDB integration:
+    `detect_framework_type` must classify a Swift framework as Swift
+    even when it ships with a sibling system Clang module shim framework
+    (binary-less, ObjC-shaped) inside the same xcframework slice. The
+    shim is identified by the `.spm-to-xcframework-system-shim` sentinel
+    file written at injection time and skipped during language tally.
+
+    To make sure we're really exercising the sentinel path and not
+    getting the right answer by alphabetical accident, the shim is
+    named `AaSysShim.framework` so it sorts BEFORE the primary
+    `GRDB.framework`. Without sentinel-based skipping, the walker would
+    pick AaSysShim first and report ObjC.
+    """
+    base = tmp_root / "detect_skips_shim"
+    xcfw = base / "GRDB.xcframework"
+    for slice_name in ("ios-arm64", "ios-arm64_x86_64-simulator"):
+        slice_dir = xcfw / slice_name
+        # Primary framework: empty binary stub + Swift surface, no shim
+        # sentinel.
+        primary = slice_dir / "GRDB.framework"
+        primary.mkdir(parents=True)
+        (primary / "GRDB").write_bytes(b"\xcf\xfa\xed\xfe")
+        swiftmod = primary / "Modules" / "GRDB.swiftmodule"
+        swiftmod.mkdir(parents=True)
+        (swiftmod / "arm64-apple-ios.swiftinterface").write_text("// fake\n")
+
+        # Sibling shim framework: alphabetically first to defeat the
+        # accidental "first wins" path. Marked with the sentinel file.
+        shim = slice_dir / "AaSysShim.framework"
+        (shim / "Modules").mkdir(parents=True)
+        (shim / "Headers").mkdir(parents=True)
+        (shim / "Modules" / "module.modulemap").write_text(
+            "framework module AaSysShim [system] { header \"shim.h\" }\n"
+        )
+        (shim / "Headers" / "shim.h").write_text("// shim\n")
+        (shim / ".spm-to-xcframework-system-shim").write_text("sentinel\n")
+
+    detected = detect_framework_type(xcfw)
+    _assert(
+        detected == "Swift",
+        f"expected Swift (shim sibling should be skipped via sentinel), got {detected}",
+    )
+
+
+def _selftest_inject_system_clang_modules_warns_on_missing_modulemap(tmp_root: Path) -> None:
+    """When the system target's source dir exists but has no
+    module.modulemap, inject must skip with a warning rather than
+    raising — graceful degradation matches the existing
+    inject_objc_headers behavior."""
+    base = tmp_root / "inject_sys_no_mm"
+    staged = base / "staged"
+    sys_src = staged / "Sources" / "BrokenSys"
+    sys_src.mkdir(parents=True)
+    # No module.modulemap intentionally.
+    package = Package(
+        name="X", tools_version="6.1.0", platforms=[],
+        products=[Product(name="X", linkage=Linkage.AUTOMATIC, targets=["X"])],
+        targets=[
+            Target(name="BrokenSys", kind=TargetKind.SYSTEM, path=None,
+                   public_headers_path=None, dependencies=[], exclude=[]),
+            Target(name="X", kind=TargetKind.REGULAR, path="Sources/X",
+                   public_headers_path=None, dependencies=["BrokenSys"], exclude=[]),
+        ],
+        schemes=[], raw_dump={
+            "name": "X", "products": [], "targets": [
+                {"name": "BrokenSys", "type": "system", "path": None,
+                 "publicHeadersPath": None, "dependencies": []},
+                {"name": "X", "type": "regular", "path": "Sources/X",
+                 "publicHeadersPath": None,
+                 "dependencies": [{"target": ["BrokenSys", None]}]},
+            ]},
+        staged_dir=staged,
+    )
+    xcfw = base / "X.xcframework"
+    (xcfw / "ios-arm64" / "X.framework").mkdir(parents=True)
+
+    n = inject_system_clang_modules(
+        xcframework_path=xcfw, package=package,
+        source_targets=["X"], verbose=False,
+    )
+    _assert(n == 0, f"expected 0 injected when modulemap is missing, got {n}")
+    _assert(not (xcfw / "ios-arm64" / "BrokenSys.framework").exists(),
+            "should not have created a shim framework with no modulemap")
+
+
+def _selftest_inject_system_clang_modules_preserves_nested_headers(
+    tmp_root: Path,
+) -> None:
+    """Codex [P2] regression: a `.systemLibrary` target whose modulemap
+    references a header in a subdirectory (e.g. `header "Sub/shim.h"`)
+    must produce a shim framework whose `Headers/` tree mirrors that
+    relative path. Before the fix, headers were collected via `iterdir()`
+    and copied flat, so the modulemap reference resolved to nothing and
+    the shim framework was unconsumable.
+    """
+    base = tmp_root / "inject_sys_nested_headers"
+    staged = base / "staged"
+    sys_src = staged / "Sources" / "NestedSys"
+    sub = sys_src / "Sub"
+    sub.mkdir(parents=True)
+    (sys_src / "module.modulemap").write_text(
+        "module NestedSys [system] {\n"
+        "    header \"Sub/shim.h\"\n"
+        "    header \"Top.h\"\n"
+        "    export *\n"
+        "}\n"
+    )
+    (sub / "shim.h").write_text("// nested header\n")
+    (sys_src / "Top.h").write_text("// top-level header\n")
+
+    package = Package(
+        name="X", tools_version="6.1.0", platforms=[],
+        products=[Product(name="X", linkage=Linkage.AUTOMATIC, targets=["X"])],
+        targets=[
+            Target(name="NestedSys", kind=TargetKind.SYSTEM, path=None,
+                   public_headers_path=None, dependencies=[], exclude=[]),
+            Target(name="X", kind=TargetKind.REGULAR, path="Sources/X",
+                   public_headers_path=None, dependencies=["NestedSys"],
+                   exclude=[]),
+        ],
+        schemes=[], raw_dump={
+            "name": "X", "products": [], "targets": [
+                {"name": "NestedSys", "type": "system", "path": None,
+                 "publicHeadersPath": None, "dependencies": []},
+                {"name": "X", "type": "regular", "path": "Sources/X",
+                 "publicHeadersPath": None,
+                 "dependencies": [{"target": ["NestedSys", None]}]},
+            ]},
+        staged_dir=staged,
+    )
+
+    xcfw = base / "X.xcframework"
+    (xcfw / "ios-arm64" / "X.framework").mkdir(parents=True)
+    (xcfw / "Info.plist").write_text("<plist></plist>")
+
+    n = inject_system_clang_modules(
+        xcframework_path=xcfw, package=package,
+        source_targets=["X"], verbose=False,
+    )
+    _assert(n == 1, f"expected 1 system shim injected, got {n}")
+
+    shim_fw = xcfw / "ios-arm64" / "NestedSys.framework"
+    _assert(shim_fw.is_dir(), "missing nested-shim framework dir")
+    nested = shim_fw / "Headers" / "Sub" / "shim.h"
+    _assert(nested.is_file(),
+            f"nested header missing — should be at {nested.relative_to(shim_fw)}")
+    _assert(nested.read_text() == "// nested header\n",
+            "nested header content corrupted")
+    top = shim_fw / "Headers" / "Top.h"
+    _assert(top.is_file(), "top-level header missing alongside nested header")
+    # The modulemap text is preserved verbatim (just promoted to
+    # framework form), so the relative `header "Sub/shim.h"` must still
+    # match the on-disk layout we just produced.
+    mm_text = (shim_fw / "Modules" / "module.modulemap").read_text()
+    _assert("header \"Sub/shim.h\"" in mm_text,
+            f"nested header reference lost from modulemap:\n{mm_text}")
+
+
+def _selftest_read_xcframework_library_paths_basic(tmp_root: Path) -> None:
+    """Happy path: a real xcframework Info.plist with two slices, each
+    pointing at a nested `LibraryPath`. The helper must return the full
+    `{identifier: library_path}` map verbatim."""
+    base = tmp_root / "read_libpaths_basic"
+    xcfw = base / "Foo.xcframework"
+    xcfw.mkdir(parents=True)
+    info_plist = xcfw / "Info.plist"
+    with info_plist.open("wb") as fh:
+        plistlib.dump({
+            "AvailableLibraries": [
+                {
+                    "LibraryIdentifier": "ios-arm64",
+                    "LibraryPath": "Frameworks/Foo.framework",
+                    "BinaryPath": "Frameworks/Foo.framework/Foo",
+                    "SupportedArchitectures": ["arm64"],
+                    "SupportedPlatform": "ios",
+                },
+                {
+                    "LibraryIdentifier": "ios-arm64_x86_64-simulator",
+                    "LibraryPath": "Foo.framework",
+                    "BinaryPath": "Foo.framework/Foo",
+                    "SupportedArchitectures": ["arm64", "x86_64"],
+                    "SupportedPlatform": "ios",
+                },
+            ],
+            "CFBundlePackageType": "XFWK",
+            "XCFrameworkFormatVersion": "1.0",
+        }, fh)
+    paths = _read_xcframework_library_paths(xcfw)
+    _assert(
+        paths == {
+            "ios-arm64": "Frameworks/Foo.framework",
+            "ios-arm64_x86_64-simulator": "Foo.framework",
+        },
+        f"unexpected library paths: {paths!r}",
+    )
+
+
+def _selftest_read_xcframework_library_paths_robust_to_corruption(
+    tmp_root: Path,
+) -> None:
+    """The helper must return an empty dict (caller falls back to
+    direct-child scan) for: missing Info.plist, parse error, missing
+    AvailableLibraries, malformed entries. None of these may raise."""
+    base = tmp_root / "read_libpaths_corrupt"
+
+    # 1. Missing plist entirely.
+    xc1 = base / "missing.xcframework"
+    xc1.mkdir(parents=True)
+    _assert(_read_xcframework_library_paths(xc1) == {},
+            "missing plist should return {}")
+
+    # 2. Garbage bytes that crash plistlib.
+    xc2 = base / "garbage.xcframework"
+    xc2.mkdir(parents=True)
+    (xc2 / "Info.plist").write_bytes(b"not a plist at all\x00\x01")
+    _assert(_read_xcframework_library_paths(xc2) == {},
+            "corrupt plist should return {}")
+
+    # 3. Plist with no AvailableLibraries key.
+    xc3 = base / "no_avail.xcframework"
+    xc3.mkdir(parents=True)
+    with (xc3 / "Info.plist").open("wb") as fh:
+        plistlib.dump({"CFBundlePackageType": "XFWK"}, fh)
+    _assert(_read_xcframework_library_paths(xc3) == {},
+            "plist without AvailableLibraries should return {}")
+
+    # 4. AvailableLibraries entries that are missing or malformed get
+    #    skipped, but well-formed siblings still come through.
+    xc4 = base / "partial.xcframework"
+    xc4.mkdir(parents=True)
+    with (xc4 / "Info.plist").open("wb") as fh:
+        plistlib.dump({
+            "AvailableLibraries": [
+                "this is a string, not a dict",
+                {"LibraryIdentifier": "ios-arm64"},  # missing LibraryPath
+                {"LibraryPath": "Foo.framework"},    # missing identifier
+                {"LibraryIdentifier": "ios-x86", "LibraryPath": ""},  # empty
+                {
+                    "LibraryIdentifier": "ios-arm64_x86_64-simulator",
+                    "LibraryPath": "Foo.framework",
+                },
+            ],
+        }, fh)
+    paths = _read_xcframework_library_paths(xc4)
+    _assert(
+        paths == {"ios-arm64_x86_64-simulator": "Foo.framework"},
+        f"partial-plist filter wrong: {paths!r}",
+    )
+
+
+def _selftest_pick_primary_framework_in_slice_honors_library_path(
+    tmp_root: Path,
+) -> None:
+    """Codex [P1]: when given an explicit `LibraryPath` from the
+    xcframework's `Info.plist`, `_pick_primary_framework_in_slice` must
+    resolve to that nested path instead of falling back to the
+    direct-child scan (which would miss it entirely and return None)."""
+    base = tmp_root / "pick_primary_libpath"
+    slice_dir = base / "ios-arm64"
+    nested_fw = slice_dir / "Frameworks" / "Foo.framework"
+    nested_fw.mkdir(parents=True)
+
+    # Without library_path the direct-child scan returns None — the
+    # framework lives nested under Frameworks/.
+    _assert(
+        _pick_primary_framework_in_slice(slice_dir) is None,
+        "direct-child scan should NOT find a nested framework",
+    )
+
+    # With library_path the helper resolves directly to the nested path.
+    picked = _pick_primary_framework_in_slice(
+        slice_dir, library_path="Frameworks/Foo.framework",
+    )
+    _assert(
+        picked == nested_fw,
+        f"expected {nested_fw}, got {picked}",
+    )
+
+    # Plist disagreement with disk: library_path doesn't resolve, so
+    # we should fall back to the direct-child scan rather than silently
+    # returning None. Add a top-level framework so the fallback succeeds.
+    top_fw = slice_dir / "Bar.framework"
+    top_fw.mkdir(parents=True)
+    fallback = _pick_primary_framework_in_slice(
+        slice_dir, library_path="DoesNotExist/Whatever.framework",
+    )
+    _assert(
+        fallback == top_fw,
+        f"expected fallback to {top_fw}, got {fallback}",
+    )
+
+
+def _selftest_detect_framework_type_nested_library_path(
+    tmp_root: Path,
+) -> None:
+    """Codex [P1] regression: an xcframework whose `Info.plist` declares
+    `LibraryPath = Frameworks/Foo.framework` must be classified by
+    `detect_framework_type` from the nested framework's contents, not
+    silently fall through to "Unknown" because the direct-child scan
+    couldn't find anything.
+    """
+    base = tmp_root / "detect_nested_libpath"
+    xcfw = base / "Foo.xcframework"
+    xcfw.mkdir(parents=True)
+    available = []
+    for slice_id in ("ios-arm64", "ios-arm64_x86_64-simulator"):
+        nested_fw = xcfw / slice_id / "Frameworks" / "Foo.framework"
+        nested_fw.mkdir(parents=True)
+        (nested_fw / "Foo").write_bytes(b"\xcf\xfa\xed\xfe" + b"\x00" * 32)
+        modules = nested_fw / "Modules" / "Foo.swiftmodule"
+        modules.mkdir(parents=True)
+        (modules / "arm64.swiftinterface").write_text("// fake\n")
+        available.append({
+            "LibraryIdentifier": slice_id,
+            "LibraryPath": "Frameworks/Foo.framework",
+            "BinaryPath": "Frameworks/Foo.framework/Foo",
+            "SupportedArchitectures": ["arm64"],
+            "SupportedPlatform": "ios",
+        })
+    with (xcfw / "Info.plist").open("wb") as fh:
+        plistlib.dump({
+            "AvailableLibraries": available,
+            "CFBundlePackageType": "XFWK",
+            "XCFrameworkFormatVersion": "1.0",
+        }, fh)
+
+    detected = detect_framework_type(xcfw)
+    _assert(
+        detected == "Swift",
+        f"expected Swift (nested LibraryPath should be honored), got {detected}",
+    )
+
+
+def _selftest_verify_one_unit_nested_library_path_enforces_language(
+    tmp_root: Path,
+) -> None:
+    """Codex [P1] regression: a binary-mode (or N/A-language) unit whose
+    real framework lives at `Frameworks/Foo.framework` must NOT silently
+    pass `_verify_one_unit` as Unknown. Before the fix, the per-slice
+    walk used direct-child scanning, missed the nested framework, and
+    fell through to `expected_language = "" / "Unknown"` which has no
+    surface-check requirements at all. After the fix, the walker uses
+    `LibraryPath` from `Info.plist`, sees the Swift surface, and the
+    detected type is Swift.
+    """
+    base = tmp_root / "verify_nested_libpath"
+    xcfw = base / "Foo.xcframework"
+    xcfw.mkdir(parents=True)
+    available = []
+    for slice_id in ("ios-arm64", "ios-arm64_x86_64-simulator"):
+        nested_fw = xcfw / slice_id / "Frameworks" / "Foo.framework"
+        nested_fw.mkdir(parents=True)
+        (nested_fw / "Foo").write_bytes(b"\xcf\xfa\xed\xfe" + b"\x00" * 32)
+        modules = nested_fw / "Modules" / "Foo.swiftmodule"
+        modules.mkdir(parents=True)
+        (modules / "arm64.swiftinterface").write_text("// fake\n")
+        (modules / "arm64.abi.json").write_text("{}")
+        available.append({
+            "LibraryIdentifier": slice_id,
+            "LibraryPath": "Frameworks/Foo.framework",
+            "BinaryPath": "Frameworks/Foo.framework/Foo",
+            "SupportedArchitectures": ["arm64"],
+            "SupportedPlatform": "ios",
+        })
+    with (xcfw / "Info.plist").open("wb") as fh:
+        plistlib.dump({
+            "AvailableLibraries": available,
+            "CFBundlePackageType": "XFWK",
+            "XCFrameworkFormatVersion": "1.0",
+        }, fh)
+
+    unit = ExecutedUnit(
+        name="Foo",
+        xcframework_path=xcfw,
+        framework_name="Foo",
+        expected_language=Language.NA,
+        is_binary_copy=True,
+    )
+    saved = tool._check_binary_dynamic
+    try:
+        tool._check_binary_dynamic = lambda _b: True
+        results = verify_output([unit], base)
+    finally:
+        tool._check_binary_dynamic = saved
+    r = results[0]
+    _assert(
+        r.framework_type == "Swift",
+        f"expected detected Swift (nested LibraryPath honored), got {r.framework_type!r}",
+    )
+    _assert(
+        r.passed,
+        f"verify should pass on a well-formed nested-LibraryPath Swift unit, "
+        f"got fatal_issues={r.fatal_issues!r}",
+    )
+
+
 # Test registry. Tuples of (name, callable, requires_swift). The fast mode
 # only runs entries with requires_swift=False.
 def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
@@ -3987,6 +4717,46 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          lambda: _selftest_archive_static_lib_path_picks_first(tmp_root), False),
         ("execute: archive framework path recursive search",
          lambda: _selftest_archive_framework_path_recursive(tmp_root), False),
+        ("execute: promote_modulemap_to_framework_form (GRDBSQLite shape)",
+         _selftest_promote_modulemap_to_framework_form_grdb, False),
+        ("execute: promote_modulemap_to_framework_form preserves indent",
+         _selftest_promote_modulemap_to_framework_form_indented, False),
+        ("execute: walk_system_library_target_deps GRDB → GRDBSQLite",
+         _selftest_walk_system_library_target_deps_grdb, False),
+        ("execute: walk_system_library_target_deps no-op for system-free packages",
+         _selftest_walk_system_library_target_deps_no_system, False),
+        ("execute: walk_system_library_target_deps follows transitive chain",
+         _selftest_walk_system_library_target_deps_transitive, False),
+        ("execute: walk_system_library_target_deps dedupes diamond",
+         _selftest_walk_system_library_target_deps_dedupes_diamond, False),
+        ("execute: system_target_source_dir uses Sources/<name> default",
+         lambda: _selftest_system_target_source_dir_default(tmp_root), False),
+        ("execute: system_target_source_dir honors explicit path:",
+         lambda: _selftest_system_target_source_dir_explicit(tmp_root), False),
+        ("execute: system_target_source_dir returns None on missing dir",
+         lambda: _selftest_system_target_source_dir_missing(tmp_root), False),
+        ("execute: inject_system_clang_modules end-to-end (GRDB shape)",
+         lambda: _selftest_inject_system_clang_modules_grdb_shape(tmp_root), False),
+        ("execute: inject_system_clang_modules idempotent on second call",
+         lambda: _selftest_inject_system_clang_modules_idempotent(tmp_root), False),
+        ("execute: inject_system_clang_modules no-op when no system deps",
+         lambda: _selftest_inject_system_clang_modules_no_system_deps(tmp_root), False),
+        ("execute: inject_system_clang_modules warns on missing modulemap",
+         lambda: _selftest_inject_system_clang_modules_warns_on_missing_modulemap(tmp_root), False),
+        ("execute: inject_system_clang_modules preserves nested headers (P2)",
+         lambda: _selftest_inject_system_clang_modules_preserves_nested_headers(tmp_root), False),
+        ("execute: detect_framework_type skips system shim sibling (GRDB)",
+         lambda: _selftest_detect_framework_type_skips_system_shim_sibling(tmp_root), False),
+        ("execute: read_xcframework_library_paths basic happy path",
+         lambda: _selftest_read_xcframework_library_paths_basic(tmp_root), False),
+        ("execute: read_xcframework_library_paths robust to corrupt plist",
+         lambda: _selftest_read_xcframework_library_paths_robust_to_corruption(tmp_root), False),
+        ("execute: pick_primary_framework_in_slice honors LibraryPath (P1)",
+         lambda: _selftest_pick_primary_framework_in_slice_honors_library_path(tmp_root), False),
+        ("execute: detect_framework_type honors nested LibraryPath (P1)",
+         lambda: _selftest_detect_framework_type_nested_library_path(tmp_root), False),
+        ("verify: nested LibraryPath unit enforces language surface (P1)",
+         lambda: _selftest_verify_one_unit_nested_library_path_enforces_language(tmp_root), False),
         ("verify: _format_size_iec K/M/G boundaries",
          _selftest_format_size_iec, False),
         ("verify: happy path Swift xcframework",
