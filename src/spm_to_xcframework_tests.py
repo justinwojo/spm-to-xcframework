@@ -2601,17 +2601,20 @@ def _selftest_find_objc_headers_dir_umbrella_rejects_unrelated_h(tmp_root: Path)
 
 def _selftest_find_objc_headers_dir_dep_walk_no_implicit_leak(tmp_root: Path) -> None:
     """Regression: when the direct product target has no public
-    headers and a depended-on target carries an implicit-layout
-    `include/` (no explicit `publicHeadersPath`), `_find_objc_headers_dir`
-    must NOT return the dep's `include/`.
+    headers and a separately-packaged dep carries an implicit-layout
+    `include/`, `_find_objc_headers_dir` must NOT return the dep's
+    `include/`.
 
-    Background: Stripe3DS2 ships its own `include/` with 33 STDS*.h
-    files and is reachable as a transitive dep of StripePayments. An
+    Background: Stripe3DS2 is exposed by Stripe's Package.swift as its
+    own library product (`library(name: "Stripe3DS2", ...)`), so it
+    gets its own xcframework. It also ships an `include/` with 33
+    STDS*.h files and is reachable as a dep of StripePayments. An
     earlier overly-lenient fix walked deps with implicit-layout
-    fallback enabled and silently injected Stripe3DS2's headers into
-    StripePayments.framework. Deps belong to their own xcframeworks;
-    only an *explicit* `publicHeadersPath` declaration on a dep is
-    treated as opt-in to surface those headers in the parent.
+    fallback enabled and silently duplicated Stripe3DS2's headers
+    into StripePayments.framework. Deps that back their own product
+    must opt in via an explicit `publicHeadersPath` to surface their
+    headers in the parent; their default `include/` belongs to their
+    own xcframework only.
     """
     base = tmp_root / "headers_dep_no_leak"
     staged = base / "staged"
@@ -2622,7 +2625,8 @@ def _selftest_find_objc_headers_dir_dep_walk_no_implicit_leak(tmp_root: Path) ->
     (parent_dir / "API.swift").write_text("// swift only")
 
     # Stripe3DS2-style dep: implicit include/ layout (NO publicHeadersPath
-    # declared in the dump). Must NOT leak.
+    # declared in the dump). Must NOT leak — it's a sibling product,
+    # built into its own xcframework.
     dep_include = staged / "Sources" / "Stripe3DS2" / "include"
     dep_include.mkdir(parents=True)
     (dep_include / "STDSConfigParameters.h").write_text("// h")
@@ -2634,7 +2638,15 @@ def _selftest_find_objc_headers_dir_dep_walk_no_implicit_leak(tmp_root: Path) ->
                 "name": "StripePayments",
                 "type": {"library": ["automatic"]},
                 "targets": ["StripePayments"],
-            }
+            },
+            # Stripe3DS2 is a sibling library product — this is what
+            # marks the dep as "separately packaged" and turns off the
+            # implicit-layout fallback for the dep walk.
+            {
+                "name": "Stripe3DS2",
+                "type": {"library": ["automatic"]},
+                "targets": ["Stripe3DS2"],
+            },
         ],
         "targets": [
             {
@@ -2657,8 +2669,12 @@ def _selftest_find_objc_headers_dir_dep_walk_no_implicit_leak(tmp_root: Path) ->
         name="StripePayments",
         tools_version="5.7.0",
         platforms=[],
-        products=[Product(name="StripePayments", linkage=Linkage.AUTOMATIC,
-                          targets=["StripePayments"])],
+        products=[
+            Product(name="StripePayments", linkage=Linkage.AUTOMATIC,
+                    targets=["StripePayments"]),
+            Product(name="Stripe3DS2", linkage=Linkage.AUTOMATIC,
+                    targets=["Stripe3DS2"]),
+        ],
         targets=[
             Target(name="StripePayments", kind=TargetKind.REGULAR,
                    path="Sources/StripePayments", public_headers_path=None,
@@ -2676,8 +2692,101 @@ def _selftest_find_objc_headers_dir_dep_walk_no_implicit_leak(tmp_root: Path) ->
                                     fw_name="StripePayments")
     _assert(
         found is None,
-        f"expected None (no headers): dep with implicit include/ must "
-        f"not leak into parent framework, got {found!r}",
+        f"expected None (no headers): separately-packaged dep with "
+        f"implicit include/ must not leak into parent framework, "
+        f"got {found!r}",
+    )
+
+
+def _selftest_find_objc_headers_dir_dep_walk_internal_default_include(tmp_root: Path) -> None:
+    """Regression: an internal-only dep target with the SPM default
+    `Sources/<Dep>/include/` layout (no explicit `publicHeadersPath`,
+    not exposed as its own product) must have its public headers
+    folded into the parent framework.
+
+    Background: the prior leak fix flipped implicit-layout fallback
+    OFF for every dep. That stopped Stripe3DS2's `include/` from
+    bleeding into StripePayments — but it also broke the very common
+    SPM shape where a product target depends on a helper sub-target
+    whose ObjC headers live in the conventional `include/` directory
+    and is never separately packaged. With the unconditional gate,
+    `_find_objc_headers_dir` returned None, `inject_objc_headers`
+    became a no-op, and the framework shipped with no `Headers/` or
+    `module.modulemap`.
+
+    The fix distinguishes deps that back another product (separately
+    packaged → don't allow implicit) from deps that no product
+    references (internal → allow implicit).
+    """
+    base = tmp_root / "headers_dep_internal_include"
+    staged = base / "staged"
+
+    # Parent product target: Swift-only, no .h of its own.
+    parent_dir = staged / "Sources" / "Widget"
+    parent_dir.mkdir(parents=True)
+    (parent_dir / "Widget.swift").write_text("// swift only")
+
+    # Internal helper: SPM default include/ layout, NO explicit
+    # publicHeadersPath, NOT listed in any product's targets.
+    helper_include = staged / "Sources" / "WidgetCore" / "include"
+    helper_include.mkdir(parents=True)
+    (helper_include / "WCAttributes.h").write_text("// h")
+    (helper_include / "WCMetrics.h").write_text("// h")
+
+    raw_dump = {
+        # Single product. WidgetCore is intentionally absent from the
+        # products list — that's what marks it as internal so the dep
+        # walk allows the implicit `include/` fallback.
+        "products": [
+            {
+                "name": "Widget",
+                "type": {"library": ["automatic"]},
+                "targets": ["Widget"],
+            }
+        ],
+        "targets": [
+            {
+                "name": "Widget",
+                "type": "regular",
+                "path": "Sources/Widget",
+                "publicHeadersPath": None,
+                "dependencies": [{"target": ["WidgetCore", None]}],
+            },
+            {
+                "name": "WidgetCore",
+                "type": "regular",
+                "path": "Sources/WidgetCore",
+                "publicHeadersPath": None,
+                "dependencies": [],
+            },
+        ],
+    }
+    package = Package(
+        name="Widget",
+        tools_version="5.7.0",
+        platforms=[],
+        products=[Product(name="Widget", linkage=Linkage.AUTOMATIC,
+                          targets=["Widget"])],
+        targets=[
+            Target(name="Widget", kind=TargetKind.REGULAR,
+                   path="Sources/Widget", public_headers_path=None,
+                   dependencies=["WidgetCore"], exclude=[],
+                   language=Language.OBJC),
+            Target(name="WidgetCore", kind=TargetKind.REGULAR,
+                   path="Sources/WidgetCore", public_headers_path=None,
+                   dependencies=[], exclude=[], language=Language.OBJC),
+        ],
+        schemes=[],
+        raw_dump=raw_dump,
+        staged_dir=staged,
+    )
+    found = _find_objc_headers_dir(package, product_name="Widget",
+                                    fw_name="Widget")
+    _assert(
+        found is not None and found.name == "include"
+        and found.parent.name == "WidgetCore",
+        f"expected internal dep's default include/ to be folded into "
+        f"the parent framework, got {found!r}",
     )
 
 
@@ -5023,6 +5132,8 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          lambda: _selftest_find_objc_headers_dir_umbrella_rejects_unrelated_h(tmp_root), False),
         ("execute: ObjC headers dir dep walk does not leak implicit include/",
          lambda: _selftest_find_objc_headers_dir_dep_walk_no_implicit_leak(tmp_root), False),
+        ("execute: ObjC headers dir dep walk folds internal default include/",
+         lambda: _selftest_find_objc_headers_dir_dep_walk_internal_default_include(tmp_root), False),
         ("execute: detect_system_frameworks follows .target() dep edge (P1)",
          lambda: _selftest_detect_system_frameworks_follows_target_edge(tmp_root), False),
         ("execute: archive static lib path picks first sorted",

@@ -3624,6 +3624,26 @@ def _find_objc_headers_dir(
     if not product_targets:
         return None
 
+    # Targets that any product in this package exposes as part of its
+    # own xcframework. Used to gate implicit-layout fallback in the dep
+    # walk: a dep that backs another product is "separately packaged"
+    # — its public surface lives in that product's xcframework, so
+    # bleeding its `include/` or umbrella header up into the parent
+    # frame would leak headers across xcframework boundaries
+    # (Stripe3DS2 → StripePayments). A dep that no product references
+    # is "internal" — only ever folded into the parent — so its
+    # default-layout headers belong to the parent.
+    separately_packaged: Set[str] = set()
+    for raw_p in package.raw_dump.get("products", []) or []:
+        if not isinstance(raw_p, dict):
+            continue
+        tlist = raw_p.get("targets")
+        if not isinstance(tlist, list):
+            continue
+        for t in tlist:
+            if isinstance(t, str):
+                separately_packaged.add(t)
+
     def headers_dir_for(target_name: str, allow_implicit_layouts: bool) -> Optional[Path]:
         target = package.target_by_name(target_name)
         if target is None:
@@ -3638,12 +3658,14 @@ def _find_objc_headers_dir(
             if full_path.is_dir() and _has_h_files_recursive(full_path):
                 return full_path
             return None
-        # 2. Implicit layouts are only allowed for the direct product
-        #    target — never when walking deps. A dep with `include/` or a
-        #    top-level umbrella header (e.g. Stripe3DS2 underneath
-        #    StripePayments) would otherwise silently leak its public
-        #    surface into the parent framework, since dep targets are
-        #    always built into their own xcframeworks separately.
+        # 2. Implicit layouts are gated by the caller. Direct product
+        #    targets always opt in. Deps opt in only when the dep is
+        #    not separately packaged — i.e. no product in this package
+        #    exposes it as its own xcframework. A separately-packaged
+        #    dep (Stripe3DS2 underneath StripePayments) ships its
+        #    public surface in its own xcframework, so accepting an
+        #    `include/` or umbrella here would duplicate-leak those
+        #    headers into the parent.
         if not allow_implicit_layouts:
             return None
         # 2a. SPM default for ObjC targets: `<target_path>/include/`.
@@ -3687,13 +3709,15 @@ def _find_objc_headers_dir(
     # First-level dependencies of direct product targets. Accepts both
     # `byName` and `target` dep shapes — the GRDB-style `.target()`
     # form would otherwise go unvisited and public headers from
-    # depended-on ObjC targets would be missed (Codex [P1]). Strict on
-    # the dep walk: only accept deps that explicitly declare
-    # `publicHeadersPath`, never the implicit `include/` / umbrella
-    # fallbacks. A dep is by definition part of a different framework,
-    # so its public surface belongs to its own xcframework — bleeding
-    # implicit-layout headers up to the parent breaks Stripe-style
-    # multi-product packages.
+    # depended-on ObjC targets would be missed (Codex [P1]). Implicit
+    # layouts are gated by `separately_packaged`: a dep that backs its
+    # own product gets its own xcframework, so we require an explicit
+    # `publicHeadersPath` to opt those headers into the parent (this is
+    # what stops Stripe3DS2's `include/` from leaking up into
+    # StripePayments). An internal-only dep — one no product
+    # references — gets the same `include/` and umbrella fallbacks as
+    # a direct product target, since the parent is the only place it
+    # ships.
     dep_fw_match: Optional[Path] = None
     dep_product_match: Optional[Path] = None
     dep_any_match: Optional[Path] = None
@@ -3706,7 +3730,8 @@ def _find_objc_headers_dir(
             if dep_name in seen_deps:
                 continue
             seen_deps.add(dep_name)
-            d = headers_dir_for(dep_name, allow_implicit_layouts=False)
+            allow_implicit = dep_name not in separately_packaged
+            d = headers_dir_for(dep_name, allow_implicit_layouts=allow_implicit)
             if d is None:
                 continue
             if dep_name == fw_name and dep_fw_match is None:
