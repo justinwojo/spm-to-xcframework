@@ -3575,6 +3575,21 @@ def inject_swiftmodule(
     return True
 
 
+def _has_h_files_recursive(path: Path) -> bool:
+    """True iff `path` contains at least one `.h` file at any depth.
+
+    Used to filter out directories that exist but contain only Swift
+    sources or subdirectories with no public ObjC surface — those
+    aren't real header roots even when they happen to be named `include`
+    or carry an explicit `publicHeadersPath`.
+    """
+    for _root, _dirs, files in os.walk(path):
+        for name in files:
+            if name.endswith(".h"):
+                return True
+    return False
+
+
 def _find_objc_headers_dir(
     package: Package,
     product_name: str,
@@ -3609,33 +3624,50 @@ def _find_objc_headers_dir(
     if not product_targets:
         return None
 
-    def headers_dir_for(target_name: str) -> Optional[Path]:
+    def headers_dir_for(target_name: str, allow_implicit_layouts: bool) -> Optional[Path]:
         target = package.target_by_name(target_name)
         if target is None:
             return None
         target_path = target.path or _default_target_path(target.name, target.kind)
         if not target_path:
             return None
-        # SPM convention: when `publicHeadersPath` is not declared, public ObjC
-        # headers default to "<target_path>/include". Stripe's SDK layout stopped
-        # declaring `publicHeadersPath` in Package.swift, which used to make
-        # `_find_objc_headers_dir` return None and silently skip header injection —
-        # then the "expected Mixed" verifier fired because .h files are still on
-        # disk (so `_count_source_files` classifies the target as Mixed).
-        headers_rel = target.public_headers_path or "include"
-        full_path = package.staged_dir / target_path / headers_rel
-        if not full_path.is_dir():
-            return None
-        # Has at least one .h file (recursively).
-        for _root, _dirs, files in os.walk(full_path):
-            if any(f.endswith(".h") for f in files):
+        target_dir = package.staged_dir / target_path
+        # 1. Explicit `publicHeadersPath` always wins (the legacy contract).
+        if target.public_headers_path:
+            full_path = target_dir / target.public_headers_path
+            if full_path.is_dir() and _has_h_files_recursive(full_path):
                 return full_path
+            return None
+        # 2. Implicit layouts are only allowed for the direct product
+        #    target — never when walking deps. A dep with `include/` or a
+        #    top-level umbrella header (e.g. Stripe3DS2 underneath
+        #    StripePayments) would otherwise silently leak its public
+        #    surface into the parent framework, since dep targets are
+        #    always built into their own xcframeworks separately.
+        if not allow_implicit_layouts:
+            return None
+        # 2a. SPM default for ObjC targets: `<target_path>/include/`.
+        include_dir = target_dir / "include"
+        if include_dir.is_dir() and _has_h_files_recursive(include_dir):
+            return include_dir
+        # 2b. Umbrella-header-at-target-root pattern. Stripe ships every
+        #    product this way: `StripePayments.h` sits at the top of
+        #    `StripePayments/StripePayments/` with no `include/` subdir.
+        #    The Stripe umbrella product uses `Stripe-umbrella.h` instead
+        #    of the strict `<TargetName>.h` form, so we accept any
+        #    non-`-Swift.h` `.h` at the top level. `inject_objc_headers`
+        #    walks the returned dir recursively, but in practice these
+        #    targets carry zero `.h` files outside the umbrella (the
+        #    rest is Swift), so over-injection is not a concern.
+        for h in target_dir.glob("*.h"):
+            if h.is_file() and not h.name.endswith("-Swift.h"):
+                return target_dir
         return None
 
     product_match: Optional[Path] = None
     any_match: Optional[Path] = None
     for tname in product_targets:
-        d = headers_dir_for(tname)
+        d = headers_dir_for(tname, allow_implicit_layouts=True)
         if d is None:
             continue
         if tname == fw_name:
@@ -3654,7 +3686,13 @@ def _find_objc_headers_dir(
     # First-level dependencies of direct product targets. Accepts both
     # `byName` and `target` dep shapes — the GRDB-style `.target()`
     # form would otherwise go unvisited and public headers from
-    # depended-on ObjC targets would be missed (Codex [P1]).
+    # depended-on ObjC targets would be missed (Codex [P1]). Strict on
+    # the dep walk: only accept deps that explicitly declare
+    # `publicHeadersPath`, never the implicit `include/` / umbrella
+    # fallbacks. A dep is by definition part of a different framework,
+    # so its public surface belongs to its own xcframework — bleeding
+    # implicit-layout headers up to the parent breaks Stripe-style
+    # multi-product packages.
     dep_fw_match: Optional[Path] = None
     dep_product_match: Optional[Path] = None
     dep_any_match: Optional[Path] = None
@@ -3667,7 +3705,7 @@ def _find_objc_headers_dir(
             if dep_name in seen_deps:
                 continue
             seen_deps.add(dep_name)
-            d = headers_dir_for(dep_name)
+            d = headers_dir_for(dep_name, allow_implicit_layouts=False)
             if d is None:
                 continue
             if dep_name == fw_name and dep_fw_match is None:

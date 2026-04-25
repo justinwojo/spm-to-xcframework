@@ -2435,6 +2435,157 @@ def _selftest_find_objc_headers_dir_follows_target_edge(tmp_root: Path) -> None:
     )
 
 
+def _selftest_find_objc_headers_dir_umbrella_at_target_root(tmp_root: Path) -> None:
+    """Regression: when `publicHeadersPath` is omitted and the target
+    follows the Stripe-style umbrella-header pattern (one
+    `<TargetName>.h` at the top of the target directory, no `include/`
+    subdir), `_find_objc_headers_dir` must return the target dir
+    itself.
+
+    Background: Stripe SDK 25.x ships every product this way —
+    `StripePayments/StripePayments/StripePayments.h` is the public
+    surface, plus a sea of `.swift`. Before the fix the lookup
+    silently returned None, which made `inject_objc_headers` a no-op
+    and produced xcframeworks missing `Headers/` and
+    `Modules/module.modulemap`.
+    """
+    base = tmp_root / "headers_umbrella_at_root"
+    staged = base / "staged"
+
+    target_dir = staged / "Sources" / "StripePayments"
+    target_dir.mkdir(parents=True)
+    (target_dir / "StripePayments.h").write_text("// umbrella")
+    # A `-Swift.h` file at the same level should NOT be confused for
+    # the umbrella — they're generated artifacts on the framework
+    # output side, not source-of-truth public headers.
+    (target_dir / "StripePayments-Swift.h").write_text("// generated")
+    (target_dir / "API.swift").write_text("// swift")
+
+    raw_dump = {
+        "products": [
+            {
+                "name": "StripePayments",
+                "type": {"library": ["automatic"]},
+                "targets": ["StripePayments"],
+            }
+        ],
+        "targets": [
+            {
+                "name": "StripePayments",
+                "type": "regular",
+                "path": "Sources/StripePayments",
+                "publicHeadersPath": None,
+                "dependencies": [],
+            },
+        ],
+    }
+    package = Package(
+        name="StripePayments",
+        tools_version="5.7.0",
+        platforms=[],
+        products=[Product(name="StripePayments", linkage=Linkage.AUTOMATIC,
+                          targets=["StripePayments"])],
+        targets=[
+            Target(name="StripePayments", kind=TargetKind.REGULAR,
+                   path="Sources/StripePayments", public_headers_path=None,
+                   dependencies=[], exclude=[], language=Language.OBJC),
+        ],
+        schemes=[],
+        raw_dump=raw_dump,
+        staged_dir=staged,
+    )
+    found = _find_objc_headers_dir(package, product_name="StripePayments",
+                                    fw_name="StripePayments")
+    _assert(
+        found is not None and found.name == "StripePayments"
+        and found.parent.name == "Sources",
+        f"expected target dir as headers root for umbrella-at-root "
+        f"layout, got {found!r}",
+    )
+
+
+def _selftest_find_objc_headers_dir_dep_walk_no_implicit_leak(tmp_root: Path) -> None:
+    """Regression: when the direct product target has no public
+    headers and a depended-on target carries an implicit-layout
+    `include/` (no explicit `publicHeadersPath`), `_find_objc_headers_dir`
+    must NOT return the dep's `include/`.
+
+    Background: Stripe3DS2 ships its own `include/` with 33 STDS*.h
+    files and is reachable as a transitive dep of StripePayments. An
+    earlier overly-lenient fix walked deps with implicit-layout
+    fallback enabled and silently injected Stripe3DS2's headers into
+    StripePayments.framework. Deps belong to their own xcframeworks;
+    only an *explicit* `publicHeadersPath` declaration on a dep is
+    treated as opt-in to surface those headers in the parent.
+    """
+    base = tmp_root / "headers_dep_no_leak"
+    staged = base / "staged"
+
+    # StripePayments-style direct target: only Swift, zero .h files.
+    parent_dir = staged / "Sources" / "StripePayments"
+    parent_dir.mkdir(parents=True)
+    (parent_dir / "API.swift").write_text("// swift only")
+
+    # Stripe3DS2-style dep: implicit include/ layout (NO publicHeadersPath
+    # declared in the dump). Must NOT leak.
+    dep_include = staged / "Sources" / "Stripe3DS2" / "include"
+    dep_include.mkdir(parents=True)
+    (dep_include / "STDSConfigParameters.h").write_text("// h")
+    (dep_include / "STDSStripe3DS2.h").write_text("// h")
+
+    raw_dump = {
+        "products": [
+            {
+                "name": "StripePayments",
+                "type": {"library": ["automatic"]},
+                "targets": ["StripePayments"],
+            }
+        ],
+        "targets": [
+            {
+                "name": "StripePayments",
+                "type": "regular",
+                "path": "Sources/StripePayments",
+                "publicHeadersPath": None,
+                "dependencies": [{"target": ["Stripe3DS2", None]}],
+            },
+            {
+                "name": "Stripe3DS2",
+                "type": "regular",
+                "path": "Sources/Stripe3DS2",
+                "publicHeadersPath": None,
+                "dependencies": [],
+            },
+        ],
+    }
+    package = Package(
+        name="StripePayments",
+        tools_version="5.7.0",
+        platforms=[],
+        products=[Product(name="StripePayments", linkage=Linkage.AUTOMATIC,
+                          targets=["StripePayments"])],
+        targets=[
+            Target(name="StripePayments", kind=TargetKind.REGULAR,
+                   path="Sources/StripePayments", public_headers_path=None,
+                   dependencies=["Stripe3DS2"], exclude=[],
+                   language=Language.OBJC),
+            Target(name="Stripe3DS2", kind=TargetKind.REGULAR,
+                   path="Sources/Stripe3DS2", public_headers_path=None,
+                   dependencies=[], exclude=[], language=Language.OBJC),
+        ],
+        schemes=[],
+        raw_dump=raw_dump,
+        staged_dir=staged,
+    )
+    found = _find_objc_headers_dir(package, product_name="StripePayments",
+                                    fw_name="StripePayments")
+    _assert(
+        found is None,
+        f"expected None (no headers): dep with implicit include/ must "
+        f"not leak into parent framework, got {found!r}",
+    )
+
+
 def _selftest_detect_system_frameworks_follows_target_edge(tmp_root: Path) -> None:
     """Regression for Codex [P1]: `detect_system_frameworks` must walk
     first-level `target`-shape deps so system frameworks declared by
@@ -4769,6 +4920,10 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          lambda: _selftest_find_objc_headers_dir_follows_target_edge(tmp_root), False),
         ("execute: ObjC headers dir defaults to include/ when publicHeadersPath omitted",
          lambda: _selftest_find_objc_headers_dir_defaults_to_include(tmp_root), False),
+        ("execute: ObjC headers dir picks umbrella-at-target-root (Stripe pattern)",
+         lambda: _selftest_find_objc_headers_dir_umbrella_at_target_root(tmp_root), False),
+        ("execute: ObjC headers dir dep walk does not leak implicit include/",
+         lambda: _selftest_find_objc_headers_dir_dep_walk_no_implicit_leak(tmp_root), False),
         ("execute: detect_system_frameworks follows .target() dep edge (P1)",
          lambda: _selftest_detect_system_frameworks_follows_target_edge(tmp_root), False),
         ("execute: archive static lib path picks first sorted",
