@@ -3611,12 +3611,19 @@ def _find_objc_headers_dir(
 
     def headers_dir_for(target_name: str) -> Optional[Path]:
         target = package.target_by_name(target_name)
-        if target is None or not target.public_headers_path:
+        if target is None:
             return None
         target_path = target.path or _default_target_path(target.name, target.kind)
         if not target_path:
             return None
-        full_path = package.staged_dir / target_path / target.public_headers_path
+        # SPM convention: when `publicHeadersPath` is not declared, public ObjC
+        # headers default to "<target_path>/include". Stripe's SDK layout stopped
+        # declaring `publicHeadersPath` in Package.swift, which used to make
+        # `_find_objc_headers_dir` return None and silently skip header injection —
+        # then the "expected Mixed" verifier fired because .h files are still on
+        # disk (so `_count_source_files` classifies the target as Mixed).
+        headers_rel = target.public_headers_path or "include"
+        full_path = package.staged_dir / target_path / headers_rel
         if not full_path.is_dir():
             return None
         # Has at least one .h file (recursively).

@@ -2307,6 +2307,62 @@ def _selftest_find_objc_headers_dir_priority(tmp_root: Path) -> None:
             f"product_name priority broken: {found}")
 
 
+def _selftest_find_objc_headers_dir_defaults_to_include(tmp_root: Path) -> None:
+    """Regression: when `publicHeadersPath` is absent from Package.swift,
+    `_find_objc_headers_dir` must fall back to SPM's conventional "include"
+    subdirectory. Stripe restructured its Package.swift to drop the explicit
+    `publicHeadersPath` entries; without the fallback, header injection became
+    a silent no-op and the Mixed-framework verifier fired 'no public .h files'.
+    """
+    base = tmp_root / "headers_default_include"
+    staged = base / "staged"
+
+    fw_include = staged / "Sources" / "StripeCore" / "include"
+    fw_include.mkdir(parents=True)
+    (fw_include / "StripeCore.h").write_text("// umbrella")
+
+    raw_dump = {
+        "products": [
+            {
+                "name": "StripeCore",
+                "type": {"library": ["automatic"]},
+                "targets": ["StripeCore"],
+            }
+        ],
+        "targets": [
+            {
+                "name": "StripeCore",
+                "type": "regular",
+                "path": "Sources/StripeCore",
+                "publicHeadersPath": None,
+                "dependencies": [],
+            },
+        ],
+    }
+    package = Package(
+        name="StripeCore",
+        tools_version="5.7.0",
+        platforms=[],
+        products=[Product(name="StripeCore", linkage=Linkage.AUTOMATIC,
+                          targets=["StripeCore"])],
+        targets=[
+            Target(name="StripeCore", kind=TargetKind.REGULAR,
+                   path="Sources/StripeCore", public_headers_path=None,
+                   dependencies=[], exclude=[], language=Language.OBJC),
+        ],
+        schemes=[],
+        raw_dump=raw_dump,
+        staged_dir=staged,
+    )
+    found = _find_objc_headers_dir(package, product_name="StripeCore",
+                                    fw_name="StripeCore")
+    _assert(
+        found is not None and found.name == "include"
+        and found.parent.name == "StripeCore",
+        f"expected include/ fallback when publicHeadersPath is None, got {found!r}",
+    )
+
+
 def _selftest_find_objc_headers_dir_follows_target_edge(tmp_root: Path) -> None:
     """Regression for Codex [P1]: `_find_objc_headers_dir` must follow
     both `byName` and `target` dependency shapes. Uses the `target`
@@ -4711,6 +4767,8 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          lambda: _selftest_find_objc_headers_dir_priority(tmp_root), False),
         ("execute: ObjC headers dir follows .target() dep edge (P1)",
          lambda: _selftest_find_objc_headers_dir_follows_target_edge(tmp_root), False),
+        ("execute: ObjC headers dir defaults to include/ when publicHeadersPath omitted",
+         lambda: _selftest_find_objc_headers_dir_defaults_to_include(tmp_root), False),
         ("execute: detect_system_frameworks follows .target() dep edge (P1)",
          lambda: _selftest_detect_system_frameworks_follows_target_edge(tmp_root), False),
         ("execute: archive static lib path picks first sorted",
