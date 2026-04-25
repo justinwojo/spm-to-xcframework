@@ -33,12 +33,14 @@ from spm_to_xcframework import *  # noqa: F401,F403 — test convenience
 # Explicit imports of underscore-prefixed helpers the tests reach into.
 # `from spm_to_xcframework import *` skips these, so we name them here.
 from spm_to_xcframework import (  # noqa: F401
+    _apply_dedup_overlap_substitutions,
     _archive_framework_path,
     _archive_static_lib_path,
     _assert_no_unsupported_swift_constructs,
     _balanced_close,
     _BUG_CLASS_ERRORS,
     _check_binary_dynamic,
+    _compute_dedup_substitutions,
     _count_source_files,
     _default_target_path,
     _derive_package_label,
@@ -1404,6 +1406,1005 @@ def _selftest_edit_add_synthetic_library_empty_array() -> None:
     # `[]` was empty; after edit, products list should be a valid array.
     # Specifically the `[]` close bracket must still be present somewhere.
     _assert("]," in out and "products: [" in out, f"shape broken: {out}")
+
+
+# ---------------------------------------------------------------------------
+# Dedup-overlap helpers (compute_internal_target_deps, topo_order_units,
+# edit_replace_with_binary_target). These exist so umbrella products
+# don't statically embed sibling targets' Mach-O when those siblings
+# also ship as their own xcframeworks. See REWRITE_DESIGN.md §5.4.
+# ---------------------------------------------------------------------------
+
+
+def _stripe_dump_package(snapshot: dict = None) -> "tool.Package":
+    """Build a typed Package from STRIPE_DUMP_SNAPSHOT (or override) so
+    helper tests don't have to repeat the parse + Package() boilerplate.
+    """
+    snap = snapshot or STRIPE_DUMP_SNAPSHOT
+    raw, products, targets, platforms, name, tv = _parse_dump(snap)
+    return tool.Package(
+        name=name,
+        tools_version=tv,
+        platforms=platforms,
+        products=products,
+        targets=targets,
+        schemes=[],
+        raw_dump=raw,
+        staged_dir=Path("/tmp/dedup-overlap-fixture"),
+    )
+
+
+def _selftest_compute_internal_target_deps_stripe() -> None:
+    """Stripe's umbrella target reaches every sibling transitively;
+    StripeCore is a leaf; the binary target Stripe3DS2 has no internal
+    deps and isn't reached from anything (it's only mentioned as a
+    package-product dep in the real manifest, which we filter out)."""
+    pkg = _stripe_dump_package()
+    deps = tool.compute_internal_target_deps(pkg)
+    _assert(deps["StripeCore"] == set(),
+            f"StripeCore should be a leaf, got {deps['StripeCore']!r}")
+    _assert(deps["StripeUICore"] == {"StripeCore"},
+            f"StripeUICore deps should be {{StripeCore}}, got {deps['StripeUICore']!r}")
+    _assert(deps["StripePayments"] == {"StripeCore"},
+            f"StripePayments deps wrong, got {deps['StripePayments']!r}")
+    _assert(deps["Stripe"] == {"StripeCore", "StripePayments", "StripeApplePay"} or
+            deps["Stripe"] >= {"StripeCore", "StripePayments"},
+            f"Stripe deps wrong, got {deps['Stripe']!r}")
+    _assert(deps["Stripe3DS2"] == set(),
+            f"Stripe3DS2 should be a leaf, got {deps['Stripe3DS2']!r}")
+    # Self-edges must never appear.
+    for t, ds in deps.items():
+        _assert(t not in ds, f"{t} should not be in its own dep set: {ds!r}")
+
+
+def _selftest_compute_internal_target_deps_filters_external_products() -> None:
+    """`product` deps reference cross-package targets we can't reach.
+    They must be filtered out — only same-package target names survive
+    in the returned closures."""
+    snap = {
+        "name": "external-deps",
+        "toolsVersion": {"_version": "5.7.0"},
+        "platforms": [{"options": [], "platformName": "ios", "version": "13.0"}],
+        "products": [
+            {"name": "Foo", "type": {"library": ["automatic"]}, "targets": ["Foo"]},
+        ],
+        "targets": [
+            {"name": "Foo", "type": "regular", "path": "Foo", "publicHeadersPath": None,
+             "dependencies": [
+                 {"byName": ["Bar", None]},               # internal: kept
+                 {"product": ["Alamofire", "alamofire", None, None]},  # external: dropped
+             ]},
+            {"name": "Bar", "type": "regular", "path": "Bar", "publicHeadersPath": None,
+             "dependencies": []},
+        ],
+    }
+    pkg = _stripe_dump_package(snap)
+    deps = tool.compute_internal_target_deps(pkg)
+    _assert(deps["Foo"] == {"Bar"},
+            f"only Bar should be reachable, got {deps['Foo']!r}")
+
+
+def _selftest_compute_internal_target_deps_tolerates_cycle() -> None:
+    """A cycle in the dump-package payload must not infinite-loop —
+    the function returns a finite set per node, even if SPM would
+    reject the manifest at build time."""
+    snap = {
+        "name": "cycle",
+        "toolsVersion": {"_version": "5.7.0"},
+        "platforms": [{"options": [], "platformName": "ios", "version": "13.0"}],
+        "products": [],
+        "targets": [
+            {"name": "A", "type": "regular", "path": "A", "publicHeadersPath": None,
+             "dependencies": [{"byName": ["B", None]}]},
+            {"name": "B", "type": "regular", "path": "B", "publicHeadersPath": None,
+             "dependencies": [{"byName": ["A", None]}]},
+        ],
+    }
+    pkg = _stripe_dump_package(snap)
+    deps = tool.compute_internal_target_deps(pkg)
+    # Each node only sees the OTHER, not itself; cycle is broken cleanly.
+    _assert(deps["A"] == {"B"}, f"A deps {deps['A']!r}")
+    _assert(deps["B"] == {"A"}, f"B deps {deps['B']!r}")
+
+
+def _selftest_topo_order_units_stripe_umbrella_last() -> None:
+    """The whole point of the helper: Stripe (umbrella) MUST be ordered
+    after every sibling target it transitively depends on. The original
+    planner order may interleave; the topo sort must place leaves first
+    even if they appear later in the planner's emission order."""
+    pkg = _stripe_dump_package()
+    BU = tool.BuildUnit
+    # Original order: Stripe (umbrella) FIRST, the ones it depends on
+    # AFTER. The topo sort must re-order so leaves precede the umbrella.
+    units = [
+        BU(name="Stripe", scheme="Stripe", framework_name="Stripe",
+           language="Swift", archive_strategy="archive", source_targets=["Stripe"]),
+        BU(name="StripePayments", scheme="StripePayments",
+           framework_name="StripePayments", language="Swift",
+           archive_strategy="archive", source_targets=["StripePayments"]),
+        BU(name="StripeUICore", scheme="StripeUICore",
+           framework_name="StripeUICore", language="Swift",
+           archive_strategy="archive", source_targets=["StripeUICore"]),
+        BU(name="StripeCore", scheme="StripeCore",
+           framework_name="StripeCore", language="Swift",
+           archive_strategy="archive", source_targets=["StripeCore"]),
+        BU(name="StripePaymentSheet", scheme="StripePaymentSheet",
+           framework_name="StripePaymentSheet", language="Swift",
+           archive_strategy="archive", source_targets=["StripePaymentSheet"]),
+    ]
+    ordered = tool.topo_order_units(units, pkg)
+    names = [u.name for u in ordered]
+    _assert(set(names) == {u.name for u in units},
+            f"topo sort lost units: {names!r}")
+    # Every dep must come before Stripe / PaymentSheet (which depend on it).
+    idx = {n: i for i, n in enumerate(names)}
+    _assert(idx["StripeCore"] < idx["Stripe"],
+            f"StripeCore must precede Stripe: {names}")
+    _assert(idx["StripeCore"] < idx["StripePaymentSheet"],
+            f"StripeCore must precede StripePaymentSheet: {names}")
+    _assert(idx["StripeUICore"] < idx["StripePaymentSheet"],
+            f"StripeUICore must precede StripePaymentSheet: {names}")
+    _assert(idx["StripePayments"] < idx["Stripe"],
+            f"StripePayments must precede Stripe: {names}")
+    _assert(idx["StripePayments"] < idx["StripePaymentSheet"],
+            f"StripePayments must precede StripePaymentSheet: {names}")
+
+
+def _selftest_topo_order_units_stable_on_independent_units() -> None:
+    """Units with no internal-dep relation between them must keep their
+    planner-assigned order. The sort is stable on original index, not a
+    spurious alphabetic shuffle."""
+    snap = {
+        "name": "indep",
+        "toolsVersion": {"_version": "5.7.0"},
+        "platforms": [{"options": [], "platformName": "ios", "version": "13.0"}],
+        "products": [],
+        "targets": [
+            {"name": "Zebra", "type": "regular", "path": "Zebra",
+             "publicHeadersPath": None, "dependencies": []},
+            {"name": "Apple", "type": "regular", "path": "Apple",
+             "publicHeadersPath": None, "dependencies": []},
+            {"name": "Mango", "type": "regular", "path": "Mango",
+             "publicHeadersPath": None, "dependencies": []},
+        ],
+    }
+    pkg = _stripe_dump_package(snap)
+    BU = tool.BuildUnit
+    units = [
+        BU(name="Zebra", scheme="Zebra", framework_name="Zebra",
+           language="Swift", archive_strategy="archive", source_targets=["Zebra"]),
+        BU(name="Apple", scheme="Apple", framework_name="Apple",
+           language="Swift", archive_strategy="archive", source_targets=["Apple"]),
+        BU(name="Mango", scheme="Mango", framework_name="Mango",
+           language="Swift", archive_strategy="archive", source_targets=["Mango"]),
+    ]
+    ordered = [u.name for u in tool.topo_order_units(units, pkg)]
+    _assert(ordered == ["Zebra", "Apple", "Mango"],
+            f"stable order broken: {ordered!r}")
+
+
+def _selftest_find_target_call_for_name_skips_binary_target() -> None:
+    """`.binaryTarget(name: T, ...)` must NEVER be returned by the
+    target-call finder — it's not a target we can rewrite, and the
+    idempotency contract of edit_replace_with_binary_target depends on
+    this distinction."""
+    text = '''
+let package = Package(
+    name: "x",
+    targets: [
+        .binaryTarget(name: "Foo", path: "Foo.xcframework"),
+        .target(name: "Bar", path: "Bar"),
+    ]
+)
+'''
+    # Foo only exists as a binaryTarget — the finder must miss it.
+    ks, ce, kind = tool._find_target_call_for_name(text, "Foo")
+    _assert(ks == -1 and ce == -1 and kind == "",
+            f"binaryTarget should not match _find_target_call_for_name, "
+            f"got ({ks}, {ce}, {kind!r})")
+    # Bar is a real .target — finder picks it up.
+    ks2, ce2, kind2 = tool._find_target_call_for_name(text, "Bar")
+    _assert(ks2 != -1 and kind2 == "target",
+            f"Bar (.target) should match, got ({ks2}, {ce2}, {kind2!r})")
+
+
+def _selftest_edit_replace_with_binary_target_basic() -> None:
+    """Stripe-shape: rewrite the StripeCore target to a binaryTarget
+    pointing at a freshly-built xcframework. The other targets and the
+    products array are left untouched."""
+    text = STRIPE_PACKAGE_SWIFT_FIXTURE
+    out = edit_replace_with_binary_target(
+        text, "StripeCore", "/build/StripeCore.xcframework"
+    )
+    # New binaryTarget present.
+    _assert(
+        '.binaryTarget(name: "StripeCore", path: "/build/StripeCore.xcframework")' in out,
+        f"binaryTarget for StripeCore missing in:\n{out}",
+    )
+    # Original .target(name: "StripeCore", ...) is gone.
+    # (Other StripeCore mentions — as a string in a deps list — must remain.)
+    _assert(".target(\n            name: \"StripeCore\"" not in out,
+            "old .target(name: StripeCore, ...) block was not removed")
+    # Sibling targets that mention StripeCore as a dep are still present.
+    _assert(
+        '.target(\n            name: "StripePayments",\n            dependencies: ["StripeCore"]' in out,
+        "StripePayments target should still reference StripeCore in deps",
+    )
+
+
+def _selftest_edit_replace_with_binary_target_idempotent() -> None:
+    """Running the editor twice on the same target name must be a
+    no-op the second time (the manifest already has a binaryTarget
+    with that name)."""
+    text = STRIPE_PACKAGE_SWIFT_FIXTURE
+    once = edit_replace_with_binary_target(text, "StripeCore", "/X.xcframework")
+    twice = edit_replace_with_binary_target(once, "StripeCore", "/X.xcframework")
+    _assert(once == twice, "second edit was not a no-op")
+
+
+def _selftest_edit_replace_with_binary_target_path_escaping() -> None:
+    """Paths containing characters that are syntactically meaningful
+    inside a Swift string literal (backslash, double-quote) must be
+    escaped — otherwise the resulting Package.swift won't parse."""
+    text = '''let p = Package(
+    name: "x",
+    targets: [.target(name: "T", path: "T")]
+)
+'''
+    nasty = '/tmp/with"quote"/and\\backslash/T.xcframework'
+    out = edit_replace_with_binary_target(text, "T", nasty)
+    # The literal must contain escaped \" and escaped backslash.
+    expected = (
+        r'.binaryTarget(name: "T", path: "/tmp/with\"quote\"/and\\backslash/T.xcframework")'
+    )
+    _assert(expected in out,
+            f"path escaping failed.\nWanted substring: {expected!r}\nGot:\n{out}")
+
+
+def _selftest_edit_replace_with_binary_target_multiline() -> None:
+    """`.target(...)` declarations span multiple lines in real
+    manifests. The editor must consume the whole multi-line span (up to
+    the matching `)`) and not accidentally leave a trailing fragment."""
+    text = STRIPE_PACKAGE_SWIFT_FIXTURE
+    out = edit_replace_with_binary_target(
+        text, "StripePayments", "/build/StripePayments.xcframework"
+    )
+    # No leftover fragments of the old .target body.
+    _assert("dependencies: [\"StripeCore\"]," not in out
+            or out.count("dependencies: [\"StripeCore\"]") < text.count("dependencies: [\"StripeCore\"]"),
+            "multi-line .target body fragment leaked into output")
+    _assert(
+        '.binaryTarget(name: "StripePayments", path: "/build/StripePayments.xcframework")' in out,
+        "binaryTarget for StripePayments missing",
+    )
+    # The .target call we replaced is no longer present.
+    _assert(".target(\n            name: \"StripePayments\"" not in out,
+            "old multi-line .target(name: StripePayments, ...) was not removed cleanly")
+
+
+def _selftest_edit_replace_with_binary_target_unknown_raises() -> None:
+    """Asking the editor to substitute a target that's not declared
+    anywhere (and isn't already a binaryTarget) must raise — the call
+    site is acting on stale planner data and we want a loud failure."""
+    text = STRIPE_PACKAGE_SWIFT_FIXTURE
+    raised = False
+    try:
+        edit_replace_with_binary_target(text, "DoesNotExist", "/X.xcframework")
+    except PrepareUserError:
+        raised = True
+    _assert(raised, "expected PrepareUserError for unknown target")
+
+
+def _selftest_find_target_call_for_name_ignores_dependency_target_refs() -> None:
+    """[Codex P1 regression] A target whose `dependencies:` array uses
+    explicit `.target(name: "Foo")` syntax must NOT cause the finder
+    to match the OUTER target's `.target(...)` call when searching
+    for "Foo". The depth-0 `name:` check ensures only the outer
+    target's own argument list is considered.
+    """
+    src = '''// swift-tools-version:5.7
+import PackageDescription
+
+let p = Package(
+    name: "x",
+    targets: [
+        .target(
+            name: "A",
+            dependencies: [.target(name: "Foo")],
+            path: "A"
+        ),
+        .target(
+            name: "Foo",
+            path: "Foo"
+        ),
+    ]
+)
+'''
+    ks, ce, kind = tool._find_target_call_for_name(src, "Foo")
+    located = src[ks:ce + 1]
+    _assert(kind == "target", f"kind was {kind!r}")
+    # The located call MUST be Foo's declaration (which has path: "Foo"),
+    # NOT A's declaration (which has dependencies: [.target(...)]).
+    _assert('name: "Foo"' in located,
+            f"located span missing name: \"Foo\":\n{located}")
+    _assert('path: "Foo"' in located,
+            f"located span missing path: \"Foo\":\n{located}")
+    _assert('name: "A"' not in located,
+            f"located span wrongly includes A's declaration:\n{located}")
+    _assert("dependencies:" not in located,
+            f"located span wrongly includes dependencies block:\n{located}")
+
+
+def _selftest_edit_replace_with_binary_target_dep_ref_does_not_clobber_sibling() -> None:
+    """[Codex P1 regression — end-to-end] Substituting Foo in a
+    manifest where target A depends on Foo via the explicit
+    `.target(name: "Foo")` expression must rewrite ONLY the Foo
+    declaration. A's declaration must remain intact, including its
+    dependency reference to Foo."""
+    src = '''// swift-tools-version:5.7
+import PackageDescription
+
+let p = Package(
+    name: "x",
+    targets: [
+        .target(
+            name: "A",
+            dependencies: [.target(name: "Foo")],
+            path: "A"
+        ),
+        .target(
+            name: "Foo",
+            path: "Foo"
+        ),
+    ]
+)
+'''
+    out = edit_replace_with_binary_target(src, "Foo", "/build/Foo.xcframework")
+    # Foo became a binaryTarget.
+    _assert('.binaryTarget(name: "Foo", path: "/build/Foo.xcframework")' in out,
+            f"binaryTarget for Foo missing:\n{out}")
+    # A's outer declaration is preserved verbatim.
+    _assert('.target(\n            name: "A",\n            dependencies: '
+            '[.target(name: "Foo")],\n            path: "A"\n        )' in out,
+            f"A's declaration was clobbered or modified:\n{out}")
+    # The OLD `.target(...)` block for Foo (which had `path: "Foo"`) is gone.
+    _assert('.target(\n            name: "Foo",\n            path: "Foo"\n'
+            '        )' not in out,
+            f"old Foo .target() block was not removed:\n{out}")
+    # Idempotent across the false-positive hazard too.
+    twice = edit_replace_with_binary_target(out, "Foo", "/build/Foo.xcframework")
+    _assert(out == twice,
+            "second edit through dep-ref manifest was not a no-op")
+
+
+def _selftest_find_target_call_for_name_ignores_commented_calls() -> None:
+    """[Codex P2 round 2 regression] A `.target(name: "Foo", ...)` that
+    appears INSIDE a `//` line comment or `/* */` block comment must
+    NOT be matched as a candidate. Without this gate, a commented-out
+    decl that precedes the real one would be the first hit, the
+    rewrite would land inside the comment, and the second pass would
+    raise BOTH-shapes-present (since the commented `.binaryTarget` it
+    just synthesized is still visible).
+    """
+    # Line-comment + real-target shape.
+    src_line = '''// swift-tools-version:5.7
+import PackageDescription
+
+let p = Package(
+    name: "x",
+    targets: [
+        // .target(name: "Foo", path: "OldFoo"),
+        .target(
+            name: "Foo",
+            path: "Foo"
+        ),
+    ]
+)
+'''
+    ks, ce, kind = tool._find_target_call_for_name(src_line, "Foo")
+    located = src_line[ks:ce + 1]
+    _assert(kind == "target", f"line-comment kind: {kind!r}")
+    _assert('path: "Foo"' in located,
+            f"line-comment finder picked the wrong span:\n{located}")
+    _assert('path: "OldFoo"' not in located,
+            f"line-comment finder matched the commented decl:\n{located}")
+
+    # Block-comment + real-target shape (with nested comment to ensure
+    # depth tracking).
+    src_block = '''// swift-tools-version:5.7
+import PackageDescription
+
+let p = Package(
+    name: "x",
+    targets: [
+        /* legacy:
+           .target(name: "Foo", path: "OldFoo"),
+           /* nested note */
+        */
+        .target(
+            name: "Foo",
+            path: "RealFoo"
+        ),
+    ]
+)
+'''
+    ks2, ce2, kind2 = tool._find_target_call_for_name(src_block, "Foo")
+    located2 = src_block[ks2:ce2 + 1]
+    _assert(kind2 == "target", f"block-comment kind: {kind2!r}")
+    _assert('path: "RealFoo"' in located2,
+            f"block-comment finder picked the wrong span:\n{located2}")
+    _assert('path: "OldFoo"' not in located2,
+            f"block-comment finder matched the commented decl:\n{located2}")
+
+
+def _selftest_has_binary_target_ignores_commented_calls() -> None:
+    """[Codex P2 round 2 regression] `_has_binary_target_with_name`
+    must skip `.binaryTarget(...)` calls that live inside `//` or
+    `/* */` comments. Without this gate, after the dedup edit lands
+    on the right target, a re-run would see the commented
+    `.binaryTarget` it never wrote and incorrectly report BOTH-shapes
+    state.
+    """
+    src_line_no = '''// swift-tools-version:5.7
+let p = Package(
+    name: "x",
+    targets: [
+        // .binaryTarget(name: "Foo", path: "/old/Foo.xcframework"),
+        .target(name: "Foo", path: "Foo"),
+    ]
+)
+'''
+    _assert(tool._has_binary_target_with_name(src_line_no, "Foo") is False,
+            "commented-out .binaryTarget must NOT count")
+
+    src_block_no = '''// swift-tools-version:5.7
+let p = Package(
+    name: "x",
+    targets: [
+        /* .binaryTarget(name: "Foo", path: "/old/Foo.xcframework"), */
+        .target(name: "Foo", path: "Foo"),
+    ]
+)
+'''
+    _assert(tool._has_binary_target_with_name(src_block_no, "Foo") is False,
+            "block-commented .binaryTarget must NOT count")
+
+    # Sanity: a real .binaryTarget is still detected.
+    src_real = '''// swift-tools-version:5.7
+let p = Package(
+    name: "x",
+    targets: [
+        .binaryTarget(name: "Foo", path: "/build/Foo.xcframework"),
+    ]
+)
+'''
+    _assert(tool._has_binary_target_with_name(src_real, "Foo") is True,
+            "real .binaryTarget must be detected")
+
+
+def _selftest_edit_replace_with_binary_target_skips_commented_decl() -> None:
+    """[Codex P2 round 2 regression — end-to-end] When a manifest has
+    a commented-out `.target(name: "Foo", ...)` before the real one,
+    `edit_replace_with_binary_target` must rewrite the real target
+    and leave the comment text byte-identical. A second call must
+    then be a true no-op — not raise BOTH-shapes."""
+    src = '''// swift-tools-version:5.7
+import PackageDescription
+
+let p = Package(
+    name: "x",
+    targets: [
+        // .target(name: "Foo", path: "OldFoo"),
+        /* .binaryTarget(name: "Foo", path: "/legacy/Foo.xcframework"), */
+        .target(
+            name: "Foo",
+            path: "RealFoo"
+        ),
+    ]
+)
+'''
+    out = edit_replace_with_binary_target(src, "Foo", "/build/Foo.xcframework")
+
+    # The real target is now a binaryTarget pointing at the new path.
+    _assert('.binaryTarget(name: "Foo", path: "/build/Foo.xcframework")' in out,
+            f"real target was not rewritten to .binaryTarget:\n{out}")
+    # The commented-out lines are byte-preserved.
+    _assert('// .target(name: "Foo", path: "OldFoo"),' in out,
+            f"line comment was modified:\n{out}")
+    _assert('/* .binaryTarget(name: "Foo", path: "/legacy/Foo.xcframework"), */' in out,
+            f"block comment was modified:\n{out}")
+    # The OLD `.target(...)` block for the real Foo (which had `path: "RealFoo"`) is gone.
+    _assert('.target(\n            name: "Foo",\n            path: "RealFoo"\n'
+            '        )' not in out,
+            f"old real Foo .target() block was not removed:\n{out}")
+
+    # Second call: must be a true no-op, not a BOTH-shapes error.
+    twice = edit_replace_with_binary_target(out, "Foo", "/build/Foo.xcframework")
+    _assert(twice == out,
+            "second edit through commented-decl manifest was not a no-op")
+
+
+def _selftest_find_target_call_for_name_ignores_string_literals() -> None:
+    """[Codex P2 round 3 regression] A `.target(name: "Foo", ...)`
+    mention that lives INSIDE a Swift `"..."` string literal must
+    NOT be matched as a candidate. Without this gate, candidate
+    discovery would stop on the string, fail to find a matching
+    top-level `name:` (the string body's `name:` sits inside escaped
+    quotes, so depth-0 stripping wipes the inner content but the
+    outer non-call context still doesn't have `name: "Foo"`), and
+    the finder would walk past — but in shapes where the in-string
+    `.target(` happens to be balanced over a fragment that DOES
+    look like `name: "Foo"` at depth 0 of the synthetic span,
+    the function would either match the wrong span or raise on a
+    malformed `)` lookup.
+    """
+    src = '''// swift-tools-version:5.7
+import PackageDescription
+
+let note = ".target(name: \\"Foo\\", path: \\"OldFoo\\")"
+
+let p = Package(
+    name: "x",
+    targets: [
+        .target(
+            name: "Foo",
+            path: "RealFoo"
+        ),
+    ]
+)
+'''
+    ks, ce, kind = tool._find_target_call_for_name(src, "Foo")
+    located = src[ks:ce + 1]
+    _assert(kind == "target", f"string-literal kind: {kind!r}")
+    _assert('path: "RealFoo"' in located,
+            f"string-literal finder picked the wrong span:\n{located}")
+    _assert('path: "OldFoo"' not in located,
+            f"string-literal finder matched the in-string decl:\n{located}")
+
+
+def _selftest_has_binary_target_ignores_string_literals() -> None:
+    """[Codex P2 round 3 regression] `.binaryTarget(name: "Foo", ...)`
+    text inside a `"..."` string literal must not register as a real
+    binary target.
+    """
+    src = '''// swift-tools-version:5.7
+let example = ".binaryTarget(name: \\"Foo\\", path: \\"/old/Foo.xcframework\\")"
+let p = Package(
+    name: "x",
+    targets: [
+        .target(name: "Foo", path: "Foo"),
+    ]
+)
+'''
+    _assert(tool._has_binary_target_with_name(src, "Foo") is False,
+            "in-string .binaryTarget must NOT count as present")
+
+
+def _selftest_edit_replace_with_binary_target_skips_string_literal() -> None:
+    """[Codex P2 round 3 regression — end-to-end] When a manifest
+    declares a string literal containing `.target(name: "Foo", ...)`
+    text BEFORE the real target decl, `edit_replace_with_binary_target`
+    must rewrite ONLY the real target. The string literal is
+    preserved byte-identically, no spurious PrepareUserError is
+    raised, and the second call is a true no-op.
+    """
+    src = '''// swift-tools-version:5.7
+import PackageDescription
+
+// Documentation example users may copy-paste into their own packages.
+let example = ".target(name: \\"Foo\\", path: \\"OldFoo\\")"
+
+let p = Package(
+    name: "x",
+    targets: [
+        .target(
+            name: "Foo",
+            path: "RealFoo"
+        ),
+    ]
+)
+'''
+    out = edit_replace_with_binary_target(src, "Foo", "/build/Foo.xcframework")
+
+    _assert('.binaryTarget(name: "Foo", path: "/build/Foo.xcframework")' in out,
+            f"real target was not rewritten to .binaryTarget:\n{out}")
+    # The documentation string literal stays byte-identical.
+    _assert('let example = ".target(name: \\"Foo\\", path: \\"OldFoo\\")"' in out,
+            f"docstring literal was modified:\n{out}")
+    # The OLD .target() block for the real Foo is gone.
+    _assert('.target(\n            name: "Foo",\n            path: "RealFoo"\n'
+            '        )' not in out,
+            f"old real Foo .target() block was not removed:\n{out}")
+
+    # Idempotent.
+    twice = edit_replace_with_binary_target(out, "Foo", "/build/Foo.xcframework")
+    _assert(twice == out,
+            "second edit through string-literal manifest was not a no-op")
+
+
+def _selftest_compute_dedup_substitutions_single_target_sibling() -> None:
+    """[Codex P2 r5 regression — happy path] Sibling unit with
+    `source_targets == [dep_t]` IS substituted: the xcframework was
+    built as that single module, so re-pointing `.target(name: T)` at
+    it is a 1:1 swap. This is the Stripe shape (each sub-product is
+    a single-target library).
+    """
+    BU = tool.BuildUnit
+    sibling = BU(name="StripeCore", scheme="StripeCore",
+                 framework_name="StripeCore", language="Swift",
+                 archive_strategy="archive", source_targets=["StripeCore"])
+    umbrella = BU(name="Stripe", scheme="Stripe",
+                  framework_name="Stripe", language="Swift",
+                  archive_strategy="archive", source_targets=["Stripe"])
+    target_to_unit = {"StripeCore": sibling, "Stripe": umbrella}
+    sibling_xcf = Path("/build/StripeCore.xcframework")
+    built = {"StripeCore": tool.ExecutedUnit(
+        name="StripeCore", xcframework_path=sibling_xcf,
+        framework_name="StripeCore",
+    )}
+    deps = {"Stripe": {"StripeCore"}, "StripeCore": set()}
+
+    subs = _compute_dedup_substitutions(
+        unit=umbrella,
+        target_to_unit=target_to_unit,
+        built_by_unit=built,
+        target_deps=deps,
+    )
+    _assert(subs == [("StripeCore", sibling_xcf)],
+            f"expected [('StripeCore', {sibling_xcf})], got {subs!r}")
+
+
+def _selftest_compute_dedup_substitutions_multi_target_sibling_skipped() -> None:
+    """[Codex P2 r5 regression — the bug] Sibling unit owns MULTIPLE
+    source targets (`.library(name: "Kit", targets: ["A", "B"])`).
+    Its single emitted `Kit.xcframework` is not a clean 1:1
+    stand-in for either A or B — the binary's contained module is
+    the product, not the individual target — so substitution must
+    be skipped. The consumer falls back to legacy behavior (SPM
+    statically embeds A's symbols into the umbrella).
+    """
+    BU = tool.BuildUnit
+    sibling = BU(name="Kit", scheme="Kit",
+                 framework_name="Kit", language="Swift",
+                 archive_strategy="archive", source_targets=["A", "B"])
+    consumer = BU(name="Umbrella", scheme="Umbrella",
+                  framework_name="Umbrella", language="Swift",
+                  archive_strategy="archive", source_targets=["Z"])
+    target_to_unit = {"A": sibling, "B": sibling, "Z": consumer}
+    built = {"Kit": tool.ExecutedUnit(
+        name="Kit", xcframework_path=Path("/build/Kit.xcframework"),
+        framework_name="Kit",
+    )}
+    deps = {"Z": {"A"}, "A": set(), "B": set()}
+
+    subs = _compute_dedup_substitutions(
+        unit=consumer,
+        target_to_unit=target_to_unit,
+        built_by_unit=built,
+        target_deps=deps,
+    )
+    _assert(subs == [],
+            f"multi-target sibling must not be substituted, got {subs!r}")
+
+
+def _selftest_compute_dedup_substitutions_aliased_single_target() -> None:
+    """[Codex P2 r5 follow-up] Sibling unit's `name` differs from its
+    single source_target (e.g. `.library(name: "Aliased", targets:
+    ["A"])`). The 1:1 invariant is `source_targets == [dep_t]`, NOT
+    name equality — substitution must still happen. The xcframework
+    file is `Aliased.xcframework` whose contained framework binary
+    holds the `A` module, and SPM resolves
+    `.binaryTarget(name: "A", path: "Aliased.xcframework")` by
+    reading the xcframework metadata.
+    """
+    BU = tool.BuildUnit
+    sibling = BU(name="Aliased", scheme="Aliased",
+                 framework_name="Aliased", language="Swift",
+                 archive_strategy="archive", source_targets=["A"])
+    consumer = BU(name="Umbrella", scheme="Umbrella",
+                  framework_name="Umbrella", language="Swift",
+                  archive_strategy="archive", source_targets=["Z"])
+    target_to_unit = {"A": sibling, "Z": consumer}
+    aliased_xcf = Path("/build/Aliased.xcframework")
+    built = {"Aliased": tool.ExecutedUnit(
+        name="Aliased", xcframework_path=aliased_xcf,
+        framework_name="Aliased",
+    )}
+    deps = {"Z": {"A"}, "A": set()}
+
+    subs = _compute_dedup_substitutions(
+        unit=consumer,
+        target_to_unit=target_to_unit,
+        built_by_unit=built,
+        target_deps=deps,
+    )
+    _assert(subs == [("A", aliased_xcf)],
+            f"aliased single-target sibling must substitute, got {subs!r}")
+
+
+def _selftest_compute_dedup_substitutions_unbuilt_sibling_skipped() -> None:
+    """[Codex P2 r5 follow-up] Sibling unit is registered in
+    `target_to_unit` but hasn't run yet (`built_by_unit` lookup
+    misses). Substitution must be skipped — without an xcframework
+    path on disk, there's nothing to point `.binaryTarget` at.
+    """
+    BU = tool.BuildUnit
+    sibling = BU(name="StripeCore", scheme="StripeCore",
+                 framework_name="StripeCore", language="Swift",
+                 archive_strategy="archive", source_targets=["StripeCore"])
+    consumer = BU(name="Stripe", scheme="Stripe",
+                  framework_name="Stripe", language="Swift",
+                  archive_strategy="archive", source_targets=["Stripe"])
+    target_to_unit = {"StripeCore": sibling, "Stripe": consumer}
+    built: Dict[str, tool.ExecutedUnit] = {}  # nothing built yet
+    deps = {"Stripe": {"StripeCore"}, "StripeCore": set()}
+
+    subs = _compute_dedup_substitutions(
+        unit=consumer,
+        target_to_unit=target_to_unit,
+        built_by_unit=built,
+        target_deps=deps,
+    )
+    _assert(subs == [],
+            f"unbuilt sibling must not be substituted, got {subs!r}")
+
+
+def _selftest_compute_dedup_substitutions_mixes_single_and_multi() -> None:
+    """[Codex P2 r5 follow-up] When a consumer transitively depends on
+    BOTH a single-target sibling (substitutable) AND a multi-target
+    sibling (not substitutable), only the single-target dep is
+    rewritten — the multi-target one is left alone for legacy
+    static-embed fallback.
+    """
+    BU = tool.BuildUnit
+    core = BU(name="Core", scheme="Core",
+              framework_name="Core", language="Swift",
+              archive_strategy="archive", source_targets=["Core"])
+    kit = BU(name="Kit", scheme="Kit",
+             framework_name="Kit", language="Swift",
+             archive_strategy="archive", source_targets=["A", "B"])
+    consumer = BU(name="Umbrella", scheme="Umbrella",
+                  framework_name="Umbrella", language="Swift",
+                  archive_strategy="archive", source_targets=["Z"])
+    target_to_unit = {
+        "Core": core, "A": kit, "B": kit, "Z": consumer,
+    }
+    core_xcf = Path("/build/Core.xcframework")
+    kit_xcf = Path("/build/Kit.xcframework")
+    built = {
+        "Core": tool.ExecutedUnit(
+            name="Core", xcframework_path=core_xcf, framework_name="Core",
+        ),
+        "Kit": tool.ExecutedUnit(
+            name="Kit", xcframework_path=kit_xcf, framework_name="Kit",
+        ),
+    }
+    deps = {
+        "Z": {"Core", "A"},
+        "Core": set(), "A": set(), "B": set(),
+    }
+
+    subs = _compute_dedup_substitutions(
+        unit=consumer,
+        target_to_unit=target_to_unit,
+        built_by_unit=built,
+        target_deps=deps,
+    )
+    # Sorted dep walk visits 'A' (multi-target sibling — skip) then 'Core' (substitute).
+    _assert(subs == [("Core", core_xcf)],
+            f"mix should yield only Core substitution, got {subs!r}")
+
+
+def _selftest_apply_dedup_overlap_substitutions_guards_unsupported_constructs(tmp_root: Path) -> None:
+    """[Codex P2 round 4 regression] When `prepare()` takes its no-op
+    path (no `package_swift_edits`), `apply_package_swift_edits` is
+    skipped — and with it the
+    `_assert_no_unsupported_swift_constructs` guard. Execute-time
+    dedup substitutions must therefore re-assert the guard themselves;
+    otherwise a manifest containing a triple-quoted string, `#"..."#`
+    raw string, or `\\(...)` interpolation that happens to mention
+    `.target(name: "Foo", ...)` would be silently mis-parsed by
+    `_make_code_token_view` (which only tracks `"..."` strings) and
+    the dedup edit would land inside the string body.
+
+    Three fixtures: triple-quoted string, raw string, and
+    interpolation. Each must raise ExecuteError before any disk write
+    happens.
+    """
+    base = tmp_root / "p2_r4_dedup_guard"
+    base.mkdir(parents=True, exist_ok=True)
+
+    fixtures = [
+        # Triple-quoted string carrying example .target text.
+        ('triple_quoted', '''// swift-tools-version:5.7
+import PackageDescription
+
+let docs = """
+.target(name: "Foo", path: "OldFoo")
+"""
+
+let p = Package(
+    name: "x",
+    targets: [
+        .target(
+            name: "Foo",
+            path: "RealFoo"
+        ),
+    ]
+)
+'''),
+        # Raw string with the same payload.
+        ('raw_string', '''// swift-tools-version:5.7
+import PackageDescription
+
+let docs = #".target(name: "Foo", path: "OldFoo")"#
+
+let p = Package(
+    name: "x",
+    targets: [
+        .target(
+            name: "Foo",
+            path: "RealFoo"
+        ),
+    ]
+)
+'''),
+        # String interpolation in plausibly-legal manifest code.
+        ('interpolation', '''// swift-tools-version:5.7
+import PackageDescription
+
+let suffix = "Foo"
+let docs = ".target(name: \\(suffix), path: \\"OldFoo\\")"
+
+let p = Package(
+    name: "x",
+    targets: [
+        .target(
+            name: "Foo",
+            path: "RealFoo"
+        ),
+    ]
+)
+'''),
+    ]
+
+    for slug, src in fixtures:
+        staged = base / slug
+        staged.mkdir(parents=True, exist_ok=True)
+        manifest = staged / "Package.swift"
+        manifest.write_text(src)
+        original_bytes = manifest.read_bytes()
+        try:
+            _apply_dedup_overlap_substitutions(
+                staged_dir=staged,
+                substitutions=[("Foo", Path("/build/Foo.xcframework"))],
+                unit_name="UnitX",
+                verbose=False,
+            )
+            _assert(False,
+                    f"[{slug}] expected ExecuteError; manifest was rewritten:\n"
+                    f"{manifest.read_text()}")
+        except tool.ExecuteError as exc:
+            msg = str(exc)
+            _assert("dedup-overlap" in msg,
+                    f"[{slug}] error message missing dedup context: {msg!r}")
+            _assert(
+                "Swift" in msg or "interpolation" in msg
+                or "raw string" in msg or "triple-quoted" in msg,
+                f"[{slug}] error message doesn't name the Swift construct: {msg!r}",
+            )
+            _assert("--no-dedup-overlap" in msg,
+                    f"[{slug}] error message missing escape hatch hint: {msg!r}")
+        # Manifest on disk must be byte-identical to the original.
+        _assert(manifest.read_bytes() == original_bytes,
+                f"[{slug}] manifest was mutated despite the guard:\n"
+                f"{manifest.read_text()}")
+
+
+def _selftest_make_code_token_view_blanks_strings_and_comments() -> None:
+    """[Codex P2 round 3] Direct unit on `_make_code_token_view`:
+    comment bodies AND string-literal spans (delimiters + body) are
+    blanked into spaces, newlines are preserved, and length matches
+    the input exactly so callers can index back into the original
+    text using offsets discovered in the view.
+    """
+    src = (
+        'let a = "hello"\n'
+        '// .target(name: "X")\n'
+        '/* .binaryTarget(name: "Y") */\n'
+        '.target(name: "Real", path: "p")\n'
+    )
+    view = tool._make_code_token_view(src)
+    _assert(len(view) == len(src),
+            f"length mismatch: src={len(src)} view={len(view)}")
+    # Newlines preserved.
+    _assert(view.count("\n") == src.count("\n"),
+            "newline count differs")
+    # Strings fully blanked (no `hello` in view).
+    _assert("hello" not in view, f"string body leaked into view:\n{view!r}")
+    # Comment bodies fully blanked (no in-comment .target text).
+    _assert(".target(name: \"X\")" not in view,
+            f"line-comment leaked into view:\n{view!r}")
+    _assert(".binaryTarget(name: \"Y\")" not in view,
+            f"block-comment leaked into view:\n{view!r}")
+    # Real `.target(` token IS visible at depth-0 of the view (the
+    # blanked-string view keeps the call's leading `.target(` intact;
+    # only the `"Real"` and `"p"` argument bodies are blanked).
+    _assert(".target(name:" in view,
+            f"real call leading token missing from view:\n{view!r}")
+    # Sanity: offsets line up — the index where `.target(name:` appears
+    # in the view points at the same `.target(` substring in src.
+    idx = view.find(".target(name:")
+    _assert(idx >= 0 and src[idx:].startswith(".target(name:"),
+            f"offsets diverged between view and src at idx={idx}")
+
+
+def _selftest_compute_internal_target_deps_external_product_collision() -> None:
+    """[Codex P2 regression] When a target depends on an EXTERNAL
+    `.product("Foo", "external-pkg")` and the same package also
+    declares an internal target named Foo, the `product` edge must
+    NOT be reclassified as an internal sibling dep. Only `byName` and
+    `target` shapes — the dump-package payload's true internal-edge
+    encodings — count toward `compute_internal_target_deps`.
+    """
+    snap = {
+        "name": "collide",
+        "toolsVersion": {"_version": "5.7.0"},
+        "platforms": [{"options": [], "platformName": "ios", "version": "13.0"}],
+        "products": [],
+        "targets": [
+            # Sibling target also named Foo. The dep walker MUST NOT
+            # connect A to this Foo via the external-product edge.
+            {"name": "Foo", "type": "regular", "path": "Foo",
+             "publicHeadersPath": None, "dependencies": []},
+            # A only depends on the EXTERNAL product also named Foo.
+            {"name": "A", "type": "regular", "path": "A",
+             "publicHeadersPath": None,
+             "dependencies": [
+                 {"product": ["Foo", "external-pkg", None, None]},
+             ]},
+        ],
+    }
+    pkg = _stripe_dump_package(snap)
+    deps = tool.compute_internal_target_deps(pkg)
+    _assert(deps["A"] == set(),
+            f"A must have no internal deps (only external product), "
+            f"got {deps['A']!r}")
+    _assert(deps["Foo"] == set(),
+            f"Foo is a leaf, got {deps['Foo']!r}")
+
+
+def _selftest_compute_internal_target_deps_mixed_internal_and_external() -> None:
+    """[Codex P2 follow-up] With BOTH a real internal `byName` edge
+    AND an external `product` edge sharing the same name, only the
+    internal edge survives. Verifies the walker walks raw shapes and
+    de-duplicates correctly."""
+    snap = {
+        "name": "mixed",
+        "toolsVersion": {"_version": "5.7.0"},
+        "platforms": [{"options": [], "platformName": "ios", "version": "13.0"}],
+        "products": [],
+        "targets": [
+            {"name": "Bar", "type": "regular", "path": "Bar",
+             "publicHeadersPath": None, "dependencies": []},
+            {"name": "Foo", "type": "regular", "path": "Foo",
+             "publicHeadersPath": None, "dependencies": []},
+            {"name": "A", "type": "regular", "path": "A",
+             "publicHeadersPath": None,
+             "dependencies": [
+                 {"byName": ["Foo", None]},                                     # internal
+                 {"product": ["Bar", "external-pkg", None, None]},              # external
+                 {"product": ["Foo", "external-pkg", None, None]},              # external collision
+                 {"target": ["Foo", None]},                                     # internal duplicate
+             ]},
+        ],
+    }
+    pkg = _stripe_dump_package(snap)
+    deps = tool.compute_internal_target_deps(pkg)
+    _assert(deps["A"] == {"Foo"},
+            f"A should depend ONLY on internal Foo, got {deps['A']!r}")
+    _assert("Bar" not in deps["A"],
+            f"external Bar should not appear in A's deps, got {deps['A']!r}")
 
 
 def _selftest_parse_xcresult_build_results() -> None:
@@ -5303,6 +6304,62 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          _selftest_edit_add_synthetic_library_with_trailing_comma, False),
         ("edit_add_synthetic_library empty products array",
          _selftest_edit_add_synthetic_library_empty_array, False),
+        ("dedup-overlap: compute_internal_target_deps Stripe transitive closure",
+         _selftest_compute_internal_target_deps_stripe, False),
+        ("dedup-overlap: compute_internal_target_deps filters external products",
+         _selftest_compute_internal_target_deps_filters_external_products, False),
+        ("dedup-overlap: compute_internal_target_deps tolerates cycle",
+         _selftest_compute_internal_target_deps_tolerates_cycle, False),
+        ("dedup-overlap: topo_order_units Stripe umbrella last",
+         _selftest_topo_order_units_stripe_umbrella_last, False),
+        ("dedup-overlap: topo_order_units stable on independent units",
+         _selftest_topo_order_units_stable_on_independent_units, False),
+        ("dedup-overlap: _find_target_call_for_name skips .binaryTarget",
+         _selftest_find_target_call_for_name_skips_binary_target, False),
+        ("dedup-overlap: edit_replace_with_binary_target basic Stripe rewrite",
+         _selftest_edit_replace_with_binary_target_basic, False),
+        ("dedup-overlap: edit_replace_with_binary_target idempotent",
+         _selftest_edit_replace_with_binary_target_idempotent, False),
+        ("dedup-overlap: edit_replace_with_binary_target path escaping",
+         _selftest_edit_replace_with_binary_target_path_escaping, False),
+        ("dedup-overlap: edit_replace_with_binary_target multi-line .target body",
+         _selftest_edit_replace_with_binary_target_multiline, False),
+        ("dedup-overlap: edit_replace_with_binary_target unknown target raises",
+         _selftest_edit_replace_with_binary_target_unknown_raises, False),
+        ("dedup-overlap [Codex P1]: _find_target_call_for_name ignores .target(name:) inside dependencies",
+         _selftest_find_target_call_for_name_ignores_dependency_target_refs, False),
+        ("dedup-overlap [Codex P1]: edit_replace doesn't clobber sibling that references the target in deps",
+         _selftest_edit_replace_with_binary_target_dep_ref_does_not_clobber_sibling, False),
+        ("dedup-overlap [Codex P2 r2]: _find_target_call_for_name skips commented-out target decls",
+         _selftest_find_target_call_for_name_ignores_commented_calls, False),
+        ("dedup-overlap [Codex P2 r2]: _has_binary_target_with_name skips commented-out binary target decls",
+         _selftest_has_binary_target_ignores_commented_calls, False),
+        ("dedup-overlap [Codex P2 r2]: edit_replace skips commented decls + remains idempotent",
+         _selftest_edit_replace_with_binary_target_skips_commented_decl, False),
+        ("dedup-overlap [Codex P2 r3]: _find_target_call_for_name skips in-string target decls",
+         _selftest_find_target_call_for_name_ignores_string_literals, False),
+        ("dedup-overlap [Codex P2 r3]: _has_binary_target_with_name skips in-string binary target decls",
+         _selftest_has_binary_target_ignores_string_literals, False),
+        ("dedup-overlap [Codex P2 r3]: edit_replace skips string-literal decls + remains idempotent",
+         _selftest_edit_replace_with_binary_target_skips_string_literal, False),
+        ("dedup-overlap [Codex P2 r3]: _make_code_token_view blanks strings + comments, preserves offsets",
+         _selftest_make_code_token_view_blanks_strings_and_comments, False),
+        ("dedup-overlap [Codex P2 r4]: _apply_dedup_overlap_substitutions guards triple-quoted/raw/interpolation",
+         lambda: _selftest_apply_dedup_overlap_substitutions_guards_unsupported_constructs(tmp_root), False),
+        ("dedup-overlap [Codex P2 r5]: _compute_dedup_substitutions substitutes single-target siblings",
+         _selftest_compute_dedup_substitutions_single_target_sibling, False),
+        ("dedup-overlap [Codex P2 r5]: _compute_dedup_substitutions skips MULTI-target siblings",
+         _selftest_compute_dedup_substitutions_multi_target_sibling_skipped, False),
+        ("dedup-overlap [Codex P2 r5]: _compute_dedup_substitutions handles aliased single-target siblings",
+         _selftest_compute_dedup_substitutions_aliased_single_target, False),
+        ("dedup-overlap [Codex P2 r5]: _compute_dedup_substitutions skips siblings not yet built",
+         _selftest_compute_dedup_substitutions_unbuilt_sibling_skipped, False),
+        ("dedup-overlap [Codex P2 r5]: _compute_dedup_substitutions mixes single-target sub + multi-target skip",
+         _selftest_compute_dedup_substitutions_mixes_single_and_multi, False),
+        ("dedup-overlap [Codex P2]: external .product collision must not become an internal edge",
+         _selftest_compute_internal_target_deps_external_product_collision, False),
+        ("dedup-overlap [Codex P2]: mixed internal byName + external product with same name",
+         _selftest_compute_internal_target_deps_mixed_internal_and_external, False),
         ("xcresulttool build-results parser",
          _selftest_parse_xcresult_build_results, False),
         ("unsupported Swift constructs guard",

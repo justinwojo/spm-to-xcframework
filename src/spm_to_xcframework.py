@@ -36,7 +36,7 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, NoReturn, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, NoReturn, Optional, Sequence, Set, Tuple
 
 # ============================================================================
 # --- Logging + color output ---
@@ -231,6 +231,15 @@ class Config:
     # — a subsequent normal run will clean them. See REFACTOR_PLAN.md
     # Task 3 for the "delay cleanup by one run" semantics.
     no_cleanup_stale: bool = False
+    # When False (default), Execute walks build units in topological order
+    # and rewrites each already-built sibling target to a `.binaryTarget`
+    # in Package.swift before the next unit's archive runs. This stops
+    # umbrella products like Stripe from statically embedding all their
+    # transitive sibling targets' Mach-O — the umbrella links dynamically
+    # against the sibling xcframeworks instead. Pass --no-dedup-overlap
+    # to opt out (e.g. to reproduce legacy single-shot behavior for
+    # debugging). See REWRITE_DESIGN.md §5.4 dedup-overlap.
+    no_dedup_overlap: bool = False
     work_dir: Optional[Path] = None  # set in main() before fetch/inspect run
 
     @property
@@ -1551,6 +1560,166 @@ def _is_system_only_product(product: Product, package: Package) -> bool:
     return True
 
 
+def compute_internal_target_deps(package: Package) -> Dict[str, Set[str]]:
+    """For every target in `package`, return the set of TRANSITIVELY
+    reachable internal target names — i.e. names that are also defined
+    as targets in the same `Package.swift`.
+
+    Walks the raw `dump-package` payload (`package.raw_dump`) rather
+    than the typed `Target.dependencies` list, because the typed
+    flattening (`_parse_dependencies`) collapses `byName`, `target`,
+    AND `product` shapes into a single name list. That collapse loses
+    the kind information we need here: a `.product("Foo", ...)`
+    cross-package import has the same flat-name shape as a
+    `.byName("Foo")` internal sibling, so a name collision between an
+    external SPM product and a local target name would silently
+    register a false internal edge. (Codex P2 regression.)
+
+    Internal-only walk: only `byName` and `target` shapes from the raw
+    dump count — those are the SPM dependency expressions that
+    definitionally point inside the same package. `product` deps are
+    skipped even if their name happens to match an internal target.
+    External non-collision `product` deps are also filtered by virtue
+    of the membership check against `internal_names`.
+
+    Cycles are tolerated (the dump-package model shouldn't permit
+    them, but the visited set guards against bad inputs anyway). The
+    reflexive self-edge is excluded from the returned set so callers
+    can iterate `deps_map[T]` without a separate "is this myself"
+    check.
+
+    Pure function over typed inputs — used by `topo_order_units` and
+    the Execute-time dedup-overlap substitution loop.
+    """
+    internal_names = {t.name for t in package.targets}
+
+    raw_targets_by_name: Dict[str, dict] = {}
+    for raw_t in package.raw_dump.get("targets", []) or []:
+        if not isinstance(raw_t, dict):
+            continue
+        nm = raw_t.get("name")
+        if isinstance(nm, str):
+            raw_targets_by_name[nm] = raw_t
+
+    direct: Dict[str, List[str]] = {}
+    for t in package.targets:
+        raw_t = raw_targets_by_name.get(t.name)
+        if raw_t is None:
+            # Target was in the typed list but not in the raw dump — a
+            # synthetic-library injection or test-fixture quirk. Treat
+            # as having no internal deps; planner-driven sibling
+            # discovery happens elsewhere.
+            direct[t.name] = []
+            continue
+        deps: List[str] = []
+        seen: Set[str] = set()
+        for name in _raw_internal_dep_names(raw_t):
+            if name == t.name:
+                continue
+            if name not in internal_names:
+                continue
+            if name in seen:
+                continue
+            seen.add(name)
+            deps.append(name)
+        direct[t.name] = deps
+
+    cache: Dict[str, Set[str]] = {}
+
+    def reachable(name: str, stack: Set[str]) -> Set[str]:
+        if name in cache:
+            return cache[name]
+        if name in stack:
+            return set()
+        stack.add(name)
+        out: Set[str] = set()
+        for d in direct.get(name, []):
+            out.add(d)
+            out |= reachable(d, stack)
+        stack.discard(name)
+        out.discard(name)
+        cache[name] = out
+        return out
+
+    return {t.name: reachable(t.name, set()) for t in package.targets}
+
+
+def topo_order_units(
+    units: Sequence[BuildUnit], package: Package
+) -> List[BuildUnit]:
+    """Order `units` so each one comes after every sibling unit it
+    transitively depends on (via internal target deps). Stable on
+    original index — units with no dependency relation between them keep
+    their planner-assigned order.
+
+    Unit-level dependency relation: unit U depends on unit V iff some
+    target name in `V.source_targets` is in the transitive internal
+    target dep closure of `U.source_targets`. Derived from
+    `compute_internal_target_deps(package)`.
+
+    This is the order Execute walks for dedup-overlap substitution: leaf
+    products (StripeCore) build first, umbrella products (Stripe) build
+    last with their already-built sibling targets swapped to
+    `.binaryTarget`. See REWRITE_DESIGN.md §5.4 dedup-overlap.
+
+    On a cycle in the unit graph (which would indicate a bad
+    dump-package payload), remaining units are appended in original
+    order so behavior stays deterministic instead of raising.
+    """
+    deps_map = compute_internal_target_deps(package)
+    n = len(units)
+    if n <= 1:
+        return list(units)
+
+    target_to_unit_idx: Dict[str, int] = {}
+    for idx, u in enumerate(units):
+        for t in u.source_targets:
+            target_to_unit_idx[t] = idx
+
+    # Edge i -> j  means unit i must come before unit j.
+    children: List[List[int]] = [[] for _ in range(n)]
+    in_degree: List[int] = [0] * n
+    edges_seen: Set[Tuple[int, int]] = set()
+    for j, u in enumerate(units):
+        reach: Set[str] = set()
+        for t in u.source_targets:
+            reach |= deps_map.get(t, set())
+        for t in reach:
+            i = target_to_unit_idx.get(t)
+            if i is None or i == j:
+                continue
+            if (i, j) in edges_seen:
+                continue
+            edges_seen.add((i, j))
+            children[i].append(j)
+            in_degree[j] += 1
+
+    ready = sorted(i for i in range(n) if in_degree[i] == 0)
+    out: List[BuildUnit] = []
+    while ready:
+        i = ready.pop(0)
+        out.append(units[i])
+        for j in children[i]:
+            in_degree[j] -= 1
+            if in_degree[j] == 0:
+                # Insert j keeping `ready` sorted by original index.
+                lo, hi = 0, len(ready)
+                while lo < hi:
+                    mid = (lo + hi) // 2
+                    if ready[mid] < j:
+                        lo = mid + 1
+                    else:
+                        hi = mid
+                ready.insert(lo, j)
+
+    if len(out) < n:
+        seen = {id(u) for u in out}
+        for u in units:
+            if id(u) not in seen:
+                out.append(u)
+    return out
+
+
 def plan_source_build(config: Config, package: Package) -> Plan:
     """Pure planner for source-mode builds.
 
@@ -2024,6 +2193,106 @@ def _strip_swift_comments(text: str) -> str:
     return "".join(out)
 
 
+def _make_code_token_view(text: str) -> str:
+    """Return `text` with `//` line comments, `/* */` block comments,
+    AND `"..."` string-literal spans (delimiters + body) replaced by
+    equal-length spans of spaces. Newlines are preserved so line
+    counters stay honest, and every offset in the returned string
+    indexes the same Swift construct as in `text`.
+
+    Use this when searching for top-level code tokens like `.target(`
+    or `.binaryTarget(` that must NOT match inside any non-code region
+    of a Package.swift. Stripping comments alone (via
+    `_strip_swift_comments`) is not enough — a valid string literal
+    whose body contains `.target(name: \"X\", ...)` text would
+    otherwise be picked up as a candidate, the rewrite would refuse
+    to land because the body's `name:` doesn't sit at depth 0 of a
+    real call, and the user sees a spurious PrepareUserError on a
+    well-formed manifest.
+
+    Limitations match `_strip_swift_comments`: only `"..."` strings are
+    tracked. `#\"...\"#` raw strings, `\"\"\"...\"\"\"` multi-line
+    strings, and `\\(...)` interpolation aren't supported here — they
+    would be rejected upstream by
+    `_assert_no_unsupported_swift_constructs` before any prepare-time
+    edit runs.
+
+    On an unterminated string or block comment, falls through
+    conservatively: copies the suspicious tail verbatim. The trigger
+    scanner upstream is the layer that turns this into a hard error,
+    so a soft fall-through here keeps the helper a pure offset-faithful
+    view rather than another error site.
+    """
+    n = len(text)
+    out: List[str] = []
+    i = 0
+    while i < n:
+        c = text[i]
+        # Double-quoted string: blank delimiters + body with spaces, keep newlines.
+        if c == '"':
+            j = i + 1
+            terminated = False
+            while j < n:
+                cc = text[j]
+                if cc == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if cc == '"':
+                    j += 1
+                    terminated = True
+                    break
+                if cc == "\n":
+                    # Unterminated — stop the string here, leave the
+                    # newline for outer processing.
+                    break
+                j += 1
+            if not terminated and j < n and text[j] == "\n":
+                # Blank the string opener through j-1 (the chars before \n);
+                # leave the newline itself untouched so the line ends.
+                for k in range(i, j):
+                    out.append("\n" if text[k] == "\n" else " ")
+                i = j
+                continue
+            for k in range(i, j):
+                out.append("\n" if text[k] == "\n" else " ")
+            i = j
+            continue
+        # Line comment: blank up to (but not including) the newline.
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            end = text.find("\n", i + 2)
+            if end == -1:
+                end = n
+            out.append(" " * (end - i))
+            i = end
+            continue
+        # Block comment: blank delimiters + body with spaces, preserving newlines.
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            depth = 1
+            j = i + 2
+            while j < n and depth > 0:
+                if j + 1 < n and text[j] == "/" and text[j + 1] == "*":
+                    depth += 1
+                    j += 2
+                    continue
+                if j + 1 < n and text[j] == "*" and text[j + 1] == "/":
+                    depth -= 1
+                    j += 2
+                    continue
+                j += 1
+            if depth > 0:
+                out.append(text[i:])
+                i = n
+                break
+            stop = j
+            for ch in text[i:stop]:
+                out.append("\n" if ch == "\n" else " ")
+            i = stop
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 def _assert_no_unsupported_swift_constructs(text: str) -> None:
     """Fail loudly if `text` contains Swift constructs the balanced-paren
     walker can't reason about.
@@ -2323,6 +2592,262 @@ def edit_add_synthetic_library(
     # followed stays in place, so the array's overall shape is preserved.
     insert_at = j + 1 if has_entries else open_bracket + 1
     return manifest_text[:insert_at] + insertion + manifest_text[insert_at:]
+
+
+def _swift_string_literal(s: str) -> str:
+    """Quote `s` as a Swift string literal that's safe inside Package.swift.
+
+    Escapes the two characters that can break a `"..."` literal — backslash
+    and double-quote. Newlines, raw strings, and interpolation are
+    deliberately not handled: Package.swift values that need them aren't
+    inputs we'll ever pass through here (target names and on-disk
+    xcframework paths).
+    """
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+_TARGET_CALL_KIND_RE = re.compile(r"\.(target|executableTarget|testTarget)\s*\(")
+_BINARY_TARGET_CALL_RE = re.compile(r"\.binaryTarget\s*\(")
+_TOP_LEVEL_NAME_LABEL_RE = re.compile(
+    r'\bname\s*:\s*"((?:[^"\\\n]|\\.)*)"'
+)
+
+
+def _flatten_to_top_level(span: str) -> str:
+    """Collapse `span` to a string preserving only its depth-0
+    characters. Nested paren / bracket / brace bodies (including their
+    delimiters) are replaced with a single space, while strings and
+    comments at depth 0 are kept verbatim so a regex looking for a
+    labelled string argument still sees its literal value.
+
+    The returned string has different offsets from `span`. Callers that
+    need offsets back into the original buffer must do their own
+    bookkeeping; the helper is only meant for "does the top-level
+    argument list say `name: \"X\"`?" style queries.
+
+    This is the depth-0 sieve underpinning `_top_level_name_label`,
+    which `_find_target_call_for_name` and `_has_binary_target_with_name`
+    use to ignore `name:` references nested inside a target's
+    `dependencies:` array (e.g. `.target(name: "Dep")` expressions).
+    """
+    out: List[str] = []
+    i = 0
+    n = len(span)
+    while i < n:
+        c = span[i]
+        if c == "/" and i + 1 < n and span[i + 1] == "/":
+            nl = span.find("\n", i + 2)
+            i = nl + 1 if nl != -1 else n
+            continue
+        if c == "/" and i + 1 < n and span[i + 1] == "*":
+            block_depth = 1
+            i += 2
+            while i < n and block_depth > 0:
+                if i + 1 < n and span[i] == "/" and span[i + 1] == "*":
+                    block_depth += 1
+                    i += 2
+                    continue
+                if i + 1 < n and span[i] == "*" and span[i + 1] == "/":
+                    block_depth -= 1
+                    i += 2
+                    continue
+                i += 1
+            continue
+        if c == '"':
+            j = i + 1
+            while j < n:
+                cc = span[j]
+                if cc == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if cc == '"':
+                    j += 1
+                    break
+                if cc == "\n":
+                    break
+                j += 1
+            out.append(span[i:j])
+            i = j
+            continue
+        if c in "([{":
+            close = _balanced_close(span, i)
+            if close == -1:
+                # Malformed nested scope — bail out cleanly so the
+                # caller's regex sees what we collected so far rather
+                # than raising. `_balanced_close == -1` already implies
+                # a manifest the rest of the pipeline will reject.
+                break
+            out.append(" ")
+            i = close + 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _top_level_name_label(span: str) -> Optional[str]:
+    """Return the value of the `name:` keyword argument at the top
+    level of `span`, or None if no such top-level label is present.
+
+    "Top level" means depth 0 — not inside any nested
+    paren/bracket/brace. So a call body like
+    `name: "A", dependencies: [.target(name: "Foo")]` returns "A",
+    not "Foo": the inner `name:` is at depth 2 (`[` then `(`) and
+    gets stripped by `_flatten_to_top_level` before the regex runs.
+
+    Used by `_find_target_call_for_name` and
+    `_has_binary_target_with_name` to verify a candidate call's OWN
+    name argument before accepting the match. Regression for the bug
+    where the planner's substitution edited the wrong target because
+    a sibling's `dependencies:` list happened to mention the target's
+    name as a `.target(name: "X")` expression.
+    """
+    flat = _flatten_to_top_level(span)
+    m = _TOP_LEVEL_NAME_LABEL_RE.search(flat)
+    if not m:
+        return None
+    return m.group(1)
+
+
+def _find_target_call_for_name(
+    text: str, target_name: str
+) -> Tuple[int, int, str]:
+    """Locate the `.target(name: "<target_name>", ...)` call (or
+    `.executableTarget` / `.testTarget`) whose own top-level `name:`
+    argument matches exactly.
+
+    Returns `(call_start_idx, close_paren_idx, kind_used)` where
+    `call_start_idx` is the offset of the leading `.` and
+    `close_paren_idx` is the offset of the matching `)`. `kind_used` is
+    one of `"target"`, `"executableTarget"`, `"testTarget"`.
+
+    Returns `(-1, -1, "")` if no matching call is found. Deliberately
+    skips `.binaryTarget(...)` and `.systemLibrary(...)` — substituting
+    them is either pointless (already binary) or unsupported (not a real
+    target we can build into an xcframework).
+
+    Two filtering disciplines are stacked:
+
+    1. Candidate discovery runs against a code-only view of the
+       manifest (`_make_code_token_view`, which blanks `//` line
+       comments, `/* */` block comments, AND `"..."` string-literal
+       spans into equal-length spaces while preserving offsets). A
+       commented-out OR string-literal-embedded `.target(name: "X")`
+       cannot match — its leading `.target(` was blanked. (Codex P2
+       round-2 regression: a commented decl before the real one
+       caused the edit to rewrite the comment. Codex P2 round-3
+       regression: a string literal whose body contained
+       `.target(name: "X", ...)` text caused the finder to stop on
+       the string and raise a spurious PrepareUserError.)
+
+    2. The match's own top-level `name:` argument is verified via
+       `_top_level_name_label`. A sibling target whose `dependencies:`
+       array contains `.target(name: "Foo")` would otherwise falsely
+       match when searching for "Foo". (Codex P1 regression.)
+    """
+    code_view = _make_code_token_view(text)
+    pos = 0
+    while True:
+        m = _TARGET_CALL_KIND_RE.search(code_view, pos)
+        if not m:
+            return -1, -1, ""
+        kind = m.group(1)
+        kind_start = m.start()
+        open_idx = m.end() - 1
+        close_idx = _balanced_close(text, open_idx)
+        if close_idx == -1:
+            raise PrepareUserError(
+                f"Could not find balanced `)` for .{kind}( at offset "
+                f"{open_idx}; the manifest may be malformed."
+            )
+        span = text[open_idx + 1 : close_idx]
+        if _top_level_name_label(span) == target_name:
+            return kind_start, close_idx, kind
+        pos = close_idx + 1
+
+
+def _has_binary_target_with_name(text: str, target_name: str) -> bool:
+    """True iff `text` contains a `.binaryTarget(name: "<target_name>", ...)`
+    call whose top-level `name:` argument matches exactly. Same
+    code-only + depth-0 discipline as `_find_target_call_for_name`:
+    a stray `.binaryTarget(name: "X")` mentioned inside another call's
+    body, sitting inside a `//`/`/* */` comment, or embedded in a
+    `"..."` string literal can't false-positive the idempotency check.
+    """
+    code_view = _make_code_token_view(text)
+    pos = 0
+    while True:
+        m = _BINARY_TARGET_CALL_RE.search(code_view, pos)
+        if not m:
+            return False
+        open_idx = m.end() - 1
+        close_idx = _balanced_close(text, open_idx)
+        if close_idx == -1:
+            return False
+        span = text[open_idx + 1 : close_idx]
+        if _top_level_name_label(span) == target_name:
+            return True
+        pos = close_idx + 1
+
+
+def edit_replace_with_binary_target(
+    manifest_text: str, target_name: str, xcframework_path: str
+) -> str:
+    """Rewrite the `.target(name: T, ...)` (or `.executableTarget` /
+    `.testTarget`) declaration for `target_name` to a
+    `.binaryTarget(name: T, path: P)` referring to `xcframework_path`.
+
+    This is the dedup-overlap edit (REWRITE_DESIGN.md §5.4): when an
+    umbrella product depends on a sibling target that we've already
+    built into a dynamic xcframework, swap the source target for a
+    binary one. SPM then resolves the umbrella's link to that
+    pre-existing dylib instead of re-compiling and statically embedding
+    every sibling's symbols.
+
+    Idempotent: if the manifest already declares `.binaryTarget(name: T,
+    ...)` and no remaining `.target(name: T, ...)`, the function
+    returns the text unchanged. The reverse asymmetry — both shapes
+    present for the same name — is treated as a malformed manifest
+    (likely corruption from a half-applied prior edit) and raises
+    `PrepareUserError`.
+
+    Parameters:
+      manifest_text     — full Package.swift text to edit
+      target_name       — exact name of the target to substitute
+      xcframework_path  — path the new `.binaryTarget` will point at;
+                          may be absolute or relative to the package
+                          root (SPM accepts both)
+
+    Returns the edited manifest text. Caller writes it back.
+    """
+    binary_present = _has_binary_target_with_name(manifest_text, target_name)
+    kind_start, close_idx, _kind = _find_target_call_for_name(
+        manifest_text, target_name
+    )
+
+    if kind_start == -1:
+        if binary_present:
+            return manifest_text  # already a binaryTarget; idempotent no-op
+        raise PrepareUserError(
+            f"replace_with_binary_target: no `.target(name: {target_name!r}, "
+            f"...)` (or .executableTarget/.testTarget) found in the manifest. "
+            f"There is also no existing `.binaryTarget(name: {target_name!r}, "
+            f"...)` — nothing matches the substitution request."
+        )
+
+    if binary_present:
+        raise PrepareUserError(
+            f"replace_with_binary_target: manifest contains BOTH a source "
+            f"target and a `.binaryTarget` for {target_name!r}. The manifest "
+            f"is in a half-edited state — a prior dedup-overlap run likely "
+            f"failed mid-edit. Restore from .original-Package.swift and try "
+            f"again."
+        )
+
+    name_literal = _swift_string_literal(target_name)
+    path_literal = _swift_string_literal(xcframework_path)
+    replacement = f".binaryTarget(name: {name_literal}, path: {path_literal})"
+    return manifest_text[:kind_start] + replacement + manifest_text[close_idx + 1 :]
 
 
 def _swift_toolchain_version() -> Optional[Tuple[int, int, int]]:
@@ -4664,6 +5189,151 @@ def _run_one_unit(
     )
 
 
+def _compute_dedup_substitutions(
+    *,
+    unit: BuildUnit,
+    target_to_unit: Mapping[str, BuildUnit],
+    built_by_unit: Mapping[str, ExecutedUnit],
+    target_deps: Mapping[str, Set[str]],
+) -> List[Tuple[str, Path]]:
+    """Pure helper: derive `(target_name, xcframework_path)` pairs to
+    rewrite in `Package.swift` before `unit` builds.
+
+    A substitution is emitted for each transitively-imported internal
+    target T owned by a sibling build unit, when:
+
+      1. T is not part of `unit.source_targets` (own targets are
+         linked normally — substituting them would build them out of
+         the wrong source).
+      2. The sibling build unit owns T (and only T) — i.e. its
+         `source_targets == [T]`. The xcframework that unit emits is
+         named after the product (e.g. `StripeIssuing.xcframework`
+         for a single-target product), so the binary's contained
+         module IS T and re-pointing `.target(name: T)` at it is a
+         clean 1:1 swap. Multi-target sibling units (e.g.
+         `.library(name: "Kit", targets: ["A", "B"])` → one
+         `Kit.xcframework` whose framework binary is the product, not
+         the individual target) are SKIPPED — re-pointing
+         `.target(name: "A")` at `Kit.xcframework` would cross
+         module boundaries silently, and assigning the same path to
+         both A and B is malformed in SPM. Codex P2 r5 regression.
+      3. The sibling has already finished building (so we have a
+         path to point at). If the sibling hasn't run yet — cycle in
+         the unit graph, or filtered out of this run — leaving the
+         source target alone is the safe fallback.
+
+    Returned pairs are deduplicated and emitted in deterministic
+    sort order (the inner loop walks `sorted(target_deps[src_t])`),
+    so the audit log is stable across runs.
+    """
+    substitutions: List[Tuple[str, Path]] = []
+    seen: Set[str] = set()
+    own = set(unit.source_targets)
+    for src_t in unit.source_targets:
+        for dep_t in sorted(target_deps.get(src_t, set())):
+            if dep_t in own or dep_t in seen:
+                continue
+            sibling = target_to_unit.get(dep_t)
+            if sibling is None or sibling.name == unit.name:
+                continue
+            # Multi-target sibling units don't participate: their
+            # xcframework was built as the product (one framework
+            # binary), not as the individual target T, so it isn't a
+            # valid 1:1 stand-in for `.target(name: T, ...)`. Falling
+            # through here means the consumer keeps `.target(...)`
+            # for T and SPM statically embeds T's symbols (legacy
+            # behavior). (Codex P2 r5 regression.)
+            if list(sibling.source_targets) != [dep_t]:
+                continue
+            sibling_executed = built_by_unit.get(sibling.name)
+            if sibling_executed is None:
+                continue
+            substitutions.append((dep_t, sibling_executed.xcframework_path))
+            seen.add(dep_t)
+    return substitutions
+
+
+def _apply_dedup_overlap_substitutions(
+    *,
+    staged_dir: Path,
+    substitutions: Sequence[Tuple[str, Path]],
+    unit_name: str,
+    verbose: bool,
+) -> None:
+    """Mutate the active Package.swift in `staged_dir` so each
+    `(target_name, xcframework_path)` pair becomes a `.binaryTarget`
+    declaration before the next unit's `xcodebuild archive` runs.
+
+    Edits are idempotent — a target already shaped as `.binaryTarget`
+    is left alone — and applied in stable order so the audit log is
+    deterministic across runs. The active manifest is the same file
+    `apply_package_swift_edits` chose during Prepare; we re-resolve it
+    here rather than caching the path on `Config`, so a toolchain
+    change between Prepare and Execute (vanishingly unlikely, but
+    cheap to defend against) wouldn't desync the two phases.
+
+    Side effect: writes the edited manifest text. The previous
+    `apply_package_swift_edits` snapshot at `.original-Package.swift`
+    is left untouched — that's the user's recovery handle if a
+    dedup-overlap edit is later reported to be wrong.
+    """
+    manifest_path = _select_active_manifest(staged_dir)
+    if not manifest_path.is_file():
+        raise ExecuteError(
+            f"dedup-overlap substitution: cannot read active manifest at "
+            f"{manifest_path} for unit {unit_name!r}"
+        )
+    text = manifest_path.read_text()
+    # Re-assert the unsupported-construct guard here. `apply_package_swift_edits`
+    # would have run it during Prepare — but only if the planner emitted at least
+    # one edit. When Prepare takes its no-op path (no package_swift_edits), the
+    # guard is skipped, and an Execute-time dedup edit on a manifest with
+    # triple-quoted strings, `#"..."#` raw strings, or `\(...)` interpolation
+    # would silently mis-parse via `_make_code_token_view` (which only tracks
+    # `"..."` strings). Running the guard here closes that gap.
+    # (Codex P2 round-4 regression.)
+    try:
+        _assert_no_unsupported_swift_constructs(text)
+    except PrepareUserError as exc:
+        raise ExecuteError(
+            f"dedup-overlap substitution failed for unit {unit_name!r}: "
+            f"the active Package.swift uses a Swift construct the dedup-overlap "
+            f"editor can't reason about. {exc} Re-run with --no-dedup-overlap to "
+            f"disable the inter-unit binaryTarget rewrite for this package."
+        ) from exc
+    edited = text
+    applied: List[str] = []
+    skipped: List[str] = []
+    for target_name, xcframework_path in substitutions:
+        path_str = str(xcframework_path)
+        try:
+            new_text = edit_replace_with_binary_target(edited, target_name, path_str)
+        except PrepareUserError as exc:
+            raise ExecuteError(
+                f"dedup-overlap substitution failed for unit {unit_name!r} "
+                f"target {target_name!r}: {exc}"
+            ) from exc
+        if new_text != edited:
+            applied.append(f"{target_name} -> {Path(path_str).name}")
+            edited = new_text
+        else:
+            skipped.append(target_name)
+    if edited != text:
+        manifest_path.write_text(edited)
+    if applied:
+        info(
+            f"  {unit_name}: dedup-overlap rewrote "
+            f"{len(applied)} sibling target(s) to .binaryTarget: "
+            + ", ".join(applied)
+        )
+    if skipped:
+        verbose_log(
+            verbose,
+            f"  {unit_name}: dedup-overlap left {len(skipped)} target(s) "
+            f"unchanged (already .binaryTarget): " + ", ".join(skipped),
+        )
+
+
 def execute_source_plan(
     prepared: PreparedPlan,
     config: Config,
@@ -4677,18 +5347,67 @@ def execute_source_plan(
     ExecutedUnits in plan order. Raises `ExecuteError` on the first
     failure (later units are not attempted, matching Session 3's
     fail-fast contract).
+
+    Build-unit ordering: when dedup-overlap is enabled (default), units
+    are walked in topological order over their internal target deps so
+    each leaf builds before any sibling that imports it. Between unit
+    builds, already-built siblings get rewritten in `Package.swift` from
+    `.target(...)` to `.binaryTarget(path: ...)` pointing at the freshly
+    produced xcframework. The umbrella product (e.g. Stripe) then links
+    dynamically against the sibling xcframeworks instead of statically
+    embedding their Mach-O. See REWRITE_DESIGN.md §5.4 dedup-overlap.
+
+    `--no-dedup-overlap` reverts to the legacy behavior: planner-order
+    walk, no inter-unit manifest mutation, sibling targets get statically
+    re-compiled into every umbrella product that imports them.
     """
     if config.work_dir is None:
         raise ExecuteError("internal error: config.work_dir was not allocated before Execute")
     archive_units = [u for u in prepared.plan.build_units if u.archive_strategy != "copy-artifact"]
     if not archive_units:
         return []
-    bold(f"\nExecuting {len(archive_units)} build unit(s)...")
+
+    if config.no_dedup_overlap:
+        ordered_units: List[BuildUnit] = list(archive_units)
+    else:
+        ordered_units = topo_order_units(archive_units, prepared.package)
+
+    target_to_unit: Dict[str, BuildUnit] = {}
+    for u in ordered_units:
+        for t in u.source_targets:
+            target_to_unit.setdefault(t, u)
+
+    target_deps = (
+        compute_internal_target_deps(prepared.package)
+        if not config.no_dedup_overlap
+        else {}
+    )
+
+    bold(f"\nExecuting {len(ordered_units)} build unit(s)...")
     config.output_dir.mkdir(parents=True, exist_ok=True)
     results: List[ExecutedUnit] = []
-    for unit in archive_units:
+    built_by_unit: Dict[str, ExecutedUnit] = {}
+    staged_dir = prepared.package.staged_dir
+
+    for unit in ordered_units:
+        if not config.no_dedup_overlap:
+            substitutions = _compute_dedup_substitutions(
+                unit=unit,
+                target_to_unit=target_to_unit,
+                built_by_unit=built_by_unit,
+                target_deps=target_deps,
+            )
+            if substitutions:
+                _apply_dedup_overlap_substitutions(
+                    staged_dir=staged_dir,
+                    substitutions=substitutions,
+                    unit_name=unit.name,
+                    verbose=config.verbose,
+                )
+
         executed = _run_one_unit(unit, prepared=prepared, config=config)
         results.append(executed)
+        built_by_unit[unit.name] = executed
     return results
 
 
@@ -5454,6 +6173,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> Tuple[argparse.Namespace
             "run will clean them."
         ),
     )
+    parser.add_argument(
+        "--no-dedup-overlap",
+        action="store_true",
+        help=(
+            "Disable inter-unit `.binaryTarget` substitution. By default, "
+            "when one product depends on a sibling product/target in the "
+            "same package, the sibling is built first and the umbrella's "
+            "Package.swift is rewritten to consume it as a `.binaryTarget` "
+            "before the umbrella's archive runs — this stops the umbrella "
+            "from statically embedding the sibling's Mach-O. Pass this flag "
+            "to keep legacy single-shot behavior."
+        ),
+    )
 
     # Session-1-only flag for exploration. Not removed in later sessions —
     # it remains a useful diagnostic.
@@ -5480,6 +6212,7 @@ def _config_from_args(ns: argparse.Namespace) -> Config:
         dry_run=ns.dry_run,
         keep_work=ns.keep_work,
         no_cleanup_stale=ns.no_cleanup_stale,
+        no_dedup_overlap=ns.no_dedup_overlap,
         inspect_only=ns.inspect_only,
     )
 
