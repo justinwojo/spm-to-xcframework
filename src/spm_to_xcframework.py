@@ -3651,16 +3651,17 @@ def _find_objc_headers_dir(
         if include_dir.is_dir() and _has_h_files_recursive(include_dir):
             return include_dir
         # 2b. Umbrella-header-at-target-root pattern. Stripe ships every
-        #    product this way: `StripePayments.h` sits at the top of
+        #    product this way: e.g. `StripePayments.h` sits at the top of
         #    `StripePayments/StripePayments/` with no `include/` subdir.
-        #    The Stripe umbrella product uses `Stripe-umbrella.h` instead
-        #    of the strict `<TargetName>.h` form, so we accept any
-        #    non-`-Swift.h` `.h` at the top level. `inject_objc_headers`
-        #    walks the returned dir recursively, but in practice these
-        #    targets carry zero `.h` files outside the umbrella (the
-        #    rest is Swift), so over-injection is not a concern.
-        for h in target_dir.glob("*.h"):
-            if h.is_file() and not h.name.endswith("-Swift.h"):
+        #    Accept the two umbrella forms only — `<TargetName>.h` (the
+        #    common Stripe target pattern) and `<TargetName>-umbrella.h`
+        #    (used by the Stripe product target itself). Anything else
+        #    risks over-injection: `inject_objc_headers` walks the
+        #    returned dir recursively and copies every .h, so accepting
+        #    a generic non-`-Swift.h` would leak private/internal
+        #    top-level headers into the framework's public surface.
+        for candidate in (f"{target.name}.h", f"{target.name}-umbrella.h"):
+            if (target_dir / candidate).is_file():
                 return target_dir
         return None
 

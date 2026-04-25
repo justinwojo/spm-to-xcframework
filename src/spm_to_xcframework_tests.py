@@ -2504,6 +2504,101 @@ def _selftest_find_objc_headers_dir_umbrella_at_target_root(tmp_root: Path) -> N
     )
 
 
+def _selftest_find_objc_headers_dir_umbrella_named_variant(tmp_root: Path) -> None:
+    """Regression: the umbrella-at-target-root pattern also accepts
+    `<TargetName>-umbrella.h`. Stripe's top-level `Stripe` product
+    target ships `Stripe-umbrella.h` instead of `Stripe.h`, so the
+    heuristic must accept both names.
+    """
+    base = tmp_root / "headers_umbrella_named_variant"
+    staged = base / "staged"
+
+    target_dir = staged / "Sources" / "Stripe"
+    target_dir.mkdir(parents=True)
+    (target_dir / "Stripe-umbrella.h").write_text("// umbrella")
+    (target_dir / "API.swift").write_text("// swift")
+
+    raw_dump = {
+        "products": [
+            {"name": "Stripe", "type": {"library": ["automatic"]},
+             "targets": ["Stripe"]},
+        ],
+        "targets": [
+            {"name": "Stripe", "type": "regular",
+             "path": "Sources/Stripe", "publicHeadersPath": None,
+             "dependencies": []},
+        ],
+    }
+    package = Package(
+        name="Stripe", tools_version="5.7.0", platforms=[],
+        products=[Product(name="Stripe", linkage=Linkage.AUTOMATIC,
+                          targets=["Stripe"])],
+        targets=[
+            Target(name="Stripe", kind=TargetKind.REGULAR,
+                   path="Sources/Stripe", public_headers_path=None,
+                   dependencies=[], exclude=[], language=Language.OBJC),
+        ],
+        schemes=[], raw_dump=raw_dump, staged_dir=staged,
+    )
+    found = _find_objc_headers_dir(package, product_name="Stripe",
+                                    fw_name="Stripe")
+    _assert(
+        found is not None and found.name == "Stripe"
+        and found.parent.name == "Sources",
+        f"expected target dir for <Target>-umbrella.h pattern, "
+        f"got {found!r}",
+    )
+
+
+def _selftest_find_objc_headers_dir_umbrella_rejects_unrelated_h(tmp_root: Path) -> None:
+    """Regression: the umbrella heuristic must NOT pick up generic
+    top-level .h files that aren't `<TargetName>.h` or
+    `<TargetName>-umbrella.h`. Returning the target dir in that case
+    would over-inject private/internal headers into the framework's
+    public surface, since `inject_objc_headers` walks the dir
+    recursively and copies every .h.
+    """
+    base = tmp_root / "headers_umbrella_strict"
+    staged = base / "staged"
+
+    target_dir = staged / "Sources" / "Foo"
+    target_dir.mkdir(parents=True)
+    # Top-level .h files exist, but none match the target name.
+    (target_dir / "Helper.h").write_text("// internal")
+    (target_dir / "PrivateThing.h").write_text("// internal")
+    (target_dir / "API.swift").write_text("// swift")
+
+    raw_dump = {
+        "products": [
+            {"name": "Foo", "type": {"library": ["automatic"]},
+             "targets": ["Foo"]},
+        ],
+        "targets": [
+            {"name": "Foo", "type": "regular",
+             "path": "Sources/Foo", "publicHeadersPath": None,
+             "dependencies": []},
+        ],
+    }
+    package = Package(
+        name="Foo", tools_version="5.7.0", platforms=[],
+        products=[Product(name="Foo", linkage=Linkage.AUTOMATIC,
+                          targets=["Foo"])],
+        targets=[
+            Target(name="Foo", kind=TargetKind.REGULAR,
+                   path="Sources/Foo", public_headers_path=None,
+                   dependencies=[], exclude=[], language=Language.OBJC),
+        ],
+        schemes=[], raw_dump=raw_dump, staged_dir=staged,
+    )
+    found = _find_objc_headers_dir(package, product_name="Foo",
+                                    fw_name="Foo")
+    _assert(
+        found is None,
+        f"expected None when no <Target>.h or <Target>-umbrella.h is "
+        f"present (only generic .h), got {found!r}",
+    )
+
+
 def _selftest_find_objc_headers_dir_dep_walk_no_implicit_leak(tmp_root: Path) -> None:
     """Regression: when the direct product target has no public
     headers and a depended-on target carries an implicit-layout
@@ -4922,6 +5017,10 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          lambda: _selftest_find_objc_headers_dir_defaults_to_include(tmp_root), False),
         ("execute: ObjC headers dir picks umbrella-at-target-root (Stripe pattern)",
          lambda: _selftest_find_objc_headers_dir_umbrella_at_target_root(tmp_root), False),
+        ("execute: ObjC headers dir accepts <Target>-umbrella.h variant",
+         lambda: _selftest_find_objc_headers_dir_umbrella_named_variant(tmp_root), False),
+        ("execute: ObjC headers dir rejects unrelated top-level .h",
+         lambda: _selftest_find_objc_headers_dir_umbrella_rejects_unrelated_h(tmp_root), False),
         ("execute: ObjC headers dir dep walk does not leak implicit include/",
          lambda: _selftest_find_objc_headers_dir_dep_walk_no_implicit_leak(tmp_root), False),
         ("execute: detect_system_frameworks follows .target() dep edge (P1)",
