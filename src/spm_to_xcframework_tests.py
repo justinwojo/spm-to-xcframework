@@ -44,6 +44,7 @@ from spm_to_xcframework import (  # noqa: F401
     _derive_package_label,
     _find_library_call_for_product,
     _find_objc_headers_dir,
+    _find_resource_bundles,
     _finalize_with_verify,
     _format_size_iec,
     _is_toxic_entry,
@@ -2138,6 +2139,215 @@ def _selftest_inject_objc_headers_nested_no_umbrella(tmp_root: Path) -> None:
             f"(got:\n{modulemap})")
     _assert("umbrella header" not in modulemap,
             "explicit modulemap should not use umbrella")
+
+
+def _make_archive_intermediates_bundle(
+    dd_path: Path,
+    *,
+    scheme: str,
+    sdk_dir: str,
+    bundle_name: str,
+    files: Optional[Dict[str, str]] = None,
+) -> Path:
+    """Build a synthetic dd_path/Build/Intermediates.noindex/.../<X>.bundle/
+    layout matching what xcodebuild's `archive` action produces.
+
+    Returns the path to the created bundle directory.
+    """
+    bundle_dir = (
+        dd_path
+        / "Build"
+        / "Intermediates.noindex"
+        / "ArchiveIntermediates"
+        / scheme
+        / "BuildProductsPath"
+        / sdk_dir
+        / bundle_name
+    )
+    bundle_dir.mkdir(parents=True)
+    contents = files if files is not None else {
+        "Info.plist": (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<plist version="1.0"><dict>'
+            '<key>CFBundleIdentifier</key><string>com.example.test</string>'
+            '</dict></plist>\n'
+        ),
+        "Assets.bin": "stub-asset-bytes",
+    }
+    for rel, body in contents.items():
+        full = bundle_dir / rel
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text(body)
+    return bundle_dir
+
+
+def _selftest_inject_resource_bundles_copies_swiftpm_bundle(tmp_root: Path) -> None:
+    """SwiftPM-emitted `<Package>_<Target>.bundle` directories must be
+    copied from the slice's `BuildProductsPath` into the framework root,
+    on both device and simulator slices, with their inner files preserved.
+    This is what makes Stripe3DS2-style resource lookups
+    (`+[STDSBundleLocator stdsResourcesBundle]`) succeed at runtime.
+    """
+    base = tmp_root / "inject_bundles_basic"
+    device_dd = base / "dd-device"
+    sim_dd = base / "dd-sim"
+    _make_archive_intermediates_bundle(
+        device_dd,
+        scheme="Stripe3DS2",
+        sdk_dir="Release-iphoneos",
+        bundle_name="Stripe_Stripe3DS2.bundle",
+        files={"PrivacyInfo.xcprivacy": "<plist/>", "image.png": "PNGSTUB"},
+    )
+    _make_archive_intermediates_bundle(
+        sim_dd,
+        scheme="Stripe3DS2",
+        sdk_dir="Release-iphonesimulator",
+        bundle_name="Stripe_Stripe3DS2.bundle",
+        files={"PrivacyInfo.xcprivacy": "<plist/>", "image.png": "PNGSTUB"},
+    )
+
+    device_fw = base / "device" / "Stripe3DS2.framework"
+    device_fw.mkdir(parents=True)
+    sim_fw = base / "simulator" / "Stripe3DS2.framework"
+    sim_fw.mkdir(parents=True)
+
+    n_device = inject_resource_bundles(
+        fw_path=device_fw,
+        fw_name="Stripe3DS2",
+        dd_path=device_dd,
+        variant="device",
+        verbose=False,
+    )
+    n_sim = inject_resource_bundles(
+        fw_path=sim_fw,
+        fw_name="Stripe3DS2",
+        dd_path=sim_dd,
+        variant="simulator",
+        verbose=False,
+    )
+    _assert(n_device == 1, f"device should have copied 1 bundle, got {n_device}")
+    _assert(n_sim == 1, f"sim should have copied 1 bundle, got {n_sim}")
+    for fw in (device_fw, sim_fw):
+        injected = fw / "Stripe_Stripe3DS2.bundle"
+        _assert(injected.is_dir(),
+                f"injected bundle missing in {fw}: expected {injected}")
+        _assert((injected / "PrivacyInfo.xcprivacy").is_file(),
+                "inner PrivacyInfo.xcprivacy not copied")
+        _assert((injected / "image.png").is_file(),
+                "inner image.png not copied")
+
+
+def _selftest_inject_resource_bundles_no_resources_is_noop(tmp_root: Path) -> None:
+    """When the build unit declared no `.process` / `.copy` resources,
+    `BuildProductsPath` has no `*.bundle` directories. The injection step
+    must return 0 and not touch the framework — most SPM packages take
+    this path.
+    """
+    base = tmp_root / "inject_bundles_noop"
+    dd_path = base / "dd"
+    # Realistic empty BuildProductsPath: directory exists, no .bundle inside.
+    (dd_path / "Build" / "Intermediates.noindex" / "ArchiveIntermediates"
+        / "Foo" / "BuildProductsPath" / "Release-iphoneos").mkdir(parents=True)
+    fw = base / "Foo.framework"
+    fw.mkdir(parents=True)
+
+    n = inject_resource_bundles(
+        fw_path=fw,
+        fw_name="Foo",
+        dd_path=dd_path,
+        variant="device",
+        verbose=False,
+    )
+    _assert(n == 0, f"expected 0 bundles when none built, got {n}")
+    # Framework directory must remain empty.
+    _assert(list(fw.iterdir()) == [],
+            f"framework was modified despite no bundles: {list(fw.iterdir())}")
+
+
+def _selftest_inject_resource_bundles_idempotent(tmp_root: Path) -> None:
+    """A second `inject_resource_bundles` call must overwrite the existing
+    bundle in place (so re-runs after partial failures stay clean) and
+    keep the framework's bundle current with whatever the latest archive
+    produced."""
+    base = tmp_root / "inject_bundles_idempotent"
+    dd_path = base / "dd"
+    bundle = _make_archive_intermediates_bundle(
+        dd_path,
+        scheme="Foo",
+        sdk_dir="Release-iphoneos",
+        bundle_name="Pkg_Foo.bundle",
+        files={"v1.txt": "first"},
+    )
+    fw = base / "Foo.framework"
+    fw.mkdir(parents=True)
+    inject_resource_bundles(fw_path=fw, fw_name="Foo", dd_path=dd_path,
+                            variant="device", verbose=False)
+    _assert((fw / "Pkg_Foo.bundle" / "v1.txt").is_file(),
+            "first injection did not land")
+
+    # Simulate a second archive that updated the bundle's contents.
+    shutil.rmtree(bundle)
+    _make_archive_intermediates_bundle(
+        dd_path,
+        scheme="Foo",
+        sdk_dir="Release-iphoneos",
+        bundle_name="Pkg_Foo.bundle",
+        files={"v2.txt": "second"},
+    )
+    n = inject_resource_bundles(fw_path=fw, fw_name="Foo", dd_path=dd_path,
+                                variant="device", verbose=False)
+    _assert(n == 1, f"second injection should report 1 copy, got {n}")
+    _assert((fw / "Pkg_Foo.bundle" / "v2.txt").is_file(),
+            "stale bundle not refreshed on re-injection")
+    _assert(not (fw / "Pkg_Foo.bundle" / "v1.txt").exists(),
+            "old bundle contents leaked through replace")
+
+
+def _selftest_find_resource_bundles_dedupe_and_filter(tmp_root: Path) -> None:
+    """`_find_resource_bundles` must (1) prefer the canonical
+    ArchiveIntermediates path over the `Build/Products` symlinked view
+    when both contain a same-named bundle, (2) ignore non-directory
+    entries and unrelated artifacts, and (3) walk the per-sdk
+    subdirectories under BuildProductsPath without missing any.
+    """
+    base = tmp_root / "find_bundles"
+    dd_path = base / "dd"
+
+    # Canonical path: two bundles under different schemes' BuildProductsPath
+    # subdirs (xcodebuild can build dependent targets while archiving the
+    # primary scheme — both end up here).
+    archive_a = _make_archive_intermediates_bundle(
+        dd_path, scheme="Primary", sdk_dir="Release-iphoneos",
+        bundle_name="Pkg_A.bundle",
+    )
+    archive_b = _make_archive_intermediates_bundle(
+        dd_path, scheme="DepBuild", sdk_dir="Release-iphoneos",
+        bundle_name="Pkg_B.bundle",
+    )
+    # Same-named bundle visible through Build/Products/Release-iphoneos —
+    # this is the symlinked view of the same artifact in the real layout.
+    symlink_view_dir = dd_path / "Build" / "Products" / "Release-iphoneos"
+    symlink_view_dir.mkdir(parents=True)
+    (symlink_view_dir / "Pkg_A.bundle").mkdir()
+    (symlink_view_dir / "Pkg_A.bundle" / "from-products.txt").write_text("dup")
+    # A loose file with `.bundle` suffix MUST be ignored — only directories
+    # are real bundles.
+    (symlink_view_dir / "stray.bundle").write_text("not-a-bundle")
+
+    found = _find_resource_bundles(dd_path)
+    found_names = sorted(p.name for p in found)
+    _assert(found_names == ["Pkg_A.bundle", "Pkg_B.bundle"],
+            f"unexpected bundle list: {found_names}")
+    # Pkg_A.bundle must come from ArchiveIntermediates, not the symlink view
+    pkg_a = next(p for p in found if p.name == "Pkg_A.bundle")
+    _assert("ArchiveIntermediates" in pkg_a.parts,
+            f"Pkg_A.bundle should resolve to ArchiveIntermediates, got {pkg_a}")
+    _assert(pkg_a == archive_a,
+            f"expected canonical {archive_a}, got {pkg_a}")
+    # Pkg_B.bundle came only from ArchiveIntermediates (no symlink view set
+    # up for it); confirm we still picked it up.
+    pkg_b = next(p for p in found if p.name == "Pkg_B.bundle")
+    _assert(pkg_b == archive_b, f"expected {archive_b}, got {pkg_b}")
 
 
 def _selftest_detect_system_frameworks_linker_settings(tmp_root: Path) -> None:
@@ -5114,6 +5324,14 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          lambda: _selftest_inject_objc_headers_preserves_nested_subpaths(tmp_root), False),
         ("execute: inject_objc_headers nested + no umbrella modulemap",
          lambda: _selftest_inject_objc_headers_nested_no_umbrella(tmp_root), False),
+        ("execute: inject_resource_bundles copies SwiftPM bundle into both slices",
+         lambda: _selftest_inject_resource_bundles_copies_swiftpm_bundle(tmp_root), False),
+        ("execute: inject_resource_bundles is a no-op when target has no resources",
+         lambda: _selftest_inject_resource_bundles_no_resources_is_noop(tmp_root), False),
+        ("execute: inject_resource_bundles is idempotent / refreshes stale copies",
+         lambda: _selftest_inject_resource_bundles_idempotent(tmp_root), False),
+        ("execute: _find_resource_bundles dedupes ArchiveIntermediates vs Build/Products",
+         lambda: _selftest_find_resource_bundles_dedupe_and_filter(tmp_root), False),
         ("execute: detect_system_frameworks linker settings",
          lambda: _selftest_detect_system_frameworks_linker_settings(tmp_root), False),
         ("execute: detect_system_frameworks source imports + Tests/ pruning",
