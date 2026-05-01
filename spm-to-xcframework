@@ -1325,33 +1325,41 @@ def scan_target_languages(staged_dir: Path, targets: Iterable[Target]) -> None:
             tgt.language = Language.NA
             continue
 
-        swift_count, objc_count = _count_source_files(target_root)
-        tgt.source_file_count = swift_count + objc_count
-        if swift_count and objc_count:
+        swift_count, objc_impl_count, objc_header_count = _count_source_files(target_root)
+        tgt.source_file_count = swift_count + objc_impl_count + objc_header_count
+        # Mixed requires actual ObjC implementation (.m/.mm). A bare .h
+        # alongside Swift is almost always the auto-generated umbrella
+        # stub Xcode creates for new framework targets — counting it as
+        # ObjC pushed Swift-only products like BlinkIDUX into Mixed and
+        # broke Verify, which then demanded a Headers/ surface the build
+        # legitimately never produces. Header-only targets (no .swift,
+        # no .m/.mm) still classify as ObjC so umbrella/system-wrapper
+        # frameworks keep working.
+        if swift_count and objc_impl_count:
             tgt.language = Language.MIXED
         elif swift_count:
             tgt.language = Language.SWIFT
-        elif objc_count:
+        elif objc_impl_count or objc_header_count:
             tgt.language = Language.OBJC
         else:
             tgt.language = Language.NA
 
 
-def _count_source_files(root: Path) -> Tuple[int, int]:
-    """Walk `root` and return (swift_count, objc_count). Skips
-    _LANG_SCAN_SKIP_DIRS at every directory level.
+def _count_source_files(root: Path) -> Tuple[int, int, int]:
+    """Walk `root` and return (swift_count, objc_impl_count, objc_header_count).
+    Skips _LANG_SCAN_SKIP_DIRS at every directory level.
 
-    ObjC counts .m / .mm implementation files AND bare .h headers — per
-    REWRITE_DESIGN.md §5.1. Including .h is necessary for header-only
-    ObjC targets (umbrella frameworks, system-wrapper modules) which
-    otherwise classify as N/A and confuse the planner.
-
-    Note: when `.swift` files are also present, the target is Mixed
-    rather than ObjC, so the "(without matching .swift)" qualifier in
-    the design is enforced by the caller, not here.
+    `objc_impl_count` covers .m / .mm; `objc_header_count` covers bare .h.
+    They're returned separately because the classifier in
+    `scan_target_languages` needs to distinguish "Swift target with a
+    stub umbrella header" (Swift) from "Swift + ObjC implementation"
+    (Mixed) — the design's "(without matching .swift)" qualifier from
+    REWRITE_DESIGN.md §5.1. Header-only ObjC targets (umbrella frameworks,
+    system-wrapper modules) still classify as ObjC via `objc_header_count`.
     """
     swift = 0
-    objc = 0
+    objc_impl = 0
+    objc_header = 0
     for dirpath, dirnames, filenames in os.walk(root):
         # Prune skip dirs in place so os.walk doesn't descend into them.
         dirnames[:] = [d for d in dirnames if d not in _LANG_SCAN_SKIP_DIRS]
@@ -1359,9 +1367,11 @@ def _count_source_files(root: Path) -> Tuple[int, int]:
             ext = os.path.splitext(fn)[1].lower()
             if ext == ".swift":
                 swift += 1
-            elif ext in (".m", ".mm", ".h"):
-                objc += 1
-    return swift, objc
+            elif ext in (".m", ".mm"):
+                objc_impl += 1
+            elif ext == ".h":
+                objc_header += 1
+    return swift, objc_impl, objc_header
 
 
 def discover_schemes(staged_dir: Path, verbose: bool = False) -> List[str]:
@@ -4199,14 +4209,20 @@ def _find_objc_headers_dir(
             return include_dir
         # 2b. Umbrella-header-at-target-root pattern. Stripe ships every
         #    product this way: e.g. `StripePayments.h` sits at the top of
-        #    `StripePayments/StripePayments/` with no `include/` subdir.
-        #    Accept the two umbrella forms only — `<TargetName>.h` (the
-        #    common Stripe target pattern) and `<TargetName>-umbrella.h`
-        #    (used by the Stripe product target itself). Anything else
-        #    risks over-injection: `inject_objc_headers` walks the
-        #    returned dir recursively and copies every .h, so accepting
-        #    a generic non-`-Swift.h` would leak private/internal
-        #    top-level headers into the framework's public surface.
+        #    `StripePayments/StripePayments/` with no `include/` subdir,
+        #    next to ~220 .swift files. Even when the umbrella itself is
+        #    a stub (just FOUNDATION_EXPORT version constants), the
+        #    Headers/ + module.modulemap surface is what lets ObjC
+        #    consumers `#import <StripePayments/StripePayments.h>` —
+        #    skipping this branch for Swift-classified targets would
+        #    silently drop that surface. Accept the two umbrella forms
+        #    only — `<TargetName>.h` (the common Stripe target pattern)
+        #    and `<TargetName>-umbrella.h` (used by the Stripe product
+        #    target itself). Anything else risks over-injection:
+        #    `inject_objc_headers` walks the returned dir recursively
+        #    and copies every .h, so accepting a generic non-`-Swift.h`
+        #    would leak private/internal top-level headers into the
+        #    framework's public surface.
         for candidate in (f"{target.name}.h", f"{target.name}-umbrella.h"):
             if (target_dir / candidate).is_file():
                 return target_dir
@@ -6004,11 +6020,25 @@ def _verify_one_unit(unit: ExecutedUnit, output_dir: Path) -> VerifyResult:
         and detected_type not in ("", "Unknown")
         and detected_type != required_type
     ):
-        warnings.append(
-            f"plan expected {required_type} framework but on-disk "
-            f"detection says {detected_type} (this usually means an "
-            "injection step partially ran)"
-        )
+        # The Swift→Mixed direction is benign for Stripe-shaped products
+        # (Swift target with a `<TargetName>.h` umbrella stub at target
+        # root): the umbrella injection is intentional so ObjC consumers
+        # can `#import <Mod/Mod.h>`, and post-hoc detection sees the
+        # Headers/ + modulemap and reports Mixed. Other directions (Mixed
+        # plan but ObjC on disk, ObjC plan but Swift on disk, etc.) still
+        # signal a partial injection worth investigating.
+        if required_type == Language.SWIFT and detected_type == Language.MIXED:
+            warnings.append(
+                f"plan expected Swift framework but on-disk detection "
+                "says Mixed (expected for products that ship a "
+                "<TargetName>.h umbrella stub for ObjC consumers)"
+            )
+        else:
+            warnings.append(
+                f"plan expected {required_type} framework but on-disk "
+                f"detection says {detected_type} (this usually means an "
+                "injection step partially ran)"
+            )
     if result.size_bytes > 500 * 1024 * 1024:
         warnings.append(
             f"size {_format_size_iec(result.size_bytes)} exceeds the 500 MB "

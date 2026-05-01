@@ -377,29 +377,39 @@ def _selftest_language_counter(tmp_root: Path) -> None:
     swift_only = base / "swift_only"
     swift_only.mkdir()
     (swift_only / "Foo.swift").write_text("// swift")
-    s, o = _count_source_files(swift_only)
-    _assert(s == 1 and o == 0, f"swift-only got ({s},{o})")
+    s, oi, oh = _count_source_files(swift_only)
+    _assert(s == 1 and oi == 0 and oh == 0, f"swift-only got ({s},{oi},{oh})")
 
     objc_only = base / "objc_only"
     objc_only.mkdir()
     (objc_only / "Bar.m").write_text("// m")
-    (objc_only / "Bar.h").write_text("// h")  # .h counts toward objc per design §5.1
-    s, o = _count_source_files(objc_only)
-    _assert(s == 0 and o == 2, f"objc-only got ({s},{o})")
+    (objc_only / "Bar.h").write_text("// h")
+    s, oi, oh = _count_source_files(objc_only)
+    _assert(s == 0 and oi == 1 and oh == 1, f"objc-only got ({s},{oi},{oh})")
 
     # Header-only ObjC target (umbrella framework shape).
     headers_only = base / "headers_only"
     headers_only.mkdir()
     (headers_only / "Public.h").write_text("// h")
-    s, o = _count_source_files(headers_only)
-    _assert(s == 0 and o == 1, f"headers-only got ({s},{o})")
+    s, oi, oh = _count_source_files(headers_only)
+    _assert(s == 0 and oi == 0 and oh == 1, f"headers-only got ({s},{oi},{oh})")
 
     mixed = base / "mixed"
     mixed.mkdir()
     (mixed / "X.swift").write_text("// swift")
     (mixed / "Y.mm").write_text("// mm")
-    s, o = _count_source_files(mixed)
-    _assert(s == 1 and o == 1, f"mixed got ({s},{o})")
+    s, oi, oh = _count_source_files(mixed)
+    _assert(s == 1 and oi == 1 and oh == 0, f"mixed got ({s},{oi},{oh})")
+
+    # Swift target with a bare umbrella .h stub: NOT mixed (BlinkIDUX
+    # regression — Xcode-generated framework targets ship a stub
+    # header alongside the Swift sources, but the build is Swift-only).
+    swift_with_umbrella = base / "swift_with_umbrella"
+    swift_with_umbrella.mkdir()
+    (swift_with_umbrella / "X.swift").write_text("// swift")
+    (swift_with_umbrella / "Module.h").write_text("// h")
+    s, oi, oh = _count_source_files(swift_with_umbrella)
+    _assert(s == 1 and oi == 0 and oh == 1, f"swift+umbrella got ({s},{oi},{oh})")
 
     # Tests/ skip pruning
     skipper = base / "skipper"
@@ -408,8 +418,41 @@ def _selftest_language_counter(tmp_root: Path) -> None:
     tests = skipper / "Tests"
     tests.mkdir()
     (tests / "Junk.swift").write_text("// swift")
-    s, o = _count_source_files(skipper)
-    _assert(s == 1 and o == 0, f"skip-tests got ({s},{o}); Tests/ should be pruned")
+    s, oi, oh = _count_source_files(skipper)
+    _assert(s == 1 and oi == 0 and oh == 0,
+            f"skip-tests got ({s},{oi},{oh}); Tests/ should be pruned")
+
+    # End-to-end: scan_target_languages must classify the umbrella-stub
+    # case as Swift, not Mixed. Pre-fix, BlinkIDUX (7 .swift + 1 stub
+    # umbrella .h) classified as Mixed and Verify failed expecting a
+    # Headers/ + module.modulemap surface that a Swift-only build never
+    # produces.
+    targets = [
+        Target(name="swift_only", kind=TargetKind.REGULAR, path="swift_only",
+               public_headers_path=None, dependencies=[], exclude=[]),
+        Target(name="objc_only", kind=TargetKind.REGULAR, path="objc_only",
+               public_headers_path=None, dependencies=[], exclude=[]),
+        Target(name="headers_only", kind=TargetKind.REGULAR, path="headers_only",
+               public_headers_path=None, dependencies=[], exclude=[]),
+        Target(name="mixed", kind=TargetKind.REGULAR, path="mixed",
+               public_headers_path=None, dependencies=[], exclude=[]),
+        Target(name="swift_with_umbrella", kind=TargetKind.REGULAR,
+               path="swift_with_umbrella", public_headers_path=None,
+               dependencies=[], exclude=[]),
+    ]
+    scan_target_languages(base, targets)
+    by_name = {t.name: t.language for t in targets}
+    _assert(by_name["swift_only"] == Language.SWIFT,
+            f"swift_only → {by_name['swift_only']}")
+    _assert(by_name["objc_only"] == Language.OBJC,
+            f"objc_only → {by_name['objc_only']}")
+    _assert(by_name["headers_only"] == Language.OBJC,
+            f"headers_only → {by_name['headers_only']}")
+    _assert(by_name["mixed"] == Language.MIXED,
+            f"mixed → {by_name['mixed']}")
+    _assert(by_name["swift_with_umbrella"] == Language.SWIFT,
+            "swift+umbrella must classify as Swift, not Mixed (BlinkIDUX "
+            f"regression); got {by_name['swift_with_umbrella']}")
 
 
 def _selftest_minimixed_fetch_integration() -> None:
@@ -3810,6 +3853,67 @@ def _selftest_find_objc_headers_dir_umbrella_rejects_unrelated_h(tmp_root: Path)
     )
 
 
+def _selftest_find_objc_headers_dir_umbrella_swift_classified_still_fires(
+    tmp_root: Path,
+) -> None:
+    """Regression: the umbrella-at-target-root branch must KEEP firing
+    for Swift-classified targets — Stripe's `StripePayments` is the
+    canonical case (220 .swift + 1 `<TargetName>.h` umbrella, 0 .m/.mm).
+
+    The classifier was tightened so a target with no .m/.mm classifies
+    as Swift even when stub `.h` files are present (BlinkIDUX fix). The
+    umbrella branch must still fire for these targets: even when the
+    umbrella file itself is only a FOUNDATION_EXPORT stub, the resulting
+    `Headers/<Target>.h` + `module.modulemap` is what lets ObjC consumers
+    `#import <StripePayments/StripePayments.h>` and the Swift bridge
+    `-Swift.h` plug into a published Clang module. Gating this branch
+    on `target.language != Language.SWIFT` would silently drop the
+    Stripe surface, which is why no such gate exists.
+    """
+    base = tmp_root / "headers_umbrella_swift_classified"
+    staged = base / "staged"
+
+    target_dir = staged / "StripePayments" / "StripePayments"
+    target_dir.mkdir(parents=True)
+    (target_dir / "StripePayments.h").write_text(
+        "// FOUNDATION_EXPORT double StripePaymentsVersionNumber;"
+    )
+    (target_dir / "API.swift").write_text("// swift")
+
+    raw_dump = {
+        "products": [
+            {"name": "StripePayments", "type": {"library": ["automatic"]},
+             "targets": ["StripePayments"]},
+        ],
+        "targets": [
+            {"name": "StripePayments", "type": "regular",
+             "path": "StripePayments/StripePayments",
+             "publicHeadersPath": None, "dependencies": []},
+        ],
+    }
+    package = Package(
+        name="StripePayments", tools_version="5.7.0", platforms=[],
+        products=[Product(name="StripePayments", linkage=Linkage.AUTOMATIC,
+                          targets=["StripePayments"])],
+        targets=[
+            Target(name="StripePayments", kind=TargetKind.REGULAR,
+                   path="StripePayments/StripePayments",
+                   public_headers_path=None, dependencies=[], exclude=[],
+                   language=Language.SWIFT),
+        ],
+        schemes=[], raw_dump=raw_dump, staged_dir=staged,
+    )
+    found = _find_objc_headers_dir(package, product_name="StripePayments",
+                                    fw_name="StripePayments")
+    _assert(
+        found is not None and found.name == "StripePayments"
+        and found.parent.name == "StripePayments",
+        f"Swift-classified target with <Target>.h umbrella (Stripe shape) "
+        f"must still return target dir so Headers/ + modulemap get "
+        f"injected for ObjC consumers; got {found!r}",
+    )
+
+
 def _selftest_find_objc_headers_dir_dep_walk_no_implicit_leak(tmp_root: Path) -> None:
     """Regression: when the direct product target has no public
     headers and a separately-packaged dep carries an implicit-layout
@@ -6405,6 +6509,8 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          lambda: _selftest_find_objc_headers_dir_umbrella_named_variant(tmp_root), False),
         ("execute: ObjC headers dir rejects unrelated top-level .h",
          lambda: _selftest_find_objc_headers_dir_umbrella_rejects_unrelated_h(tmp_root), False),
+        ("execute: ObjC headers dir umbrella branch fires on Swift-classified target (Stripe)",
+         lambda: _selftest_find_objc_headers_dir_umbrella_swift_classified_still_fires(tmp_root), False),
         ("execute: ObjC headers dir dep walk does not leak implicit include/",
          lambda: _selftest_find_objc_headers_dir_dep_walk_no_implicit_leak(tmp_root), False),
         ("execute: ObjC headers dir dep walk folds internal default include/",
