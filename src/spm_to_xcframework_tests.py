@@ -46,10 +46,12 @@ from spm_to_xcframework import (  # noqa: F401
     _derive_package_label,
     _find_library_call_for_product,
     _find_objc_headers_dir,
+    _find_project_modulemap_for_module,
     _find_resource_bundles,
     _finalize_with_verify,
     _format_size_iec,
     _is_toxic_entry,
+    _modules_declared_in_modulemap,
     _parse_dependencies,
     _parse_dump,
     _parse_linkage,
@@ -5948,6 +5950,442 @@ def _selftest_inject_system_clang_modules_no_system_deps(tmp_root: Path) -> None
             f"unexpected slice contents: {siblings}")
 
 
+# --- inject_bridge_clang_modules tests ------------------------------------
+#
+# Distinct from `inject_system_clang_modules`: that one walks the SPM model
+# for `.systemLibrary` targets. This one parses the framework's emitted
+# swiftinterface for imports the framework's own modulemap doesn't declare,
+# then matches them against project-shipped modulemaps in the package
+# source tree. Original surfacing case: WCDB ships `WCDB_Private` via
+# `src/bridge/module.modulemap` and the WCDBSwift swiftinterface imports
+# it; without injection, consumers fail with `error: no such module
+# 'WCDB_Private'` when rebuilding from the textual interface.
+
+
+def _selftest_scan_swiftinterface_imports_normalizes_dotted(tmp_root: Path) -> None:
+    """`import X.Sub` (submodule) and `import X` (plain) both normalize to
+    the top-level module name `X`. The original regex required the line to
+    end after the first identifier, so dotted imports silently dropped — a
+    swiftinterface containing only `import WCDB_Private.Sub` would report
+    no missing modules and the bridge-shim injection would skip."""
+    base = tmp_root / "scan_imports_dotted"
+    fw = base / "WCDBSwift.framework"
+    swiftmod = fw / "Modules" / "WCDBSwift.swiftmodule"
+    swiftmod.mkdir(parents=True)
+    (swiftmod / "arm64-apple-ios.swiftinterface").write_text(
+        "// swift-interface-format-version: 1.0\n"
+        "import Foundation\n"
+        "import WCDB_Private.Sub\n"
+        "import _Concurrency\n"
+    )
+    (swiftmod / "arm64-apple-ios.private.swiftinterface").write_text(
+        "import Other.Inner.Deep\n"
+        "import Plain\n"
+    )
+    imports = tool._scan_swiftinterface_imports(fw)
+    _assert(
+        imports == {"Foundation", "WCDB_Private", "_Concurrency", "Other", "Plain"},
+        f"dotted imports not normalized: {sorted(imports)}",
+    )
+
+
+def _selftest_inject_bridge_clang_modules_wcdb_shape(tmp_root: Path) -> None:
+    """End-to-end on a WCDB-shaped fixture. Staged source tree contains a
+    `bridge/` target with its own module.modulemap declaring `WCDB_Private`
+    and an umbrella header. The xcframework's primary framework has a
+    swiftinterface that imports `WCDB_Private` and a modulemap that does
+    NOT declare it. After injection, both slices must have a sibling
+    `WCDB_Private.framework` with a framework-form modulemap and the
+    bridge headers."""
+    base = tmp_root / "inject_bridge_wcdb"
+    staged = base / "staged"
+    bridge_src = staged / "src" / "bridge"
+    bridge_src.mkdir(parents=True)
+    (bridge_src / "module.modulemap").write_text(
+        'module WCDB_Private {\n'
+        '    requires objc\n'
+        '    umbrella header "WCDBBridging.h"\n'
+        '    export *\n'
+        '}\n'
+    )
+    (bridge_src / "WCDBBridging.h").write_text("// umbrella\n")
+    (bridge_src / "ColumnBridge.h").write_text("// column\n")
+    (bridge_src / "BindingBridge.h").write_text("// binding\n")
+
+    package = Package(
+        name="WCDBSwift", tools_version="5.5", platforms=[],
+        products=[Product(name="WCDBSwift", linkage=Linkage.AUTOMATIC, targets=["WCDBSwift"])],
+        targets=[
+            Target(name="bridge", kind=TargetKind.REGULAR, path="src/bridge",
+                   public_headers_path=None, dependencies=[], exclude=[]),
+            Target(name="WCDBSwift", kind=TargetKind.REGULAR, path="src/swift",
+                   public_headers_path=None, dependencies=["bridge"], exclude=[]),
+        ],
+        schemes=[], raw_dump={}, staged_dir=staged,
+    )
+
+    xcfw = base / "WCDBSwift.xcframework"
+    for slice_name in ("ios-arm64", "ios-arm64_x86_64-simulator"):
+        primary = xcfw / slice_name / "WCDBSwift.framework"
+        primary.mkdir(parents=True)
+        # Modulemap declares the main module only (matches what
+        # xcodebuild archive emits when bridge headers are auto-collected).
+        (primary / "Modules").mkdir(exist_ok=True)
+        (primary / "Modules" / "module.modulemap").write_text(
+            'framework module WCDBSwift {\n'
+            '  header "ColumnBridge.h"\n'
+            '  export *\n'
+            '}\n'
+        )
+        # Swiftinterface imports WCDB_Private — the trigger.
+        swiftmod = primary / "Modules" / "WCDBSwift.swiftmodule"
+        swiftmod.mkdir(parents=True)
+        (swiftmod / "arm64-apple-ios.swiftinterface").write_text(
+            "// swift-interface-format-version: 1.0\n"
+            "import Foundation\n"
+            "import Swift\n"
+            "import WCDB_Private\n"
+            "import _Concurrency\n"
+        )
+    (xcfw / "Info.plist").write_text("<plist></plist>")
+
+    n = inject_bridge_clang_modules(
+        xcframework_path=xcfw, package=package,
+        fw_name="WCDBSwift", verbose=False,
+    )
+    _assert(n == 1, f"expected 1 bridge shim injected, got {n}")
+
+    for slice_name in ("ios-arm64", "ios-arm64_x86_64-simulator"):
+        shim_fw = xcfw / slice_name / "WCDB_Private.framework"
+        _assert(shim_fw.is_dir(), f"missing shim framework dir in {slice_name}")
+        modulemap = shim_fw / "Modules" / "module.modulemap"
+        _assert(modulemap.is_file(), f"missing modulemap in {slice_name}")
+        text = modulemap.read_text()
+        _assert("framework module WCDB_Private" in text,
+                f"modulemap not promoted to framework form:\n{text}")
+        _assert('umbrella header "WCDBBridging.h"' in text,
+                f"umbrella header lost:\n{text}")
+        # All three .h files in bridge_src/ should land in Headers/
+        # because the umbrella header expansion takes every sibling .h.
+        for hname in ("WCDBBridging.h", "ColumnBridge.h", "BindingBridge.h"):
+            h = shim_fw / "Headers" / hname
+            _assert(h.is_file(), f"missing header {hname} in {slice_name}")
+        # Sentinel marks this as a spm-to-xcframework-injected shim
+        # so language classification skips it.
+        _assert((shim_fw / ".spm-to-xcframework-system-shim").is_file(),
+                f"missing sentinel file in {slice_name}")
+
+
+def _selftest_inject_bridge_clang_modules_idempotent(tmp_root: Path) -> None:
+    """Second call must be a no-op once shims exist. Counter drops to 0
+    and existing modulemap mtime is preserved."""
+    base = tmp_root / "inject_bridge_idempotent"
+    staged = base / "staged"
+    bridge_src = staged / "src" / "bridge"
+    bridge_src.mkdir(parents=True)
+    (bridge_src / "module.modulemap").write_text(
+        'module WCDB_Private { umbrella header "U.h" export * }\n'
+    )
+    (bridge_src / "U.h").write_text("// u\n")
+
+    package = Package(
+        name="WCDBSwift", tools_version="5.5", platforms=[],
+        products=[Product(name="WCDBSwift", linkage=Linkage.AUTOMATIC, targets=["WCDBSwift"])],
+        targets=[Target(name="WCDBSwift", kind=TargetKind.REGULAR, path="src/swift",
+                        public_headers_path=None, dependencies=[], exclude=[])],
+        schemes=[], raw_dump={}, staged_dir=staged,
+    )
+
+    xcfw = base / "WCDBSwift.xcframework"
+    primary = xcfw / "ios-arm64" / "WCDBSwift.framework"
+    primary.mkdir(parents=True)
+    (primary / "Modules").mkdir()
+    (primary / "Modules" / "module.modulemap").write_text(
+        'framework module WCDBSwift { export * }\n'
+    )
+    swiftmod = primary / "Modules" / "WCDBSwift.swiftmodule"
+    swiftmod.mkdir(parents=True)
+    (swiftmod / "arm64-apple-ios.swiftinterface").write_text("import WCDB_Private\n")
+    (xcfw / "Info.plist").write_text("<plist></plist>")
+
+    first = inject_bridge_clang_modules(
+        xcframework_path=xcfw, package=package, fw_name="WCDBSwift", verbose=False,
+    )
+    _assert(first == 1, f"first call should report 1, got {first}")
+
+    mm = xcfw / "ios-arm64" / "WCDB_Private.framework" / "Modules" / "module.modulemap"
+    first_mtime = mm.stat().st_mtime_ns
+
+    second = inject_bridge_clang_modules(
+        xcframework_path=xcfw, package=package, fw_name="WCDBSwift", verbose=False,
+    )
+    _assert(second == 0, f"second call should report 0, got {second}")
+    _assert(mm.stat().st_mtime_ns == first_mtime,
+            "modulemap was rewritten on second call — not idempotent")
+
+
+def _selftest_inject_bridge_clang_modules_no_missing_imports(tmp_root: Path) -> None:
+    """When every swiftinterface import is either declared in the
+    framework's modulemap or a Swift built-in, the pass injects nothing.
+    Pure-Swift packages (no project-shipped clang modulemap) are this
+    case — covers Nuke, Lottie, Kingfisher shapes."""
+    base = tmp_root / "inject_bridge_pureswift"
+    staged = base / "staged"
+    staged.mkdir(parents=True)
+
+    package = Package(
+        name="Nuke", tools_version="5.6.0", platforms=[],
+        products=[Product(name="Nuke", linkage=Linkage.AUTOMATIC, targets=["Nuke"])],
+        targets=[Target(name="Nuke", kind=TargetKind.REGULAR, path=None,
+                        public_headers_path=None, dependencies=[], exclude=[])],
+        schemes=[], raw_dump={}, staged_dir=staged,
+    )
+
+    xcfw = base / "Nuke.xcframework"
+    primary = xcfw / "ios-arm64" / "Nuke.framework"
+    primary.mkdir(parents=True)
+    swiftmod = primary / "Modules" / "Nuke.swiftmodule"
+    swiftmod.mkdir(parents=True)
+    (swiftmod / "arm64-apple-ios.swiftinterface").write_text(
+        "import Foundation\nimport Swift\nimport _Concurrency\nimport UIKit\n"
+    )
+    (xcfw / "Info.plist").write_text("<plist></plist>")
+
+    n = inject_bridge_clang_modules(
+        xcframework_path=xcfw, package=package, fw_name="Nuke", verbose=False,
+    )
+    # UIKit is unknown to the finder (no modulemap in package source),
+    # which is the right behavior — system frameworks are served by the
+    # consumer's SDK. Foundation/Swift/_Concurrency are filtered before
+    # the finder is even called.
+    _assert(n == 0, f"expected 0 injected for pure-Swift package, got {n}")
+    siblings = sorted(p.name for p in (xcfw / "ios-arm64").iterdir())
+    _assert(siblings == ["Nuke.framework"],
+            f"unexpected slice contents: {siblings}")
+
+
+def _selftest_inject_bridge_clang_modules_skips_already_declared(tmp_root: Path) -> None:
+    """If the framework's modulemap ALREADY declares the imported module
+    name (e.g. as a submodule), no injection happens — the import is
+    already resolvable."""
+    base = tmp_root / "inject_bridge_already_declared"
+    staged = base / "staged"
+    bridge_src = staged / "bridge"
+    bridge_src.mkdir(parents=True)
+    (bridge_src / "module.modulemap").write_text(
+        'module WCDB_Private { umbrella header "U.h" export * }\n'
+    )
+    (bridge_src / "U.h").write_text("// u\n")
+
+    package = Package(
+        name="X", tools_version="5.5", platforms=[],
+        products=[Product(name="X", linkage=Linkage.AUTOMATIC, targets=["X"])],
+        targets=[Target(name="X", kind=TargetKind.REGULAR, path="x",
+                        public_headers_path=None, dependencies=[], exclude=[])],
+        schemes=[], raw_dump={}, staged_dir=staged,
+    )
+
+    xcfw = base / "X.xcframework"
+    primary = xcfw / "ios-arm64" / "X.framework"
+    primary.mkdir(parents=True)
+    (primary / "Modules").mkdir()
+    # Framework's modulemap already declares WCDB_Private → no injection
+    # needed even though the swiftinterface imports it.
+    (primary / "Modules" / "module.modulemap").write_text(
+        'framework module X { export * }\n'
+        'module WCDB_Private { header "x.h" export * }\n'
+    )
+    swiftmod = primary / "Modules" / "X.swiftmodule"
+    swiftmod.mkdir(parents=True)
+    (swiftmod / "arm64-apple-ios.swiftinterface").write_text("import WCDB_Private\n")
+    (xcfw / "Info.plist").write_text("<plist></plist>")
+
+    n = inject_bridge_clang_modules(
+        xcframework_path=xcfw, package=package, fw_name="X", verbose=False,
+    )
+    _assert(n == 0, f"expected 0 injected when already declared, got {n}")
+
+
+def _selftest_find_project_modulemap_for_module_resolves_umbrella() -> None:
+    """`umbrella header "X.h"` must collect every sibling .h in the same
+    directory (clang's umbrella semantics). Verified directly so the
+    end-to-end test can rely on this expansion."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        staged = Path(tmp) / "staged"
+        bridge = staged / "bridge"
+        bridge.mkdir(parents=True)
+        (bridge / "module.modulemap").write_text(
+            'module M { umbrella header "U.h" export * }\n'
+        )
+        (bridge / "U.h").write_text("// u\n")
+        (bridge / "A.h").write_text("// a\n")
+        (bridge / "B.h").write_text("// b\n")
+        # Non-header file must be ignored.
+        (bridge / "notheader.txt").write_text("noise\n")
+        package = Package(
+            name="P", tools_version="5.5", platforms=[],
+            products=[], targets=[], schemes=[], raw_dump={}, staged_dir=staged,
+        )
+        result = _find_project_modulemap_for_module(package, "M")
+        _assert(result is not None, "expected modulemap match for M")
+        modulemap_path, headers = result
+        names = sorted(h.name for h, _rel in headers)
+        _assert(names == ["A.h", "B.h", "U.h"],
+                f"expected umbrella to expand to all sibling .h files, got {names}")
+        # Modulemap is at bridge/, so each header's relative path is just its
+        # basename (no nested directory prefix in this fixture).
+        rels = sorted(str(rel) for _h, rel in headers)
+        _assert(rels == ["A.h", "B.h", "U.h"],
+                f"expected flat relative paths, got {rels}")
+
+
+def _selftest_find_project_modulemap_for_module_symlinked_umbrella() -> None:
+    """Regression test for the WCDB shape: `bridge/include/` ships a
+    `module.modulemap` that names `WCDBBridging.h` as its umbrella, but
+    EVERY .h in `bridge/include/` is a SYMLINK pointing into a sibling
+    directory (e.g. `../cppbridge/BindingBridge.h`). An umbrella header
+    expansion that calls `Path.resolve()` would dereference the umbrella
+    symlink and conclude the umbrella's parent dir is `bridge/` — a
+    directory containing only one `.h` — silently dropping the other 64
+    headers and producing a shim framework that fails to compile because
+    `#include "ObjectBridge.h"` from the umbrella can't find its sibling.
+
+    Use logical paths (no resolve) so the umbrella's parent stays at
+    `bridge/include/` regardless of where the symlinks ultimately point.
+    """
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        staged = Path(tmp) / "staged"
+        bridge = staged / "bridge"
+        include = bridge / "include"
+        include.mkdir(parents=True)
+        (include / "module.modulemap").write_text(
+            'module M { umbrella header "WCDBBridging.h" export * }\n'
+        )
+        # Real files live in bridge/, NOT bridge/include/.
+        (bridge / "WCDBBridging.h").write_text("// umbrella\n")
+        (bridge / "ObjectBridge.h").write_text("// real header\n")
+        (bridge / "BindingBridge.h").write_text("// real header\n")
+        # bridge/include/ contains only symlinks pointing into the parent.
+        (include / "WCDBBridging.h").symlink_to("../WCDBBridging.h")
+        (include / "ObjectBridge.h").symlink_to("../ObjectBridge.h")
+        (include / "BindingBridge.h").symlink_to("../BindingBridge.h")
+        package = Package(
+            name="P", tools_version="5.5", platforms=[],
+            products=[], targets=[], schemes=[], raw_dump={}, staged_dir=staged,
+        )
+        result = _find_project_modulemap_for_module(package, "M")
+        _assert(result is not None, "expected modulemap match for M")
+        _, headers = result
+        names = sorted(h.name for h, _rel in headers)
+        _assert(names == ["BindingBridge.h", "ObjectBridge.h", "WCDBBridging.h"],
+                f"expected umbrella to enumerate symlinked siblings in include/, got {names}")
+
+
+def _selftest_find_project_modulemap_for_module_skips_dangling_symlinks() -> None:
+    """Regression test for the WCDB shape: `bridge/include/` ships a
+    handful of symlinks into `bridge/tests/` (e.g.
+    `AutoAddColumnObject.h -> ..//tests/crud/AutoAddColumnObject.h`) and
+    SwiftPM-style staging deletes the `tests/` subdir per the package's
+    `exclude: ["tests"]` declaration. The dangling symlinks survive the
+    prune but `shutil.copy2` would crash with FileNotFoundError when it
+    tries to open the now-missing target. Filter them out at scan time
+    so the shim only contains headers that have actual content — those
+    test-only includes aren't referenced by the public umbrella chain.
+    """
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        staged = Path(tmp) / "staged"
+        bridge = staged / "bridge"
+        bridge.mkdir(parents=True)
+        (bridge / "module.modulemap").write_text(
+            'module M { umbrella header "U.h" export * }\n'
+        )
+        (bridge / "U.h").write_text("// umbrella\n")
+        (bridge / "Real.h").write_text("// real\n")
+        # Dangling symlink: target tests/ subdir was pruned.
+        (bridge / "Dangling.h").symlink_to("missing/Header.h")
+        package = Package(
+            name="P", tools_version="5.5", platforms=[],
+            products=[], targets=[], schemes=[], raw_dump={}, staged_dir=staged,
+        )
+        result = _find_project_modulemap_for_module(package, "M")
+        _assert(result is not None, "expected modulemap match")
+        _, headers = result
+        names = sorted(h.name for h, _rel in headers)
+        _assert(names == ["Real.h", "U.h"],
+                f"dangling symlink should be filtered out, got {names}")
+
+
+def _selftest_find_project_modulemap_for_module_preserves_nested_paths() -> None:
+    """Modulemaps that reference headers at nested paths (e.g.
+    `umbrella header "include/U.h"` or `header "sub/A.h"`) must surface
+    those paths through the headers list so the bridge-shim copier can
+    mirror them under `Headers/<rel>`. Flattening to basenames silently
+    breaks the shim because clang resolves the modulemap's textual
+    references against the Headers/ tree at consumer compile time."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        staged = Path(tmp) / "staged"
+        bridge = staged / "bridge"
+        include = bridge / "include"
+        sub = bridge / "sub"
+        include.mkdir(parents=True)
+        sub.mkdir(parents=True)
+        (bridge / "module.modulemap").write_text(
+            'module M {\n'
+            '    umbrella header "include/U.h"\n'
+            '    header "sub/A.h"\n'
+            '    export *\n'
+            '}\n'
+        )
+        (include / "U.h").write_text("// umbrella\n")
+        (include / "Sibling.h").write_text("// sibling at include/\n")
+        (sub / "A.h").write_text("// explicit nested header\n")
+        package = Package(
+            name="P", tools_version="5.5", platforms=[],
+            products=[], targets=[], schemes=[], raw_dump={}, staged_dir=staged,
+        )
+        result = _find_project_modulemap_for_module(package, "M")
+        _assert(result is not None, "expected modulemap match for M")
+        _, headers = result
+        rels = sorted(str(rel) for _h, rel in headers)
+        _assert(rels == ["include/Sibling.h", "include/U.h", "sub/A.h"],
+                f"nested header paths must be preserved relative to modulemap dir, got {rels}")
+
+
+def _selftest_find_project_modulemap_for_module_returns_none_for_system() -> None:
+    """When the requested module name has no matching modulemap in the
+    staged tree, return None — the caller is expected to silently treat
+    it as a system framework served by the consumer's SDK."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        staged = Path(tmp) / "staged"
+        staged.mkdir(parents=True)
+        package = Package(
+            name="P", tools_version="5.5", platforms=[],
+            products=[], targets=[], schemes=[], raw_dump={}, staged_dir=staged,
+        )
+        _assert(_find_project_modulemap_for_module(package, "UIKit") is None,
+                "expected None for unknown system module")
+
+
+def _selftest_modules_declared_in_modulemap_picks_top_and_sub() -> None:
+    """The declared-modules parser must catch both top-level
+    `module X { ... }` and submodule `module X.Y { ... }` forms — and
+    `framework module Z { ... }` for already-promoted modulemaps."""
+    text = (
+        'framework module Top { export * }\n'
+        'module Bare { export * }\n'
+        'explicit module Top.Sub { header "x.h" }\n'
+    )
+    declared = _modules_declared_in_modulemap(text)
+    _assert("Top" in declared, f"missing Top: {declared}")
+    _assert("Bare" in declared, f"missing Bare: {declared}")
+    _assert("Top.Sub" in declared, f"missing Top.Sub: {declared}")
+
+
 def _selftest_detect_framework_type_skips_system_shim_sibling(tmp_root: Path) -> None:
     """Regression test for the issue surfaced by GRDB integration:
     `detect_framework_type` must classify a Swift framework as Swift
@@ -6549,6 +6987,28 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          lambda: _selftest_inject_system_clang_modules_warns_on_missing_modulemap(tmp_root), False),
         ("execute: inject_system_clang_modules preserves nested headers (P2)",
          lambda: _selftest_inject_system_clang_modules_preserves_nested_headers(tmp_root), False),
+        ("execute: scan_swiftinterface_imports normalizes dotted imports",
+         lambda: _selftest_scan_swiftinterface_imports_normalizes_dotted(tmp_root), False),
+        ("execute: inject_bridge_clang_modules end-to-end (WCDB shape)",
+         lambda: _selftest_inject_bridge_clang_modules_wcdb_shape(tmp_root), False),
+        ("execute: inject_bridge_clang_modules idempotent on second call",
+         lambda: _selftest_inject_bridge_clang_modules_idempotent(tmp_root), False),
+        ("execute: inject_bridge_clang_modules no-op when no missing imports",
+         lambda: _selftest_inject_bridge_clang_modules_no_missing_imports(tmp_root), False),
+        ("execute: inject_bridge_clang_modules skips already-declared module",
+         lambda: _selftest_inject_bridge_clang_modules_skips_already_declared(tmp_root), False),
+        ("execute: find_project_modulemap_for_module resolves umbrella header",
+         _selftest_find_project_modulemap_for_module_resolves_umbrella, False),
+        ("execute: find_project_modulemap_for_module symlinked umbrella (WCDB shape)",
+         _selftest_find_project_modulemap_for_module_symlinked_umbrella, False),
+        ("execute: find_project_modulemap_for_module skips dangling symlinks",
+         _selftest_find_project_modulemap_for_module_skips_dangling_symlinks, False),
+        ("execute: find_project_modulemap_for_module preserves nested header paths",
+         _selftest_find_project_modulemap_for_module_preserves_nested_paths, False),
+        ("execute: find_project_modulemap_for_module returns None for system framework",
+         _selftest_find_project_modulemap_for_module_returns_none_for_system, False),
+        ("execute: modules_declared_in_modulemap picks top + sub modules",
+         _selftest_modules_declared_in_modulemap_picks_top_and_sub, False),
         ("execute: detect_framework_type skips system shim sibling (GRDB)",
          lambda: _selftest_detect_framework_type_skips_system_shim_sibling(tmp_root), False),
         ("execute: read_xcframework_library_paths basic happy path",
