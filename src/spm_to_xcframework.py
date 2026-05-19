@@ -4344,6 +4344,72 @@ def _find_swiftmodule_in_dd(
     return None
 
 
+# macOS frameworks ship in the "versioned bundle" layout: real content lives
+# under `Versions/A/` and the framework root holds only `Versions/` plus
+# convenience symlinks (`Foo -> Versions/Current/Foo`, etc.). Apple's
+# codesigning rejects any framework that has real (non-symlink) directories
+# at the root other than `Versions/` — "unsealed contents present in the
+# root directory of an embedded framework."
+#
+# `xcodebuild archive` emits a macOS framework already in versioned layout
+# (binary + Resources/Info.plist under Versions/A), but it does NOT pre-
+# create Modules/ or Headers/ (xcodebuild's archive output doesn't include
+# swiftinterface or public ObjC headers — those come from DerivedData and
+# our injection passes). Our injectors therefore must write under Versions/A
+# and create root symlinks themselves, otherwise they'd lay a real Modules/
+# at the framework root and break codesigning downstream.
+#
+# iOS / tvOS / watchOS / visionOS / Mac Catalyst all use the flat layout
+# (no Versions/ directory; everything at the framework root), and these
+# helpers no-op on those slices — `_framework_content_root` returns
+# fw_path itself, and `_ensure_root_symlink` returns without touching
+# anything.
+
+
+def _framework_content_root(fw_path: Path) -> Path:
+    """Return the directory under a framework bundle where real injected
+    content should live.
+
+    Versioned (macOS-style) bundles: `<fw>/Versions/A`. Flat (iOS-style)
+    bundles: `fw_path` itself. Detected by presence of a real (non-symlink)
+    `Versions/A` directory at the framework root.
+    """
+    versions_a = fw_path / "Versions" / "A"
+    if versions_a.is_dir() and not versions_a.is_symlink():
+        return versions_a
+    return fw_path
+
+
+def _ensure_root_symlink(fw_path: Path, name: str) -> None:
+    """For a versioned framework, ensure `<fw>/<name>` is a symlink to
+    `Versions/Current/<name>`. No-op for flat frameworks.
+
+    If a real (non-symlink) directory squats at the root path — typically
+    the result of a prior injection that wrote in flat-layout style on a
+    macOS framework — it is migrated to `Versions/A/<name>` and the
+    symlink takes its place. Migration is the only reliable repair: a
+    leftover real directory at the root will cause the codesigning
+    rejection this whole machinery exists to prevent.
+    """
+    versions_a = fw_path / "Versions" / "A"
+    if not (versions_a.is_dir() and not versions_a.is_symlink()):
+        return  # flat (iOS-style) framework — nothing to symlink.
+    link = fw_path / name
+    target = Path("Versions") / "Current" / name
+    if link.is_symlink():
+        if os.readlink(link) == str(target):
+            return
+        link.unlink()
+    elif link.exists():
+        # Migrate a real root directory left over from a prior injection
+        # into the versioned location, then drop the symlink in place.
+        dest = versions_a / name
+        if dest.exists():
+            shutil.rmtree(dest)
+        shutil.move(str(link), str(dest))
+    link.symlink_to(target)
+
+
 def inject_swiftmodule(
     *,
     fw_path: Path,
@@ -4365,8 +4431,12 @@ def inject_swiftmodule(
     Returns True iff anything was injected. Idempotent: if any
     `Modules/<X>.swiftmodule/` already contains `.swiftinterface` files
     this is a no-op.
+
+    Versioned (macOS) frameworks: writes under `Versions/A/Modules/` and
+    ensures `<fw>/Modules` is a symlink. See `_framework_content_root`
+    for the rationale.
     """
-    modules_dir = fw_path / "Modules"
+    modules_dir = _framework_content_root(fw_path) / "Modules"
     if modules_dir.is_dir():
         for sm in modules_dir.glob("*.swiftmodule"):
             if sm.is_dir():
@@ -4390,6 +4460,7 @@ def inject_swiftmodule(
     if dest.exists():
         shutil.rmtree(dest)
     shutil.copytree(swiftmod, dest)
+    _ensure_root_symlink(fw_path, "Modules")
     return True
 
 
@@ -4577,9 +4648,10 @@ def _generate_modulemap(fw_path: Path, fw_name: str) -> None:
     exists, otherwise lists every header explicitly. Same shape as the
     legacy bash 1430-1450.
     """
-    modules_dir = fw_path / "Modules"
+    content_root = _framework_content_root(fw_path)
+    modules_dir = content_root / "Modules"
     modules_dir.mkdir(parents=True, exist_ok=True)
-    headers_dir = fw_path / "Headers"
+    headers_dir = content_root / "Headers"
     umbrella = headers_dir / f"{fw_name}.h"
     if umbrella.is_file():
         # The `module * { export * }` line tells Clang to walk the
@@ -4829,7 +4901,7 @@ def inject_objc_headers(
 
     Returns True iff anything was injected.
     """
-    headers_target = fw_path / "Headers"
+    headers_target = _framework_content_root(fw_path) / "Headers"
     if headers_target.is_dir():
         for p in headers_target.glob("*.h"):
             if not p.name.endswith("-Swift.h"):
@@ -4870,6 +4942,8 @@ def inject_objc_headers(
         return False
 
     _generate_modulemap(fw_path, fw_name)
+    _ensure_root_symlink(fw_path, "Headers")
+    _ensure_root_symlink(fw_path, "Modules")
     verbose_log(verbose, f"  Injected {copied} header(s) + modulemap")
     return True
 
@@ -4918,7 +4992,7 @@ def _scan_swiftinterface_imports(fw_path: Path) -> Set[str]:
     needs the top-level name to match what's declared in the project's
     own `module.modulemap`.
     """
-    modules_dir = fw_path / "Modules"
+    modules_dir = _framework_content_root(fw_path) / "Modules"
     if not modules_dir.is_dir():
         return set()
     imports: Set[str] = set()
@@ -5253,18 +5327,33 @@ def inject_resource_bundles(
     verbose: bool,
 ) -> int:
     """Copy SwiftPM-emitted resource bundles from this slice's
-    `BuildProductsPath` into the framework root.
+    `BuildProductsPath` into the framework.
 
     Idempotent: an existing same-named bundle inside the framework is
     replaced. Returns the number of bundles copied (zero when the target
     declares no `.process` / `.copy` resources, which is the common case).
+
+    Flat (iOS-style) frameworks: bundles drop at the framework root —
+    that's where `Bundle(for:).bundleURL` points and where Xcode-built
+    iOS frameworks conventionally hold sub-bundles. Versioned
+    (macOS-style) frameworks: bundles drop under `Versions/A/Resources/`,
+    where Apple puts sub-bundles by convention and where
+    `Bundle(for:).resourceURL` looks at runtime. Placing them at the
+    framework root on macOS would trip codesigning ("unsealed contents
+    present in the root directory of an embedded framework").
     """
     bundles = _find_resource_bundles(dd_path)
     if not bundles:
         return 0
+    content_root = _framework_content_root(fw_path)
+    if content_root != fw_path:
+        dest_dir = content_root / "Resources"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        dest_dir = fw_path
     copied = 0
     for src in bundles:
-        dest = fw_path / src.name
+        dest = dest_dir / src.name
         if dest.exists():
             shutil.rmtree(dest)
         shutil.copytree(src, dest, symlinks=True)
@@ -5272,6 +5361,7 @@ def inject_resource_bundles(
         verbose_log(verbose, f"  Copied {src.name} into {variant} {fw_name}.framework")
     if copied:
         dim(f"  Injected {copied} SwiftPM resource bundle(s) ({variant})")
+        _ensure_root_symlink(fw_path, "Resources")
     return copied
 
 

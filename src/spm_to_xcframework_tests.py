@@ -45,9 +45,11 @@ from spm_to_xcframework import (  # noqa: F401
     _default_target_path,
     _derive_package_label,
     _find_library_call_for_product,
+    _ensure_root_symlink,
     _find_objc_headers_dir,
     _find_project_modulemap_for_module,
     _find_resource_bundles,
+    _framework_content_root,
     _finalize_with_verify,
     _format_size_iec,
     _is_toxic_entry,
@@ -6135,6 +6137,222 @@ def _selftest_system_target_source_dir_missing(tmp_root: Path) -> None:
             "missing source dir should return None")
 
 
+def _make_flat_framework(fw_path: Path) -> Path:
+    """Create a minimal flat-layout (iOS-style) framework on disk."""
+    fw_path.mkdir(parents=True, exist_ok=True)
+    (fw_path / "Foo").write_bytes(b"\x00")  # binary stub
+    (fw_path / "Info.plist").write_text(
+        '<?xml version="1.0"?><plist version="1.0"><dict/></plist>'
+    )
+    return fw_path
+
+
+def _make_versioned_framework(fw_path: Path, fw_name: str = "Foo") -> Path:
+    """Create a minimal macOS-style versioned framework on disk, matching
+    xcodebuild's archive output: binary + Resources/Info.plist under
+    Versions/A, with Current → A and a Resources root symlink."""
+    versions_a = fw_path / "Versions" / "A"
+    (versions_a / "Resources").mkdir(parents=True)
+    (versions_a / fw_name).write_bytes(b"\x00")  # binary stub
+    (versions_a / "Resources" / "Info.plist").write_text(
+        '<?xml version="1.0"?><plist version="1.0"><dict/></plist>'
+    )
+    (fw_path / "Versions" / "Current").symlink_to("A")
+    (fw_path / fw_name).symlink_to(Path("Versions") / "Current" / fw_name)
+    (fw_path / "Resources").symlink_to(Path("Versions") / "Current" / "Resources")
+    return fw_path
+
+
+def _selftest_framework_content_root_flat_vs_versioned(tmp_root: Path) -> None:
+    """_framework_content_root must return fw_path for flat frameworks and
+    Versions/A for versioned (macOS-style) frameworks. Detection key:
+    presence of a real, non-symlink Versions/A directory at the root.
+    """
+    base = tmp_root / "content_root"
+    flat_fw = _make_flat_framework(base / "Flat.framework")
+    versioned_fw = _make_versioned_framework(base / "Versioned.framework")
+    _assert(
+        _framework_content_root(flat_fw) == flat_fw,
+        f"flat framework should resolve to fw_path, got "
+        f"{_framework_content_root(flat_fw)}",
+    )
+    expected_versioned = versioned_fw / "Versions" / "A"
+    _assert(
+        _framework_content_root(versioned_fw) == expected_versioned,
+        f"versioned framework should resolve to Versions/A, got "
+        f"{_framework_content_root(versioned_fw)}",
+    )
+
+
+def _selftest_ensure_root_symlink_versioned(tmp_root: Path) -> None:
+    """On a versioned framework with no root Modules entry, the helper
+    must create a relative symlink `Modules -> Versions/Current/Modules`.
+    No-op on flat frameworks. Idempotent on already-correct symlinks.
+    """
+    base = tmp_root / "ensure_symlink"
+    versioned_fw = _make_versioned_framework(base / "V.framework")
+    # No Modules at root yet — helper should create the symlink.
+    _ensure_root_symlink(versioned_fw, "Modules")
+    link = versioned_fw / "Modules"
+    _assert(link.is_symlink(), "Modules should be a symlink after ensure")
+    _assert(
+        os.readlink(link) == str(Path("Versions") / "Current" / "Modules"),
+        f"unexpected symlink target: {os.readlink(link)}",
+    )
+    # Idempotent — second call must not raise or change the link.
+    _ensure_root_symlink(versioned_fw, "Modules")
+    _assert(link.is_symlink(), "Modules should remain a symlink after re-ensure")
+
+    # Flat framework: helper must be a no-op.
+    flat_fw = _make_flat_framework(base / "F.framework")
+    _ensure_root_symlink(flat_fw, "Modules")
+    _assert(
+        not (flat_fw / "Modules").exists(),
+        "ensure_root_symlink should not touch flat frameworks",
+    )
+
+
+def _selftest_ensure_root_symlink_migrates_real_dir(tmp_root: Path) -> None:
+    """If a previous broken injection left a real `Modules/` directory at
+    the framework root of a versioned framework, the helper must migrate
+    that directory into `Versions/A/Modules` and replace the root with a
+    symlink. This repairs frameworks produced by older builds.
+    """
+    base = tmp_root / "migrate_root"
+    fw = _make_versioned_framework(base / "M.framework")
+    # Simulate the bug: real Modules/ directory at the framework root.
+    real_modules = fw / "Modules"
+    real_modules.mkdir()
+    (real_modules / "Foo.swiftmodule").mkdir()
+    (real_modules / "Foo.swiftmodule" / "arm64.swiftinterface").write_text(
+        "// iface\n"
+    )
+
+    _ensure_root_symlink(fw, "Modules")
+
+    link = fw / "Modules"
+    _assert(link.is_symlink(), "Modules at root should be a symlink after migration")
+    migrated = fw / "Versions" / "A" / "Modules" / "Foo.swiftmodule" / "arm64.swiftinterface"
+    _assert(migrated.is_file(), f"swiftinterface not migrated under Versions/A: {migrated}")
+
+
+def _selftest_inject_swiftmodule_versioned_macos(tmp_root: Path) -> None:
+    """inject_swiftmodule on a macOS-style versioned framework writes
+    Modules/ under Versions/A and leaves the framework root with a
+    symlink. This is the codesigning fix from MACOS_SLICE_BUG.md.
+    """
+    base = tmp_root / "inject_swift_macos"
+    fw = _make_versioned_framework(base / "Foo.framework")
+    # Synthesize a DerivedData tree containing a Foo.swiftmodule with
+    # one .swiftinterface — matches what xcodebuild emits.
+    dd = base / "DerivedData"
+    swiftmod = dd / "Build" / "Products" / "Release" / "Foo.swiftmodule"
+    swiftmod.mkdir(parents=True)
+    (swiftmod / "arm64-apple-macos.swiftinterface").write_text(
+        "// swift-interface-format-version: 1.0\nimport Foundation\n"
+    )
+
+    injected = inject_swiftmodule(
+        fw_path=fw,
+        fw_name="Foo",
+        scheme="Foo",
+        dd_path=dd,
+        variant="macos-arm64_x86_64",
+        verbose=False,
+    )
+    _assert(injected, "inject_swiftmodule should report injection on macOS slice")
+
+    # The real swiftmodule must land under Versions/A/Modules, NOT at root.
+    real_dest = fw / "Versions" / "A" / "Modules" / "Foo.swiftmodule" / "arm64-apple-macos.swiftinterface"
+    _assert(real_dest.is_file(), f"swiftinterface not at versioned path: {real_dest}")
+
+    # Root must hold a symlink, not a real directory — this is the
+    # codesigning constraint.
+    root_modules = fw / "Modules"
+    _assert(root_modules.is_symlink(),
+            f"root Modules must be a symlink, got real dir at {root_modules}")
+    _assert(
+        os.readlink(root_modules) == str(Path("Versions") / "Current" / "Modules"),
+        f"root Modules symlink wrong target: {os.readlink(root_modules)}",
+    )
+
+    # Re-run must be idempotent (interfaces already present → no-op).
+    injected_again = inject_swiftmodule(
+        fw_path=fw,
+        fw_name="Foo",
+        scheme="Foo",
+        dd_path=dd,
+        variant="macos-arm64_x86_64",
+        verbose=False,
+    )
+    _assert(not injected_again,
+            "inject_swiftmodule should be a no-op when interfaces already present")
+
+
+def _selftest_inject_swiftmodule_flat_unchanged(tmp_root: Path) -> None:
+    """inject_swiftmodule on a flat (iOS-style) framework must keep the
+    flat layout: Modules/ stays a real directory at the framework root.
+    Regression guard so the macOS fix doesn't accidentally affect iOS.
+    """
+    base = tmp_root / "inject_swift_flat"
+    fw = _make_flat_framework(base / "Foo.framework")
+    dd = base / "DerivedData"
+    swiftmod = dd / "Build" / "Products" / "Release" / "Foo.swiftmodule"
+    swiftmod.mkdir(parents=True)
+    (swiftmod / "arm64-apple-ios.swiftinterface").write_text(
+        "// swift-interface-format-version: 1.0\nimport Foundation\n"
+    )
+
+    injected = inject_swiftmodule(
+        fw_path=fw,
+        fw_name="Foo",
+        scheme="Foo",
+        dd_path=dd,
+        variant="ios-arm64",
+        verbose=False,
+    )
+    _assert(injected, "inject_swiftmodule should report injection on iOS slice")
+
+    root_modules = fw / "Modules"
+    _assert(root_modules.is_dir(), "iOS Modules/ should exist")
+    _assert(not root_modules.is_symlink(),
+            "iOS Modules/ must remain a real directory, not a symlink")
+    _assert((root_modules / "Foo.swiftmodule" / "arm64-apple-ios.swiftinterface").is_file(),
+            "swiftinterface not written at flat-layout location")
+    _assert(not (fw / "Versions").exists(),
+            "flat framework must not gain a Versions/ directory")
+
+
+def _selftest_inject_resource_bundles_versioned_macos(tmp_root: Path) -> None:
+    """SwiftPM `.bundle` sub-bundles drop under Versions/A/Resources/
+    on macOS, not at the framework root (which would break codesigning).
+    """
+    base = tmp_root / "inject_bundle_macos"
+    fw = _make_versioned_framework(base / "Bar.framework")
+    # Fake DerivedData with a single SwiftPM resource bundle under the
+    # Build/Products/<config>/ fallback path that _find_resource_bundles
+    # scans (`<dd>/Build/Products/*/*.bundle`).
+    dd = base / "DerivedData"
+    bundle_src = dd / "Build" / "Products" / "Release-macosx" / "Bar_Bar.bundle"
+    bundle_src.mkdir(parents=True)
+    (bundle_src / "Info.plist").write_text("<plist/>")
+
+    n = inject_resource_bundles(
+        fw_path=fw,
+        fw_name="Bar",
+        dd_path=dd,
+        variant="macos-arm64_x86_64",
+        verbose=False,
+    )
+    _assert(n == 1, f"expected 1 bundle injected, got {n}")
+
+    # Bundle lands under Versions/A/Resources/, NOT at framework root.
+    real_dest = fw / "Versions" / "A" / "Resources" / "Bar_Bar.bundle"
+    _assert(real_dest.is_dir(), f"bundle not at versioned path: {real_dest}")
+    _assert(not (fw / "Bar_Bar.bundle").is_dir() or (fw / "Bar_Bar.bundle").is_symlink(),
+            "bundle must not exist as a real dir at framework root")
+
+
 def _selftest_inject_system_clang_modules_grdb_shape(tmp_root: Path) -> None:
     """End-to-end on a synthetic GRDB-shaped fixture: a built xcframework
     with two slices (device + sim), a regular Swift target with a
@@ -7342,6 +7560,18 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          lambda: _selftest_system_target_source_dir_explicit(tmp_root), False),
         ("execute: system_target_source_dir returns None on missing dir",
          lambda: _selftest_system_target_source_dir_missing(tmp_root), False),
+        ("execute: _framework_content_root flat vs versioned",
+         lambda: _selftest_framework_content_root_flat_vs_versioned(tmp_root), False),
+        ("execute: _ensure_root_symlink creates relative symlink on versioned framework",
+         lambda: _selftest_ensure_root_symlink_versioned(tmp_root), False),
+        ("execute: _ensure_root_symlink migrates real root dir into Versions/A",
+         lambda: _selftest_ensure_root_symlink_migrates_real_dir(tmp_root), False),
+        ("execute: inject_swiftmodule on macOS versioned framework writes under Versions/A (MACOS_SLICE_BUG)",
+         lambda: _selftest_inject_swiftmodule_versioned_macos(tmp_root), False),
+        ("execute: inject_swiftmodule on flat (iOS) framework keeps flat layout (regression)",
+         lambda: _selftest_inject_swiftmodule_flat_unchanged(tmp_root), False),
+        ("execute: inject_resource_bundles on macOS versioned framework lands under Versions/A/Resources",
+         lambda: _selftest_inject_resource_bundles_versioned_macos(tmp_root), False),
         ("execute: inject_system_clang_modules end-to-end (GRDB shape)",
          lambda: _selftest_inject_system_clang_modules_grdb_shape(tmp_root), False),
         ("execute: inject_system_clang_modules idempotent on second call",
