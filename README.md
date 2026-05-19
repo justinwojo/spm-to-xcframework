@@ -2,7 +2,7 @@
 
 Build or download xcframeworks from Swift Package Manager packages — Swift, Objective-C, or mixed.
 
-Takes an SPM package URL (or local path) and produces ready-to-use xcframeworks for each library product. Source packages are built into device (arm64) and simulator slices with `BUILD_LIBRARY_FOR_DISTRIBUTION=YES` for ABI stability. Packages that use SPM binary targets can also be downloaded directly with `--binary`.
+Takes an SPM package URL (or local path) and produces ready-to-use xcframeworks for each library product. Source packages default to iOS device + simulator slices built with `BUILD_LIBRARY_FOR_DISTRIBUTION=YES` for ABI stability; macOS, Mac Catalyst, tvOS, watchOS, and visionOS slices are opt-in via per-platform `--min-*` flags. Packages that use SPM binary targets can also be downloaded directly with `--binary`.
 
 Framework type (Swift, ObjC, Mixed) is auto-detected and reported in the build output.
 
@@ -39,8 +39,14 @@ spm-to-xcframework <package-url-or-path> --version <ver> [options]
 | `-t, --target <name>` | Build an SPM target that isn't exposed as a `.library()` product (repeatable). Escape hatch — see warning below. |
 | `--binary` | Download pre-built xcframeworks from binary SPM targets instead of building from source (remote URLs only) |
 | `--revision <sha>` | Verify the git tag resolves to this full 40-character commit SHA before fetching (supply-chain security) |
-| `--min-ios <ver>` | Minimum iOS deployment target for source builds (default: `15.0`) |
-| `--include-deps` | Also build xcframeworks for transitive dependencies in source-build mode |
+| `--min-ios <ver>` | Minimum iOS deployment target for source builds (default: `15.0`). Pass `--no-ios` to skip iOS entirely. |
+| `--no-ios` | Skip the iOS slices. Requires at least one other `--min-*` flag. |
+| `--min-macos <ver>` | Add the macOS slice (e.g. `11.0`). |
+| `--min-maccatalyst <ver>` | Add the Mac Catalyst slice (e.g. `15.0`). |
+| `--min-tvos <ver>` | Add tvOS device + simulator slices (e.g. `15.0`). |
+| `--min-watchos <ver>` | Add watchOS device + simulator slices (e.g. `8.0`). |
+| `--min-visionos <ver>` | Add visionOS device + simulator slices (e.g. `1.0`). |
+| `--include-deps` | Also build xcframeworks for transitive dependencies in source-build mode (iOS-only — requires iOS to be enabled) |
 | `--verbose` | Show full xcodebuild output |
 | `--dry-run` | Show what would be produced without completing the final build/copy step. In binary mode this still resolves artifacts so the reported set is exact. |
 | `--keep-work` | Keep temporary work directory (for debugging) |
@@ -73,6 +79,14 @@ spm-to-xcframework https://github.com/stripe/stripe-ios.git -v 25.6.2 \
 # Build an ObjC library with a static SPM product (auto-promoted to dynamic)
 spm-to-xcframework https://github.com/jdg/MBProgressHUD.git -v 1.2.0
 
+# Multi-platform: iOS + macOS + tvOS in one xcframework
+spm-to-xcframework https://github.com/kean/Nuke.git -v 12.8.0 \
+    --min-macos 11.0 --min-tvos 15.0
+
+# macOS-only build (no iOS slices)
+spm-to-xcframework https://github.com/Alamofire/Alamofire.git -v 5.10.2 \
+    --no-ios --min-macos 11.0
+
 # Download pre-built binary xcframeworks (no source build)
 spm-to-xcframework https://github.com/nicklockwood/iCarousel.git -v 1.8.3 --binary
 
@@ -94,9 +108,10 @@ spm-to-xcframework https://github.com/kean/Nuke.git -v 12.8.0 --dry-run
 4. **Discovers** library products via `swift package dump-package` — works for Swift, ObjC, and mixed-language targets. Additional SPM targets passed via `--target` are verified against the package's `targets[]` array and queued alongside the products.
 5. **Resolves** build schemes via `xcodebuild -list` against the staged copy. Sibling `.xcodeproj`/`.xcworkspace` files are pruned during staging so xcodebuild always picks SPM-generated schemes — no special handling needed for packages that ship multiple Xcode projects (e.g. GRDB's `GRDB.xcodeproj` + `GRDBCustom.xcodeproj`).
 6. **Patches** `Package.swift` to set the requested library products to `type: .dynamic`. Only the specific products you asked for are touched — internal dependency targets and `.systemLibrary(...)` products (e.g. GRDB's `GRDBSQLite`) are left alone, and the round-trip validator runs `swift package dump-package` against the edited manifest to confirm every requested edit actually took effect.
-7. **Builds** device and simulator archives in parallel via `xcodebuild archive`, with:
+7. **Builds** every enabled slice in parallel via `xcodebuild archive` (default: iOS device + simulator; additional slices added by `--min-macos`, `--min-maccatalyst`, `--min-tvos`, `--min-watchos`, `--min-visionos`). Pool width is capped at 4 to avoid Xcode license/DerivedData contention. Each archive runs with:
    - `BUILD_LIBRARY_FOR_DISTRIBUTION=YES` — ABI stability + swiftinterface emission
    - `SKIP_INSTALL=NO` — framework included in archive products
+   - the slice's platform-specific deployment-target build setting (`IPHONEOS_DEPLOYMENT_TARGET`, `MACOSX_DEPLOYMENT_TARGET`, `TVOS_DEPLOYMENT_TARGET`, `WATCHOS_DEPLOYMENT_TARGET`, or `XROS_DEPLOYMENT_TARGET`)
 8. **Promotes** static archives to dynamic frameworks when needed — some ObjC-only packages (e.g. MBProgressHUD) produce `.a` files even when patched to `.dynamic`. The tool detects this, re-links the static archive as a dynamic library via `clang -dynamiclib`, infers system framework dependencies from source imports, and wraps the result in a `.framework` bundle.
 9. **Injects** `.swiftmodule`/`.swiftinterface` from DerivedData when missing from the framework bundle (common with SPM dynamic libraries).
 10. **Injects** ObjC public headers and modulemaps from the source tree for ObjC/mixed targets that don't include them in archive output.
@@ -107,7 +122,7 @@ spm-to-xcframework https://github.com/kean/Nuke.git -v 12.8.0 --dry-run
     - **Mixed**: Has both Swift interfaces and ObjC headers
 13. **Verifies** every produced xcframework with strict per-unit checks. The build only reports success when all of these pass for every output:
     - The `Info.plist` parses through `plistlib` (catches AppleDouble `__MACOSX` ghost xcframeworks).
-    - At least 2 slices (device + simulator) appear in `AvailableLibraries`.
+    - Every requested (platform, variant) slice appears in `AvailableLibraries` — e.g. `--min-ios 15 --min-macos 11` requires `ios-device`, `ios-simulator`, and `macos-device` to all be present. Single-slice xcframeworks (pure macOS, pure Mac Catalyst) are valid.
     - Every slice's binary is a dynamically-linked Mach-O (no static archives masquerading as frameworks).
     - Swift/Mixed frameworks ship at least one `.swiftinterface` file.
     - ObjC/Mixed frameworks ship public headers under `Headers/` and a `module.modulemap`.
@@ -171,10 +186,10 @@ Plan for Alamofire @ 5.10.2  (source mode)
 Preparing Package.swift edits...
   Prepare validated 1 edit(s) ✓
 Executing 2 build unit(s)...
-  Building Alamofire — device (arm64) + simulator (parallel)...
+  Building Alamofire — ios-arm64, ios-simulator (parallel)...
   ...
   Alamofire.xcframework ready [Swift]
-  Building AlamofireDynamic — device (arm64) + simulator (parallel)...
+  Building AlamofireDynamic — ios-arm64, ios-simulator (parallel)...
   ...
   AlamofireDynamic.xcframework ready [Swift]
 

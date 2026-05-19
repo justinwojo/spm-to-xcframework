@@ -63,6 +63,17 @@ from spm_to_xcframework import (  # noqa: F401
     _read_output_manifest,
     _read_xcframework_library_paths,
     _select_active_manifest,
+    _selected_slices,
+    _enabled_platforms,
+    _spm_platform_entries,
+    _platform_from_library_identifier,
+    _variant_from_library_identifier,
+    _variant_for_platform_slice,
+    _expected_slice_classes,
+    _validate_requested_platforms,
+    _PLATFORM_SLICES,
+    _PLATFORM_ORDER,
+    PlatformSlice,
     _slice_paths,
     _swift_toolchain_version,
     _system_target_source_dir,
@@ -2821,13 +2832,336 @@ let package = Package(
 """
 
 
+def _selftest_platform_slices_table_integrity() -> None:
+    """Every PlatformSlice's clang_min_flag_template must format cleanly
+    with a sample version and produce the verified-good string for that
+    (platform, device/sim) combination. The exact flag values were
+    confirmed via live `xcrun --sdk <sdk> clang -mtargetos=...` probes
+    by both reviewers (see MULTI_PLATFORM_PLAN.md High items 1-3).
+    """
+    expected = {
+        "ios-arm64":            "-miphoneos-version-min=15.0",
+        "ios-simulator":        "-mios-simulator-version-min=15.0",
+        "macos":                "-mmacosx-version-min=11.0",
+        "maccatalyst":          "-mtargetos=ios15.0-macabi",
+        "tvos-arm64":           "-mtvos-version-min=15.0",
+        "tvos-simulator":       "-mtvos-simulator-version-min=15.0",
+        "watchos-arm64":        "-mwatchos-version-min=8.0",
+        "watchos-simulator":    "-mwatchos-simulator-version-min=8.0",
+        "visionos-arm64":       "-mtargetos=xros1.0",
+        "visionos-simulator":   "-mtargetos=xros1.0-simulator",
+    }
+    samples = {
+        "ios": "15.0", "macos": "11.0", "maccatalyst": "15.0",
+        "tvos": "15.0", "watchos": "8.0", "visionos": "1.0",
+    }
+    seen: Dict[str, PlatformSlice] = {}
+    for plat in _PLATFORM_ORDER:
+        _assert(plat in _PLATFORM_SLICES, f"missing platform in _PLATFORM_SLICES: {plat}")
+        for s in _PLATFORM_SLICES[plat]:
+            _assert(s.slice_id not in seen, f"duplicate slice_id: {s.slice_id}")
+            seen[s.slice_id] = s
+            got = s.clang_min_flag_template.format(version=samples[plat])
+            want = expected[s.slice_id]
+            _assert(got == want, f"slice {s.slice_id}: got={got!r} want={want!r}")
+    _assert(set(seen.keys()) == set(expected.keys()),
+            f"slice_id coverage mismatch: {sorted(seen.keys())} vs {sorted(expected.keys())}")
+
+
+def _selftest_selected_slices_order_and_filter() -> None:
+    """_selected_slices walks _PLATFORM_ORDER, emits only enabled
+    platforms, and pairs each PlatformSlice with the user-supplied
+    deployment target."""
+    cfg = tool.Config(
+        package_source="/dev/null",
+        min_ios="15.0", min_macos=None, min_maccatalyst="15.0",
+        min_tvos=None, min_watchos="8.0", min_visionos="1.0",
+    )
+    out = _selected_slices(cfg)
+    ids = [s.slice_id for s, _ in out]
+    _assert(ids == [
+        "ios-arm64", "ios-simulator", "maccatalyst",
+        "watchos-arm64", "watchos-simulator",
+        "visionos-arm64", "visionos-simulator",
+    ], f"unexpected order: {ids}")
+    versions = {s.slice_id: v for s, v in out}
+    _assert(versions["ios-arm64"] == "15.0", f"ios-arm64 version: {versions['ios-arm64']!r}")
+    _assert(versions["maccatalyst"] == "15.0", f"maccatalyst version: {versions['maccatalyst']!r}")
+    _assert(versions["watchos-simulator"] == "8.0", f"watchos-simulator version: {versions['watchos-simulator']!r}")
+    _assert(versions["visionos-arm64"] == "1.0", f"visionos-arm64 version: {versions['visionos-arm64']!r}")
+
+
+def _selftest_selected_slices_no_ios_path() -> None:
+    """--no-ios maps to min_ios=None, which must drop both iOS slices."""
+    cfg = tool.Config(package_source="/dev/null", min_ios=None, min_macos="11.0")
+    out = _selected_slices(cfg)
+    ids = [s.slice_id for s, _ in out]
+    _assert(ids == ["macos"], f"expected only macos slice, got {ids}")
+    _assert(_enabled_platforms(cfg) == ["macos"],
+            f"unexpected enabled platforms: {_enabled_platforms(cfg)!r}")
+
+
+def _selftest_spm_platform_entries_string_form() -> None:
+    """Binary-mode shim emits one `.<Plat>("X.Y")` entry per enabled
+    platform, in fixed order. String form sidesteps the broken
+    `.macOS(.v10)` enum mapping for 10.15."""
+    cfg = tool.Config(
+        package_source="/dev/null",
+        min_ios="15.0", min_macos="10.15", min_maccatalyst="15.0",
+        min_tvos="15.0", min_watchos="8.0", min_visionos="1.0",
+    )
+    entries = _spm_platform_entries(cfg)
+    _assert(entries == [
+        '.iOS("15.0")', '.macOS("10.15")', '.macCatalyst("15.0")',
+        '.tvOS("15.0")', '.watchOS("8.0")', '.visionOS("1.0")',
+    ], f"unexpected entries: {entries}")
+    # Subset works too — only emit what's enabled.
+    cfg2 = tool.Config(package_source="/dev/null", min_ios=None, min_macos="11.0")
+    _assert(_spm_platform_entries(cfg2) == ['.macOS("11.0")'],
+            f"unexpected single-platform entries: {_spm_platform_entries(cfg2)!r}")
+
+
+def _selftest_validate_requested_platforms_rejects_undeclared() -> None:
+    """Requesting a platform not in the package's declared platforms
+    must fail-fast with a PlanError naming the missing platform."""
+    pkg = tool.Package(
+        name="Snapshot",
+        tools_version="5.6.0",
+        platforms=[
+            tool.Platform(name="ios", version="13.0"),
+            tool.Platform(name="macos", version="10.15"),
+        ],
+        products=[], targets=[], schemes=[],
+        raw_dump={}, staged_dir=Path("/tmp/spm2xc-fake-staged"),
+    )
+    # iOS + macOS: declared → OK.
+    cfg_ok = tool.Config(package_source="/dev/null", min_ios="15.0", min_macos="11.0")
+    _validate_requested_platforms(cfg_ok, pkg)  # must not raise
+
+    # iOS + visionOS: visionOS not declared → must raise.
+    cfg_bad = tool.Config(package_source="/dev/null", min_ios="15.0", min_visionos="1.0")
+    try:
+        _validate_requested_platforms(cfg_bad, pkg)
+    except tool.PlanError as exc:
+        _assert("visionos" in str(exc).lower(),
+                f"expected missing-platform message, got: {exc}")
+    else:
+        _assert(False, "expected PlanError for undeclared visionOS")
+
+
+def _selftest_validate_requested_platforms_empty_passes_through() -> None:
+    """SPM treats `platforms: []` as 'all platforms supported', so the
+    validator must allow any request when the package declares none."""
+    pkg = tool.Package(
+        name="NoPlatforms", tools_version="5.6.0",
+        platforms=[], products=[], targets=[], schemes=[],
+        raw_dump={}, staged_dir=Path("/tmp/spm2xc-fake-staged"),
+    )
+    cfg = tool.Config(package_source="/dev/null", min_ios="15.0",
+                      min_macos="11.0", min_visionos="1.0")
+    _validate_requested_platforms(cfg, pkg)  # must not raise
+
+
+def _selftest_parse_platforms_recognises_all_six_names() -> None:
+    """`swift package dump-package` emits these exact platformName values
+    for the six platforms we care about. Confirmed via live dump-package
+    run by Grok."""
+    raw = [
+        {"platformName": "ios", "version": "15.0"},
+        {"platformName": "macos", "version": "11.0"},
+        {"platformName": "maccatalyst", "version": "15.0"},
+        {"platformName": "tvos", "version": "15.0"},
+        {"platformName": "watchos", "version": "8.0"},
+        {"platformName": "visionos", "version": "1.0"},
+    ]
+    plats = tool._parse_platforms(raw)
+    names = [p.name for p in plats]
+    _assert(names == ["ios", "macos", "maccatalyst", "tvos", "watchos", "visionos"],
+            f"unexpected names: {names}")
+
+
+def _selftest_platform_from_library_identifier() -> None:
+    """Apple's `<platform>-<archs>[-<variant>]` LibraryIdentifier shape
+    must map cleanly to our internal platform IDs. visionOS uses the
+    `xros` prefix in the LibraryIdentifier (not `visionos`), and the
+    `-maccatalyst` suffix wins over the `ios-` prefix it shares."""
+    cases = {
+        "ios-arm64":                                "ios",
+        "ios-arm64_x86_64-simulator":               "ios",
+        "ios-arm64_x86_64-maccatalyst":             "maccatalyst",
+        "macos-arm64_x86_64":                       "macos",
+        "tvos-arm64":                               "tvos",
+        "tvos-arm64_x86_64-simulator":              "tvos",
+        "watchos-arm64_32_armv7k":                  "watchos",
+        "watchos-arm64_i386_x86_64-simulator":      "watchos",
+        "xros-arm64":                               "visionos",
+        "xros-arm64_x86_64-simulator":              "visionos",
+        "garbage":                                  None,
+        "":                                         None,
+    }
+    for lid, want in cases.items():
+        got = _platform_from_library_identifier(lid)
+        _assert(got == want, f"identifier {lid!r}: got {got!r} want {want!r}")
+
+
+def _selftest_variant_classification_round_trips() -> None:
+    """`_variant_for_platform_slice` (PlatformSlice side) and
+    `_variant_from_library_identifier` (xcframework side) must agree on
+    the same taxonomy — otherwise the expected set and the covered set
+    can never line up. Spot-check both sides over every platform."""
+    plat_cases: Dict[str, str] = {
+        "ios-arm64":            "device",
+        "ios-simulator":        "simulator",
+        "macos":                "device",
+        "maccatalyst":          "maccatalyst",
+        "tvos-arm64":           "device",
+        "tvos-simulator":       "simulator",
+        "watchos-arm64":        "device",
+        "watchos-simulator":    "simulator",
+        "visionos-arm64":       "device",
+        "visionos-simulator":   "simulator",
+    }
+    for plat in _PLATFORM_ORDER:
+        for s in _PLATFORM_SLICES[plat]:
+            got = _variant_for_platform_slice(s)
+            want = plat_cases[s.slice_id]
+            _assert(got == want, f"slice {s.slice_id}: got {got!r} want {want!r}")
+    lid_cases: Dict[str, str] = {
+        "ios-arm64":                            "device",
+        "ios-arm64_x86_64-simulator":           "simulator",
+        "ios-arm64_x86_64-maccatalyst":         "maccatalyst",
+        "macos-arm64_x86_64":                   "device",
+        "tvos-arm64":                           "device",
+        "tvos-arm64_x86_64-simulator":          "simulator",
+        "watchos-arm64_32_armv7k":              "device",
+        "watchos-arm64_i386_x86_64-simulator":  "simulator",
+        "xros-arm64":                           "device",
+        "xros-arm64_x86_64-simulator":          "simulator",
+    }
+    for lid, want in lid_cases.items():
+        got = _variant_from_library_identifier(lid)
+        _assert(got == want, f"identifier {lid!r}: got {got!r} want {want!r}")
+
+
+def _selftest_expected_slice_classes_pairs() -> None:
+    """`_expected_slice_classes(config)` must emit one (platform, variant)
+    pair per slice the build pipeline drives — i.e. it must expand iOS,
+    tvOS, watchOS, and visionOS into their device + simulator pairs."""
+    cfg = tool.Config(
+        package_source="/dev/null",
+        min_ios="15.0", min_macos="11.0", min_maccatalyst="15.0",
+        min_visionos="1.0",
+    )
+    got = _expected_slice_classes(cfg)
+    _assert(got == [
+        ("ios", "device"), ("ios", "simulator"),
+        ("macos", "device"),
+        ("maccatalyst", "maccatalyst"),
+        ("visionos", "device"), ("visionos", "simulator"),
+    ], f"unexpected slice classes: {got}")
+
+
+def _selftest_verify_coverage_rejects_missing_platform(tmp_root: Path) -> None:
+    """Binary-mode regression #1: when the unit declares
+    `expected_slice_classes`, Verify must refuse to pass an xcframework
+    that doesn't carry one of the requested platform families at all.
+    Constructs an iOS-only artifact and asserts a fatal when the unit
+    asked for both iOS and macOS."""
+    base = tmp_root / "verify_coverage_missing_platform"
+    base.mkdir()
+    xc = _build_synthetic_xcframework(
+        base, "OnlyiOS", flavor="swift",
+        slices=("ios-arm64", "ios-arm64_x86_64-simulator"),
+    )
+    unit = ExecutedUnit(
+        name="OnlyiOS", xcframework_path=xc, framework_name="OnlyiOS",
+        framework_type="Swift",
+        expected_slice_classes=[
+            ("ios", "device"), ("ios", "simulator"),
+            ("macos", "device"),
+        ],
+        is_binary_copy=True,
+    )
+    mod = tool
+    saved = mod._check_binary_dynamic
+    try:
+        mod._check_binary_dynamic = lambda _b: True
+        results = verify_output([unit], base)
+    finally:
+        mod._check_binary_dynamic = saved
+    r = results[0]
+    _assert(not r.passed, "expected coverage fatal, got pass")
+    _assert(any("missing requested slice(s)" in m for m in r.fatal_issues),
+            f"expected coverage fatal, got {r.fatal_issues!r}")
+    _assert(any("macos-device" in m for m in r.fatal_issues),
+            f"expected macos-device in fatal, got {r.fatal_issues!r}")
+
+
+def _selftest_verify_coverage_rejects_missing_simulator(tmp_root: Path) -> None:
+    """Binary-mode regression #2 (Codex round 3): an iOS device-only
+    artifact must fail Verify when the unit also expects a simulator
+    slice. Family-level coverage alone would have let this pass."""
+    base = tmp_root / "verify_coverage_missing_simulator"
+    base.mkdir()
+    xc = _build_synthetic_xcframework(
+        base, "DeviceOnly", flavor="swift",
+        slices=("ios-arm64",),
+    )
+    unit = ExecutedUnit(
+        name="DeviceOnly", xcframework_path=xc, framework_name="DeviceOnly",
+        framework_type="Swift",
+        expected_slice_classes=[("ios", "device"), ("ios", "simulator")],
+        is_binary_copy=True,
+    )
+    mod = tool
+    saved = mod._check_binary_dynamic
+    try:
+        mod._check_binary_dynamic = lambda _b: True
+        results = verify_output([unit], base)
+    finally:
+        mod._check_binary_dynamic = saved
+    r = results[0]
+    _assert(not r.passed,
+            f"expected coverage fatal for missing simulator; passed={r.passed} fatals={r.fatal_issues!r}")
+    _assert(any("ios-simulator" in m for m in r.fatal_issues),
+            f"expected ios-simulator in fatal, got {r.fatal_issues!r}")
+
+
+def _selftest_verify_coverage_passes_when_all_requested_present(tmp_root: Path) -> None:
+    """The mirror case: when every expected (platform, variant) pair is
+    present in AvailableLibraries, the coverage check stays quiet."""
+    base = tmp_root / "verify_coverage_ok"
+    base.mkdir()
+    xc = _build_synthetic_xcframework(
+        base, "Both", flavor="swift",
+        slices=("ios-arm64", "ios-arm64_x86_64-simulator", "macos-arm64_x86_64"),
+    )
+    unit = ExecutedUnit(
+        name="Both", xcframework_path=xc, framework_name="Both",
+        framework_type="Swift",
+        expected_slice_classes=[
+            ("ios", "device"), ("ios", "simulator"),
+            ("macos", "device"),
+        ],
+    )
+    mod = tool
+    saved = mod._check_binary_dynamic
+    try:
+        mod._check_binary_dynamic = lambda _b: True
+        results = verify_output([unit], base)
+    finally:
+        mod._check_binary_dynamic = saved
+    r = results[0]
+    _assert(r.passed, f"expected verify pass; fatals={r.fatal_issues!r}")
+
+
 def _selftest_slice_paths_unique() -> None:
     """Device + simulator slice paths must be disjoint so the parallel
     builder can run both at once without stomping on each other's
     archives, derived data, xcresult bundles, or log files."""
     work = Path("/tmp/spm2xc-fake-work")
-    dev = _slice_paths(work, "MyUnit", "arm64")
-    sim = _slice_paths(work, "MyUnit", "simulator")
+    dev = _slice_paths(work, "MyUnit", "ios-arm64")
+    sim = _slice_paths(work, "MyUnit", "ios-simulator")
     for d, s in zip(dev, sim):
         _assert(d != s, f"slice paths collided: device={d} sim={s}")
     # Within each slice the four paths must also be distinct (no two
@@ -4385,12 +4719,18 @@ def _selftest_verify_missing_xcframework(tmp_root: Path) -> None:
 
 
 def _selftest_verify_one_slice_only(tmp_root: Path) -> None:
-    """A single-slice xcframework should fail the ≥2 slice check."""
+    """After multi-platform support, a single-slice xcframework is a
+    legitimate output (pure macOS, pure Mac Catalyst, etc.) and must
+    pass Verify. The per-slice dynamic-linkage check below the (former)
+    count guard still catches the real failure modes."""
     base = tmp_root / "verify_one_slice"
     base.mkdir()
     xc = _build_synthetic_xcframework(base, "Solo", flavor="swift",
-                                       slices=("ios-arm64",))
-    unit = ExecutedUnit(name="Solo", xcframework_path=xc, framework_name="Solo")
+                                       slices=("macos-arm64_x86_64",))
+    unit = ExecutedUnit(
+        name="Solo", xcframework_path=xc, framework_name="Solo",
+        framework_type="Swift",
+    )
     mod = tool
     saved = mod._check_binary_dynamic
     try:
@@ -4399,9 +4739,8 @@ def _selftest_verify_one_slice_only(tmp_root: Path) -> None:
     finally:
         mod._check_binary_dynamic = saved
     r = results[0]
-    _assert(not r.passed, "single-slice xcframework should fail verify")
-    _assert(any("slice" in m for m in r.fatal_issues),
-            f"expected slice-count message, got {r.fatal_issues!r}")
+    _assert(r.passed,
+            f"expected single-slice xcframework to pass verify; fatals={r.fatal_issues!r}")
 
 
 def _selftest_verify_static_binary(tmp_root: Path) -> None:
@@ -6912,6 +7251,32 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          _selftest_error_taxonomy_split, False),
         ("active manifest selector (Package@swift-X.Y)",
          _selftest_select_active_manifest, False),
+        ("multi-platform: _PLATFORM_SLICES table integrity (clang flags)",
+         _selftest_platform_slices_table_integrity, False),
+        ("multi-platform: _selected_slices order & filter",
+         _selftest_selected_slices_order_and_filter, False),
+        ("multi-platform: --no-ios drops both iOS slices",
+         _selftest_selected_slices_no_ios_path, False),
+        ("multi-platform: binary shim emits string-form .Plat(\"X.Y\") entries",
+         _selftest_spm_platform_entries_string_form, False),
+        ("multi-platform: per-package validation rejects undeclared platforms",
+         _selftest_validate_requested_platforms_rejects_undeclared, False),
+        ("multi-platform: per-package validation passes when package declares no platforms",
+         _selftest_validate_requested_platforms_empty_passes_through, False),
+        ("multi-platform: _parse_platforms recognises all six platformName values",
+         _selftest_parse_platforms_recognises_all_six_names, False),
+        ("multi-platform: _platform_from_library_identifier maps Apple xcframework slices",
+         _selftest_platform_from_library_identifier, False),
+        ("multi-platform: variant classifier round-trips PlatformSlice ↔ LibraryIdentifier",
+         _selftest_variant_classification_round_trips, False),
+        ("multi-platform: _expected_slice_classes expands device/simulator pairs",
+         _selftest_expected_slice_classes_pairs, False),
+        ("multi-platform: verify rejects xcframework missing a requested platform",
+         lambda: _selftest_verify_coverage_rejects_missing_platform(tmp_root), False),
+        ("multi-platform: verify rejects device-only when simulator was requested (Codex r3)",
+         lambda: _selftest_verify_coverage_rejects_missing_simulator(tmp_root), False),
+        ("multi-platform: verify passes when every requested slice present",
+         lambda: _selftest_verify_coverage_passes_when_all_requested_present(tmp_root), False),
         ("execute: slice paths are unique", _selftest_slice_paths_unique, False),
         ("execute: detect_framework_type Swift/ObjC/Mixed/Bridge",
          lambda: _selftest_detect_framework_type_swift_objc_mixed(tmp_root), False),
@@ -7031,7 +7396,7 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          lambda: _selftest_verify_corrupt_info_plist(tmp_root), False),
         ("verify: missing xcframework directory",
          lambda: _selftest_verify_missing_xcframework(tmp_root), False),
-        ("verify: single-slice xcframework rejected",
+        ("verify: single-slice xcframework accepted (multi-platform)",
          lambda: _selftest_verify_one_slice_only(tmp_root), False),
         ("verify: static binary fails dynamic-link check",
          lambda: _selftest_verify_static_binary(tmp_root), False),

@@ -25,6 +25,7 @@ annotations` so they remain strings).
 from __future__ import annotations
 
 import argparse
+import collections
 import concurrent.futures
 import json
 import os
@@ -217,7 +218,15 @@ class Config:
     product_filters: List[str] = field(default_factory=list)
     target_filters: List[str] = field(default_factory=list)
     revision: Optional[str] = None
-    min_ios: str = "15.0"
+    # Per-platform deployment targets. `None` means "don't build this platform".
+    # iOS defaults to "15.0" for backward compatibility; pass --no-ios to opt out.
+    # Each non-iOS platform is opt-in via its --min-* flag.
+    min_ios: Optional[str] = "15.0"
+    min_macos: Optional[str] = None
+    min_maccatalyst: Optional[str] = None
+    min_tvos: Optional[str] = None
+    min_watchos: Optional[str] = None
+    min_visionos: Optional[str] = None
     include_deps: bool = False
     binary_mode: bool = False
     verbose: bool = False
@@ -510,17 +519,15 @@ class DependencyXcframework:
 class ExecutedUnit:
     """Output of Execute for a single build unit.
 
-    Holds both archive slices (device + simulator) and the final
-    xcframework path the merge step produced. The optional fields are
-    populated only when the unit's archive_strategy is "archive". For
-    binary-mode units (`copy-artifact`) the slices are empty and only
-    `xcframework_path` is set, pointing at the copied artifact in
-    `<output_dir>/`.
+    Holds the archive slices produced for this unit (one per enabled
+    platform-arch pair) and the final xcframework path the merge step
+    produced. `slices` is empty for binary-mode units (`copy-artifact`),
+    where only `xcframework_path` is set, pointing at the copied artifact
+    in `<output_dir>/`.
     """
 
     name: str                     # build unit name (matches plan.build_units[i].name)
-    device: Optional[ArchiveSlice] = None
-    simulator: Optional[ArchiveSlice] = None
+    slices: List[ArchiveSlice] = field(default_factory=list)
     xcframework_path: Optional[Path] = None
     framework_name: Optional[str] = None  # the resolved <fw_name>, may differ from unit.name
     framework_type: str = ""              # "Swift" / "ObjC" / "Mixed" / "Unknown" — post-hoc detection from disk, for summary printing
@@ -531,6 +538,15 @@ class ExecutedUnit:
     # partially-built artifact. Empty string for legacy callers; Verify
     # treats empty / "N/A" as "fall back to post-hoc detection".
     expected_language: str = ""
+    # Per-(platform, variant) slice coverage the user asked for. Variants
+    # are "device" / "simulator" / "maccatalyst". Verify enforces that the
+    # xcframework's AvailableLibraries carries an entry for every pair —
+    # critical for binary mode where we copy a vendor artifact unchanged
+    # and have no other way to know whether the requested coverage is
+    # actually present (e.g. an iOS-device-only artifact would otherwise
+    # silently satisfy `--min-ios`). Empty list is the legacy default and
+    # disables the check.
+    expected_slice_classes: List[Tuple[str, str]] = field(default_factory=list)
     is_binary_copy: bool = False
     dependency_xcframeworks: List[DependencyXcframework] = field(default_factory=list)
 
@@ -991,21 +1007,22 @@ def discover_binary_artifacts(config: Config) -> List[BinaryArtifact]:
     # leading "v" so `--version v7.6.2` also resolves cleanly.
     exact_version = config.user_version[1:] if config.user_version.startswith("v") else config.user_version
 
-    # Minimum iOS for the shim. SPM resolve doesn't actually care about
-    # the version, but the manifest needs to be self-consistent. Use the
-    # major version from config.min_ios.
-    try:
-        major = int(config.min_ios.split(".")[0])
-    except (ValueError, IndexError):
-        major = 15
+    # SPM resolve doesn't actually care about the version, but the
+    # manifest needs to be self-consistent: one platform entry per
+    # `--min-*` flag the user set, using the exact version string. The
+    # string-form `.iOS("15.0")` sidesteps the `.v<major>` enum table
+    # (`.macOS(.v10)` is not a real case for 10.15). Tools-version 5.9
+    # is the floor that allows declaring `visionOS`.
+    platform_entries = _spm_platform_entries(config)
+    platforms_array = ", ".join(platform_entries) if platform_entries else ".iOS(\"15.0\")"
 
     manifest = (
-        "// swift-tools-version:5.7\n"
+        "// swift-tools-version:5.9\n"
         "import PackageDescription\n"
         "\n"
         "let package = Package(\n"
         '    name: "binary-resolver",\n'
-        f"    platforms: [.iOS(.v{major})],\n"
+        f"    platforms: [{platforms_array}],\n"
         "    dependencies: [\n"
         f'        .package(url: "{config.package_source}", exact: "{exact_version}"),\n'
         "    ],\n"
@@ -1730,6 +1747,24 @@ def topo_order_units(
     return out
 
 
+def _validate_requested_platforms(config: Config, package: Package) -> None:
+    """Fail fast if the user asked for a platform the package doesn't
+    declare. SPM treats an empty `platforms:` array as "all platforms",
+    so we only enforce when the package's list is non-empty.
+    """
+    if not package.platforms:
+        return
+    declared = {p.name.lower() for p in package.platforms}
+    requested = _enabled_platforms(config)
+    missing = [p for p in requested if p not in declared]
+    if missing:
+        decl = ", ".join(sorted(declared)) or "(none)"
+        raise PlanError(
+            f"Requested platform(s) not declared by the package: "
+            f"{', '.join(missing)}. Package declares: {decl}."
+        )
+
+
 def plan_source_build(config: Config, package: Package) -> Plan:
     """Pure planner for source-mode builds.
 
@@ -1739,6 +1774,7 @@ def plan_source_build(config: Config, package: Package) -> Plan:
     the planner consciously skipped with a reason. See REWRITE_DESIGN.md
     §5.2 for the full rule set.
     """
+    _validate_requested_platforms(config, package)
     plan = Plan()
     plan.include_deps = config.include_deps
 
@@ -2080,6 +2116,11 @@ def print_plan(
             )
     else:
         print("  Build units: (none)")
+
+    selected = _selected_slices(config)
+    if selected:
+        ids = ", ".join(s.slice_id for s, _ in selected)
+        print(f"  Selected slices: {ids}")
 
     if plan.skipped:
         print("  Skipped:")
@@ -3333,12 +3374,12 @@ def run_xcodebuild_archive(
     *,
     staged_dir: Path,
     scheme: str,
-    destination: str,
+    slice: PlatformSlice,
+    deployment_target: str,
     archive_path: Path,
     dd_path: Path,
     result_bundle_path: Path,
     log_path: Path,
-    min_ios: str,
     verbose: bool,
 ) -> int:
     """Run `xcodebuild archive` for one (build unit, slice) combination.
@@ -3352,7 +3393,7 @@ def run_xcodebuild_archive(
 
         BUILD_LIBRARY_FOR_DISTRIBUTION=YES
         SKIP_INSTALL=NO
-        IPHONEOS_DEPLOYMENT_TARGET=<min_ios>
+        <slice.deployment_target_var>=<deployment_target>
         GCC_TREAT_WARNINGS_AS_ERRORS=NO
         SWIFT_TREAT_WARNINGS_AS_ERRORS=NO
         OTHER_SWIFT_FLAGS=-no-verify-emitted-module-interface
@@ -3382,13 +3423,13 @@ def run_xcodebuild_archive(
         "xcodebuild",
         "archive",
         "-scheme", scheme,
-        "-destination", destination,
+        "-destination", slice.destination,
         "-archivePath", str(archive_path),
         "-derivedDataPath", str(dd_path),
         "-resultBundlePath", str(result_bundle_path),
         "BUILD_LIBRARY_FOR_DISTRIBUTION=YES",
         "SKIP_INSTALL=NO",
-        f"IPHONEOS_DEPLOYMENT_TARGET={min_ios}",
+        f"{slice.deployment_target_var}={deployment_target}",
         "GCC_TREAT_WARNINGS_AS_ERRORS=NO",
         "SWIFT_TREAT_WARNINGS_AS_ERRORS=NO",
         "OTHER_SWIFT_FLAGS=-no-verify-emitted-module-interface",
@@ -3526,45 +3567,278 @@ def _format_execute_error(unit_name: str, log_path: Path, errors: List[dict]) ->
     return "\n".join(lines)
 
 
-def _slice_paths(work_dir: Path, unit_name: str, arch_suffix: str) -> Tuple[Path, Path, Path, Path]:
+def _slice_paths(work_dir: Path, unit_name: str, slice_id: str) -> Tuple[Path, Path, Path, Path]:
     """Pure path computation for one (build unit, slice). Centralised so
     the parallel scheduler and the post-build framework lookup agree on
     where each artifact lives.
 
+    `slice_id` is the platform-prefixed identifier from
+    `PlatformSlice.slice_id` (e.g. `ios-arm64`, `ios-simulator`, `macos`).
     Returns (archive_path, dd_path, result_bundle_path, log_path).
     """
-    archive_path = work_dir / "archives" / f"{unit_name}-ios-{arch_suffix}.xcarchive"
-    dd_path = work_dir / "dd" / unit_name / arch_suffix
-    result_bundle_path = work_dir / "results" / f"{unit_name}-{arch_suffix}.xcresult"
-    log_path = work_dir / f".build-output-{unit_name}-{arch_suffix}"
+    archive_path = work_dir / "archives" / f"{unit_name}-{slice_id}.xcarchive"
+    dd_path = work_dir / "dd" / unit_name / slice_id
+    result_bundle_path = work_dir / "results" / f"{unit_name}-{slice_id}.xcresult"
+    log_path = work_dir / f".build-output-{unit_name}-{slice_id}"
     return archive_path, dd_path, result_bundle_path, log_path
 
 
-# Two slices per build unit. Order is fixed so the printed summary and
-# the xcframework merge command consume them in a stable order
-# (device first, then simulator).
-_SLICES: Tuple[Tuple[str, str, str], ...] = (
-    ("arm64", "iphoneos", "generic/platform=iOS"),
-    ("simulator", "iphonesimulator", "generic/platform=iOS Simulator"),
+# Per-platform xcframework slice metadata. Each `PlatformSlice` carries
+# everything the archive + static-promote paths need to target the slice
+# without per-platform if/else branching: the xcodebuild `-destination`
+# and SDK name, the deployment-target build setting variable, and a
+# `{version}`-templated clang min-version flag that the static-promote
+# fallback uses to re-link `.a` archives as dynamic frameworks.
+#
+# `slice_id` is the unique identifier used in file paths under work_dir
+# (archives, derived data, xcresult bundles, build logs) and as the key
+# in the `Dict[str, ArchiveSlice]` returned by `_archive_all_parallel`.
+# Archive paths for the legacy iOS slice ids `ios-arm64` / `ios-simulator`
+# remain byte-identical to the pre-multi-platform layout; derived-data,
+# xcresult, and log paths now embed the full slice_id (previously they
+# used the bare `arch_suffix` of `arm64` / `simulator`).
+#
+# Clang min-version flags were verified against `xcrun --sdk <sdk> clang`
+# on Xcode 26.2:
+#   - iOS device:        -miphoneos-version-min=<ver>
+#   - iOS simulator:     -mios-simulator-version-min=<ver>
+#   - macOS:             -mmacosx-version-min=<ver>
+#   - Mac Catalyst:      -mtargetos=ios<ver>-macabi
+#                        (arch-neutral; works inside the per-arch loop
+#                        in `promote_static_to_framework`)
+#   - tvOS device:       -mtvos-version-min=<ver>
+#   - tvOS simulator:    -mtvos-simulator-version-min=<ver>
+#   - watchOS device:    -mwatchos-version-min=<ver>
+#   - watchOS simulator: -mwatchos-simulator-version-min=<ver>
+#   - visionOS device:   -mtargetos=xros<ver>
+#   - visionOS sim:      -mtargetos=xros<ver>-simulator
+#                        (version goes BEFORE -simulator; the
+#                        -mtargetos=xros-simulator<ver> form is rejected)
+
+
+@dataclass(frozen=True)
+class PlatformSlice:
+    platform: str                   # "ios", "macos", "maccatalyst", "tvos", "watchos", "visionos"
+    slice_id: str                   # unique key: "ios-arm64", "ios-simulator", "macos", ...
+    sdk_name: str                   # `xcodebuild -showsdks` short name
+    destination: str                # xcodebuild -destination value
+    deployment_target_var: str      # build setting name passed as `<var>=<version>`
+    clang_min_flag_template: str    # `{version}`-formatted single clang arg for static-promote
+
+
+_PLATFORM_SLICES: Dict[str, Tuple[PlatformSlice, ...]] = {
+    "ios": (
+        PlatformSlice("ios", "ios-arm64", "iphoneos",
+                      "generic/platform=iOS",
+                      "IPHONEOS_DEPLOYMENT_TARGET",
+                      "-miphoneos-version-min={version}"),
+        PlatformSlice("ios", "ios-simulator", "iphonesimulator",
+                      "generic/platform=iOS Simulator",
+                      "IPHONEOS_DEPLOYMENT_TARGET",
+                      "-mios-simulator-version-min={version}"),
+    ),
+    "macos": (
+        PlatformSlice("macos", "macos", "macosx",
+                      "generic/platform=macOS",
+                      "MACOSX_DEPLOYMENT_TARGET",
+                      "-mmacosx-version-min={version}"),
+    ),
+    "maccatalyst": (
+        PlatformSlice("maccatalyst", "maccatalyst", "macosx",
+                      "generic/platform=macOS,variant=Mac Catalyst",
+                      "IPHONEOS_DEPLOYMENT_TARGET",
+                      "-mtargetos=ios{version}-macabi"),
+    ),
+    "tvos": (
+        PlatformSlice("tvos", "tvos-arm64", "appletvos",
+                      "generic/platform=tvOS",
+                      "TVOS_DEPLOYMENT_TARGET",
+                      "-mtvos-version-min={version}"),
+        PlatformSlice("tvos", "tvos-simulator", "appletvsimulator",
+                      "generic/platform=tvOS Simulator",
+                      "TVOS_DEPLOYMENT_TARGET",
+                      "-mtvos-simulator-version-min={version}"),
+    ),
+    "watchos": (
+        PlatformSlice("watchos", "watchos-arm64", "watchos",
+                      "generic/platform=watchOS",
+                      "WATCHOS_DEPLOYMENT_TARGET",
+                      "-mwatchos-version-min={version}"),
+        PlatformSlice("watchos", "watchos-simulator", "watchsimulator",
+                      "generic/platform=watchOS Simulator",
+                      "WATCHOS_DEPLOYMENT_TARGET",
+                      "-mwatchos-simulator-version-min={version}"),
+    ),
+    "visionos": (
+        PlatformSlice("visionos", "visionos-arm64", "xros",
+                      "generic/platform=visionOS",
+                      "XROS_DEPLOYMENT_TARGET",
+                      "-mtargetos=xros{version}"),
+        PlatformSlice("visionos", "visionos-simulator", "xrsimulator",
+                      "generic/platform=visionOS Simulator",
+                      "XROS_DEPLOYMENT_TARGET",
+                      "-mtargetos=xros{version}-simulator"),
+    ),
+}
+
+
+# Fixed iteration order so dry-run output, the slice merge command, and
+# all parallel-build scheduling consume slices in a stable order across
+# runs. iOS first (matches today's behaviour); subsequent platforms in
+# the same order as the CLI flags appear in --help.
+_PLATFORM_ORDER: Tuple[str, ...] = (
+    "ios", "macos", "maccatalyst", "tvos", "watchos", "visionos",
 )
+
+
+def _selected_slices(config: "Config") -> List[Tuple[PlatformSlice, str]]:
+    """Walk every `min_<platform>` field on `config` and return the
+    ordered list of (slice, deployment_target_version) pairs the rest
+    of the pipeline should drive xcodebuild against.
+
+    Returns an empty list when no platform is enabled — the caller
+    (`main()`) validates that ≥1 platform is enabled before reaching
+    Execute, so an empty return from here is a programmer error.
+    """
+    out: List[Tuple[PlatformSlice, str]] = []
+    versions: Dict[str, Optional[str]] = {
+        "ios": config.min_ios,
+        "macos": config.min_macos,
+        "maccatalyst": config.min_maccatalyst,
+        "tvos": config.min_tvos,
+        "watchos": config.min_watchos,
+        "visionos": config.min_visionos,
+    }
+    for plat in _PLATFORM_ORDER:
+        version = versions.get(plat)
+        if not version:
+            continue
+        for s in _PLATFORM_SLICES[plat]:
+            out.append((s, version))
+    return out
+
+
+def _enabled_platforms(config: "Config") -> List[str]:
+    """Platforms the user requested via `--min-*` flags, in fixed order.
+    Pure data — no side effects."""
+    versions: Dict[str, Optional[str]] = {
+        "ios": config.min_ios,
+        "macos": config.min_macos,
+        "maccatalyst": config.min_maccatalyst,
+        "tvos": config.min_tvos,
+        "watchos": config.min_watchos,
+        "visionos": config.min_visionos,
+    }
+    return [p for p in _PLATFORM_ORDER if versions.get(p)]
+
+
+# SPM `PackageDescription` platform case names, keyed by our internal
+# platform identifier. Used by the binary-resolve shim to build the
+# manifest's `platforms:` array. The string-version form
+# (`.iOS("15.0")`) sidesteps the `.v<major>` enum table — which is
+# wrong for macOS minima like 10.15 (`.v10` would be `.v10_0`).
+_SPM_PLATFORM_CASE: Dict[str, str] = {
+    "ios": "iOS",
+    "macos": "macOS",
+    "maccatalyst": "macCatalyst",
+    "tvos": "tvOS",
+    "watchos": "watchOS",
+    "visionos": "visionOS",
+}
+
+
+def _platform_from_library_identifier(lid: str) -> Optional[str]:
+    """Map an xcframework `AvailableLibraries[*].LibraryIdentifier` to one
+    of our internal platform IDs. Apple's convention for these strings
+    (per `man xcodebuild -create-xcframework` + observed real-world
+    xcframeworks): `<platform>-<archs>[-<variant>]`, where `variant` is
+    `simulator` or `maccatalyst`. visionOS uses the SDK prefix `xros`,
+    not `visionos`. Returns None for shapes we don't recognise — callers
+    treat unknown identifiers as not contributing to coverage.
+    """
+    if lid.endswith("-maccatalyst"):
+        return "maccatalyst"
+    if lid.startswith("ios-") or lid == "ios":
+        return "ios"
+    if lid.startswith("macos-") or lid == "macos":
+        return "macos"
+    if lid.startswith("tvos-") or lid == "tvos":
+        return "tvos"
+    if lid.startswith("watchos-") or lid == "watchos":
+        return "watchos"
+    if lid.startswith("xros-") or lid == "xros":
+        return "visionos"
+    return None
+
+
+def _variant_from_library_identifier(lid: str) -> str:
+    """Classify the device/simulator/maccatalyst flavour of a
+    LibraryIdentifier. Pairs with `_platform_from_library_identifier`
+    so Verify can assert (platform, variant) coverage — not just family
+    coverage — against `unit.expected_slice_classes`."""
+    if lid.endswith("-maccatalyst"):
+        return "maccatalyst"
+    if lid.endswith("-simulator"):
+        return "simulator"
+    return "device"
+
+
+def _variant_for_platform_slice(s: "PlatformSlice") -> str:
+    """Same taxonomy as `_variant_from_library_identifier`, but applied
+    to our internal `PlatformSlice` (whose `slice_id` we control). Keeps
+    the expected-set construction in lockstep with the covered-set
+    construction inside `_verify_one_unit`."""
+    if s.platform == "maccatalyst":
+        return "maccatalyst"
+    if s.slice_id.endswith("-simulator"):
+        return "simulator"
+    return "device"
+
+
+def _expected_slice_classes(config: "Config") -> List[Tuple[str, str]]:
+    """Per-(platform, variant) coverage requirement derived from the
+    enabled `--min-*` flags. e.g. `--min-ios 15 --min-macos 11` yields
+    `[("ios", "device"), ("ios", "simulator"), ("macos", "device")]`."""
+    return [
+        (s.platform, _variant_for_platform_slice(s))
+        for s, _ in _selected_slices(config)
+    ]
+
+
+def _spm_platform_entries(config: "Config") -> List[str]:
+    """Render one `.iOS("15.0")`-style entry per enabled platform, in
+    fixed order. Used by the binary-resolve shim manifest emitter."""
+    versions: Dict[str, Optional[str]] = {
+        "ios": config.min_ios,
+        "macos": config.min_macos,
+        "maccatalyst": config.min_maccatalyst,
+        "tvos": config.min_tvos,
+        "watchos": config.min_watchos,
+        "visionos": config.min_visionos,
+    }
+    entries: List[str] = []
+    for plat in _PLATFORM_ORDER:
+        v = versions.get(plat)
+        if not v:
+            continue
+        entries.append(f'.{_SPM_PLATFORM_CASE[plat]}("{v}")')
+    return entries
 
 
 def _archive_one_slice(
     unit: BuildUnit,
     *,
-    arch_suffix: str,
-    sdk_name: str,
-    destination: str,
+    platform_slice: PlatformSlice,
+    deployment_target: str,
     staged_dir: Path,
     work_dir: Path,
-    min_ios: str,
     verbose: bool,
 ) -> Tuple[ArchiveSlice, int]:
     """Run xcodebuild archive once for one (build unit, slice) combination
     and return the slice metadata plus the xcodebuild return code.
 
-    Does NOT raise on xcodebuild failure — the caller (`_archive_pair_parallel`)
-    needs both futures to settle so it can tail both logs and surface a
+    Does NOT raise on xcodebuild failure — the caller (`_archive_all_parallel`)
+    needs all futures to settle so it can tail every log and surface a
     consolidated error. Locating the framework / static lib also happens
     here so the caller can decide whether to trigger static promotion
     without re-walking the archive.
@@ -3573,17 +3847,17 @@ def _archive_one_slice(
     `ThreadPoolExecutor`.
     """
     archive_path, dd_path, result_bundle_path, log_path = _slice_paths(
-        work_dir, unit.name, arch_suffix
+        work_dir, unit.name, platform_slice.slice_id
     )
     rc = run_xcodebuild_archive(
         staged_dir=staged_dir,
         scheme=unit.scheme,
-        destination=destination,
+        slice=platform_slice,
+        deployment_target=deployment_target,
         archive_path=archive_path,
         dd_path=dd_path,
         result_bundle_path=result_bundle_path,
         log_path=log_path,
-        min_ios=min_ios,
         verbose=verbose,
     )
     framework_path = None
@@ -3594,8 +3868,8 @@ def _archive_one_slice(
             static_lib_path = _archive_static_lib_path(archive_path)
 
     slice_obj = ArchiveSlice(
-        arch_suffix=arch_suffix,
-        sdk_name=sdk_name,
+        arch_suffix=platform_slice.slice_id,
+        sdk_name=platform_slice.sdk_name,
         archive_path=archive_path,
         dd_path=dd_path,
         log_path=log_path,
@@ -3621,52 +3895,54 @@ def _tail_log(log_path: Path, n: int = 5) -> str:
     return "".join(lines[-n:])
 
 
-def _archive_pair_parallel(
+def _archive_all_parallel(
     unit: BuildUnit,
     *,
+    selected: Sequence[Tuple[PlatformSlice, str]],
     staged_dir: Path,
     work_dir: Path,
-    min_ios: str,
     verbose: bool,
-) -> Tuple[ArchiveSlice, ArchiveSlice]:
-    """Build the device + simulator archives for one build unit in parallel
-    via `ThreadPoolExecutor(max_workers=2)`.
+) -> "collections.OrderedDict[str, ArchiveSlice]":
+    """Build every requested (platform_slice, deployment_target) archive
+    for one build unit in parallel via `ThreadPoolExecutor`.
 
-    Both futures must settle before this function returns — the caller
+    All futures must settle before this function returns — the caller
     needs the consolidated state to decide whether the unit succeeded
     completely, partially, or failed. Slice logs are captured to separate
-    files (`_slice_paths` enforces uniqueness) and tailed only after both
-    settle, so device + sim output never interleave on the user's
-    terminal.
+    files (`_slice_paths` enforces uniqueness via the platform-prefixed
+    `slice_id`) and tailed only after every future settles, so output
+    never interleaves on the user's terminal.
 
-    Raises ExecuteError if either slice's xcodebuild call exited non-zero,
+    Raises ExecuteError if any slice's xcodebuild call exited non-zero,
     with the parsed xcresult diagnostics for whichever slice(s) failed.
-    On success, returns (device_slice, simulator_slice).
+    On success, returns an `OrderedDict` keyed by `slice_id` in the same
+    order as `selected` so downstream consumers (create-xcframework merge,
+    dry-run summary) see a stable ordering.
     """
-    info(f"  Building {unit.name} — device (arm64) + simulator (parallel)...")
+    slice_labels = ", ".join(ps.slice_id for ps, _v in selected)
+    info(f"  Building {unit.name} — {slice_labels} (parallel)...")
 
-    # Submit both archives. We use a fixed-size pool of 2 because that's
-    # the only parallelism the iOS pipeline benefits from per build unit
-    # — the device and simulator archives share scheme metadata but
-    # otherwise touch disjoint paths under `work_dir`.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        futures: Dict[concurrent.futures.Future, Tuple[str, str, str]] = {}
-        for arch_suffix, sdk_name, destination in _SLICES:
+    # Cap pool size at 4 so a high-platform invocation (iOS + macOS +
+    # Catalyst + tvOS + visionOS) doesn't oversubscribe the host's xcodebuild
+    # licenses or DerivedData I/O. Two-wide for the default --min-ios case
+    # — identical to the legacy two-pool behaviour.
+    max_workers = min(4, max(1, len(selected)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures: Dict[concurrent.futures.Future, PlatformSlice] = {}
+        for platform_slice, deployment_target in selected:
             fut = pool.submit(
                 _archive_one_slice,
                 unit,
-                arch_suffix=arch_suffix,
-                sdk_name=sdk_name,
-                destination=destination,
+                platform_slice=platform_slice,
+                deployment_target=deployment_target,
                 staged_dir=staged_dir,
                 work_dir=work_dir,
-                min_ios=min_ios,
                 verbose=verbose,
             )
-            futures[fut] = (arch_suffix, sdk_name, destination)
+            futures[fut] = platform_slice
         results: Dict[str, Tuple[ArchiveSlice, int]] = {}
         for fut in concurrent.futures.as_completed(futures):
-            arch_suffix, _sdk, _dest = futures[fut]
+            platform_slice = futures[fut]
             try:
                 slice_obj, rc = fut.result()
             except Exception as exc:  # pragma: no cover — defensive
@@ -3674,20 +3950,23 @@ def _archive_pair_parallel(
                 # a permissions error, etc.) is reported as an
                 # ExecuteError tagged to the slice that blew up.
                 raise ExecuteError(
-                    f"unexpected failure during {unit.name} {arch_suffix} archive: {exc}"
+                    f"unexpected failure during {unit.name} "
+                    f"{platform_slice.slice_id} archive: {exc}"
                 ) from exc
-            results[arch_suffix] = (slice_obj, rc)
+            results[platform_slice.slice_id] = (slice_obj, rc)
 
-    device_slice, device_rc = results["arm64"]
-    sim_slice, sim_rc = results["simulator"]
+    # Re-order results to match `selected` order (`as_completed` shuffles
+    # them by finish time, which would make logs unreliable).
+    ordered: "collections.OrderedDict[str, ArchiveSlice]" = collections.OrderedDict()
+    for platform_slice, _v in selected:
+        ordered[platform_slice.slice_id] = results[platform_slice.slice_id][0]
 
-    # Tail both logs after both settle. This is the legacy bash strategy
-    # (build_archive at lines 814-820) — interleaved live output is
-    # unreadable so the bash tool deferred summaries until both PIDs
-    # exited. Verbose mode already streams everything live so we skip the
+    # Tail every log after every slice settles. Interleaved live output is
+    # unreadable, so non-verbose mode defers summaries until everything
+    # exits. Verbose mode already streams everything live so we skip the
     # extra tail there to avoid double-printing.
     if not verbose:
-        for slice_obj in (device_slice, sim_slice):
+        for slice_obj in ordered.values():
             tail = _tail_log(slice_obj.log_path)
             if tail:
                 sys.stdout.write(tail)
@@ -3695,20 +3974,20 @@ def _archive_pair_parallel(
                     sys.stdout.write("\n")
         sys.stdout.flush()
 
-    failed_slices: List[Tuple[ArchiveSlice, int]] = []
-    if device_rc != 0:
-        failed_slices.append((device_slice, device_rc))
-    if sim_rc != 0:
-        failed_slices.append((sim_slice, sim_rc))
-    if failed_slices:
+    failed: List[ArchiveSlice] = []
+    for platform_slice, _v in selected:
+        _slice_obj, rc = results[platform_slice.slice_id]
+        if rc != 0:
+            failed.append(_slice_obj)
+    if failed:
         sections: List[str] = []
-        for slice_obj, _rc in failed_slices:
+        for slice_obj in failed:
             errors = read_xcresult_errors(slice_obj.result_bundle_path, limit=5)
             slice_label = f"{unit.name} ({slice_obj.arch_suffix})"
             sections.append(_format_execute_error(slice_label, slice_obj.log_path, errors))
         raise ExecuteError("\n\n".join(sections))
 
-    return device_slice, sim_slice
+    return ordered
 
 
 # ----- detect_system_frameworks --------------------------------------------
@@ -3898,7 +4177,7 @@ _INFO_PLIST_FORMAT = (
     '    <key>CFBundlePackageType</key>\n'
     '    <string>FMWK</string>\n'
     '    <key>MinimumOSVersion</key>\n'
-    '    <string>{min_ios}</string>\n'
+    '    <string>{min_version}</string>\n'
     '</dict>\n'
     '</plist>\n'
 )
@@ -3923,8 +4202,8 @@ def promote_static_to_framework(
     *,
     static_lib: Path,
     product: str,
-    sdk_name: str,
-    min_ios: str,
+    platform_slice: PlatformSlice,
+    deployment_target: str,
     archive_path: Path,
     system_frameworks: Sequence[str],
     verbose: bool,
@@ -3934,13 +4213,20 @@ def promote_static_to_framework(
     Same algorithm as the legacy bash promote_static_to_framework:
       1. `lipo -archs` to discover the slice's archs.
       2. `xcrun --sdk <sdk> clang -dynamiclib` with one `-arch` per arch,
-         the appropriate `-m{iphoneos,ios-simulator}-version-min` flag,
+         the appropriate min-version flag (from
+         `platform_slice.clang_min_flag_template`),
          `-install_name @rpath/<X>.framework/<X>`, `-Xlinker -all_load`,
          every `-framework <Foo>` we detected for the product, and
          `-Xlinker -undefined dynamic_lookup` as a safety net for
          indirect dependencies the scanner missed.
       3. Wrap the resulting Mach-O in a minimal `.framework` bundle with
          a CFBundlePackageType=FMWK Info.plist.
+
+    The clang min-version flag is formatted from
+    `platform_slice.clang_min_flag_template` with `{version}` ←
+    `deployment_target`. Templates are arch-neutral (Mac Catalyst uses
+    `-mtargetos=ios{ver}-macabi`, not `-target arm64-apple-ios{ver}-macabi`)
+    so the same flag works inside the per-arch loop for fat archives.
 
     Returns the path to the newly-created `.framework` directory. Raises
     `ExecuteError` if any step fails.
@@ -3956,14 +4242,11 @@ def promote_static_to_framework(
             f"Failed to determine architectures from {static_lib} via lipo -archs."
         )
 
-    if sdk_name == "iphonesimulator":
-        min_ver_flag = f"-mios-simulator-version-min={min_ios}"
-    else:
-        min_ver_flag = f"-miphoneos-version-min={min_ios}"
+    min_ver_flag = platform_slice.clang_min_flag_template.format(version=deployment_target)
 
-    dim(f"  Re-linking static → dynamic ({sdk_name}: {' '.join(archs)})")
+    dim(f"  Re-linking static → dynamic ({platform_slice.sdk_name}: {' '.join(archs)})")
 
-    cmd: List[str] = ["xcrun", "--sdk", sdk_name, "clang", "-dynamiclib"]
+    cmd: List[str] = ["xcrun", "--sdk", platform_slice.sdk_name, "clang", "-dynamiclib"]
     for a in archs:
         cmd.extend(["-arch", a])
     cmd.extend([
@@ -3994,11 +4277,11 @@ def promote_static_to_framework(
         tail = _tail_log(log_path, n=10)
         raise ExecuteError(
             f"Failed to re-link static library {static_lib} as dynamic framework "
-            f"{product}.framework (sdk={sdk_name}). Last lines of relink log "
-            f"({log_path}):\n{tail}"
+            f"{product}.framework (sdk={platform_slice.sdk_name}). Last lines of "
+            f"relink log ({log_path}):\n{tail}"
         )
 
-    plist_text = _INFO_PLIST_FORMAT.format(product=product, min_ios=min_ios)
+    plist_text = _INFO_PLIST_FORMAT.format(product=product, min_version=deployment_target)
     (fw_dir / "Info.plist").write_text(plist_text)
 
     return fw_dir
@@ -4998,24 +5281,33 @@ def inject_resource_bundles(
 def create_xcframework(
     *,
     output_xcframework: Path,
-    device_fw: Path,
-    sim_fw: Path,
+    frameworks: Sequence[Path],
     verbose: bool,
 ) -> None:
-    """Shell out to `xcodebuild -create-xcframework` for one (device, sim)
-    framework pair. Removes any pre-existing output directory first
-    (xcodebuild refuses to overwrite). Raises `ExecuteError` on failure.
+    """Shell out to `xcodebuild -create-xcframework` with one or more
+    `.framework` inputs. Removes any pre-existing output directory first
+    (xcodebuild refuses to overwrite). Raises `ExecuteError` on failure
+    or when `frameworks` is empty.
+
+    Accepts 1..N inputs so single-slice platforms (macOS-only, Mac
+    Catalyst-only) and the legacy iOS device+simulator pair share the
+    same code path. xcodebuild handles heterogeneous-platform merges
+    natively — iOS + macOS + tvOS frameworks in one invocation produce
+    an xcframework with all the corresponding `*-arm64*` directories.
     """
+    if not frameworks:
+        raise ExecuteError(
+            f"create_xcframework called with no frameworks for "
+            f"{output_xcframework.name}"
+        )
     if output_xcframework.exists():
         shutil.rmtree(output_xcframework)
     output_xcframework.parent.mkdir(parents=True, exist_ok=True)
 
-    cmd = [
-        "xcodebuild", "-create-xcframework",
-        "-framework", str(device_fw),
-        "-framework", str(sim_fw),
-        "-output", str(output_xcframework),
-    ]
+    cmd: List[str] = ["xcodebuild", "-create-xcframework"]
+    for fw in frameworks:
+        cmd.extend(["-framework", str(fw)])
+    cmd.extend(["-output", str(output_xcframework)])
     verbose_log(verbose, f"  $ {' '.join(cmd)}")
     cp = subprocess.run(
         cmd,
@@ -5295,8 +5587,7 @@ def _build_dependency_xcframeworks(
         try:
             create_xcframework(
                 output_xcframework=dep_xcframework,
-                device_fw=fw_path,
-                sim_fw=sim_fw,
+                frameworks=[fw_path, sim_fw],
                 verbose=verbose,
             )
         except ExecuteError as exc:
@@ -5332,33 +5623,43 @@ def _run_one_unit(
 ) -> ExecutedUnit:
     """End-to-end Execute pipeline for a single source-mode build unit.
 
-    1. Parallel device + simulator archive.
-    2. Locate framework, fall back to static-promote if both slices
-       produced a `.a` instead.
-    3. Inject swiftmodule + ObjC headers per slice.
-    4. Merge slices via `xcodebuild -create-xcframework`.
-    5. (Optional) walk dependency frameworks if `--include-deps` is set.
+    1. Parallel archive for every enabled platform slice.
+    2. Locate framework per slice, fall back to static-promote when a
+       slice produced a `.a` instead of a `.framework`.
+    3. Inject swiftmodule + ObjC headers + resource bundles per slice.
+    4. Merge all slices via `xcodebuild -create-xcframework`.
+    5. (Optional) walk dependency frameworks if `--include-deps` is set
+       — iOS-only in v1; non-iOS slices don't carry dep artifacts.
     """
     assert config.work_dir is not None
     work_dir = config.work_dir
     staged_dir = prepared.package.staged_dir
 
-    device_slice, sim_slice = _archive_pair_parallel(
+    selected = _selected_slices(config)
+    if not selected:
+        raise ExecuteError(
+            "no platforms selected; pass --min-ios / --min-macos / "
+            "--min-tvos / --min-maccatalyst / --min-watchos / --min-visionos"
+        )
+    slice_by_id: Dict[str, PlatformSlice] = {ps.slice_id: ps for ps, _v in selected}
+    version_by_id: Dict[str, str] = {ps.slice_id: v for ps, v in selected}
+
+    archive_slices = _archive_all_parallel(
         unit,
+        selected=selected,
         staged_dir=staged_dir,
         work_dir=work_dir,
-        min_ios=config.min_ios,
         verbose=config.verbose,
     )
 
     # If a slice produced a `.a` instead of a `.framework`, run the
     # StaticPromote strategy on it and re-locate the framework. This is
-    # the MBProgressHUD path. Per-slice (not "both must be static") so
+    # the MBProgressHUD path. Per-slice (not "all must be static") so
     # the asymmetric case — one slice ends up with a framework, the
     # other only a static archive — is also handled instead of failing
     # with a misleading "framework missing" error.
     needs_promote = [
-        s for s in (device_slice, sim_slice)
+        (sid, s) for sid, s in archive_slices.items()
         if s.framework_path is None and s.static_lib_path is not None
     ]
     if needs_promote:
@@ -5369,12 +5670,12 @@ def _run_one_unit(
                 config.verbose,
                 f"  Linking system frameworks: {' '.join(system_frameworks)}",
             )
-        for slice_obj in needs_promote:
+        for sid, slice_obj in needs_promote:
             promote_static_to_framework(
                 static_lib=slice_obj.static_lib_path,
                 product=unit.framework_name,
-                sdk_name=slice_obj.sdk_name,
-                min_ios=config.min_ios,
+                platform_slice=slice_by_id[sid],
+                deployment_target=version_by_id[sid],
                 archive_path=slice_obj.archive_path,
                 system_frameworks=system_frameworks,
                 verbose=config.verbose,
@@ -5383,13 +5684,15 @@ def _run_one_unit(
                 slice_obj.archive_path, unit.framework_name
             )
 
-    if device_slice.framework_path is None:
-        # Last-resort: scan for any .framework in the archive and use it
-        # as a best-guess (handles the rare case where the framework
-        # binary name differs from both the product name and the target
-        # name). Same fallback the legacy bash uses at lines 1097-1110.
+    # Last-resort framework-name fallback. The legacy bash uses a single
+    # device-slice scan to pick `any *.framework` when the expected name
+    # doesn't resolve, then propagates the discovered name to the sibling
+    # slice(s). Same shape here: scan the first slice in iteration order
+    # (most often `ios-arm64` — same as the legacy device slice).
+    primary_id, primary_slice = next(iter(archive_slices.items()))
+    if primary_slice.framework_path is None:
         any_fw = None
-        products = device_slice.archive_path / "Products"
+        products = primary_slice.archive_path / "Products"
         if products.is_dir():
             for candidate in sorted(products.rglob("*.framework")):
                 if candidate.is_dir():
@@ -5398,83 +5701,71 @@ def _run_one_unit(
         if any_fw is not None:
             actual_name = any_fw.stem
             warn(f"  Using {actual_name} instead of {unit.framework_name}")
-            device_slice.framework_path = any_fw
-            sim_products = sim_slice.archive_path / "Products"
-            if sim_products.is_dir():
-                for candidate in sim_products.rglob(f"{actual_name}.framework"):
+            primary_slice.framework_path = any_fw
+            # Propagate the discovered name to every other slice.
+            for sid, s in archive_slices.items():
+                if sid == primary_id:
+                    continue
+                sib_products = s.archive_path / "Products"
+                if not sib_products.is_dir():
+                    continue
+                for candidate in sib_products.rglob(f"{actual_name}.framework"):
                     if candidate.is_dir():
-                        sim_slice.framework_path = candidate
+                        s.framework_path = candidate
                         break
 
-    if device_slice.framework_path is None:
+    if primary_slice.framework_path is None:
         raise ExecuteError(
             f"{unit.name}: archive completed but no .framework found anywhere "
-            f"under {device_slice.archive_path}/Products/. Static promotion "
+            f"under {primary_slice.archive_path}/Products/. Static promotion "
             f"either failed or no .a was produced either."
         )
-    if sim_slice.framework_path is None:
-        raise ExecuteError(
-            f"{unit.name}: simulator framework missing under "
-            f"{sim_slice.archive_path}/Products/."
+    for sid, s in archive_slices.items():
+        if s.framework_path is None:
+            raise ExecuteError(
+                f"{unit.name}: {sid} framework missing under "
+                f"{s.archive_path}/Products/."
+            )
+
+    fw_name = primary_slice.framework_path.stem
+    success(
+        f"  {unit.name}: {primary_id} "
+        f"{primary_slice.framework_path.relative_to(primary_slice.archive_path.parent)}"
+    )
+
+    # Injection passes — every slice. The `variant` label is the slice_id
+    # so user-visible logs identify which platform the diagnostic
+    # belongs to.
+    for sid, s in archive_slices.items():
+        inject_swiftmodule(
+            fw_path=s.framework_path,
+            fw_name=fw_name,
+            scheme=unit.scheme,
+            dd_path=s.dd_path,
+            variant=sid,
+            verbose=config.verbose,
+            extra_module_names=unit.source_targets,
         )
-
-    fw_name = device_slice.framework_path.stem
-    success(f"  {unit.name}: device {device_slice.framework_path.relative_to(device_slice.archive_path.parent)}")
-
-    # Injection passes — both slices.
-    inject_swiftmodule(
-        fw_path=device_slice.framework_path,
-        fw_name=fw_name,
-        scheme=unit.scheme,
-        dd_path=device_slice.dd_path,
-        variant="device",
-        verbose=config.verbose,
-        extra_module_names=unit.source_targets,
-    )
-    inject_swiftmodule(
-        fw_path=sim_slice.framework_path,
-        fw_name=fw_name,
-        scheme=unit.scheme,
-        dd_path=sim_slice.dd_path,
-        variant="simulator",
-        verbose=config.verbose,
-        extra_module_names=unit.source_targets,
-    )
-    inject_objc_headers(
-        package=prepared.package,
-        product_name=unit.name,
-        fw_name=fw_name,
-        fw_path=device_slice.framework_path,
-        verbose=config.verbose,
-    )
-    inject_objc_headers(
-        package=prepared.package,
-        product_name=unit.name,
-        fw_name=fw_name,
-        fw_path=sim_slice.framework_path,
-        verbose=config.verbose,
-    )
-    inject_resource_bundles(
-        fw_path=device_slice.framework_path,
-        fw_name=fw_name,
-        dd_path=device_slice.dd_path,
-        variant="device",
-        verbose=config.verbose,
-    )
-    inject_resource_bundles(
-        fw_path=sim_slice.framework_path,
-        fw_name=fw_name,
-        dd_path=sim_slice.dd_path,
-        variant="simulator",
-        verbose=config.verbose,
-    )
+        inject_objc_headers(
+            package=prepared.package,
+            product_name=unit.name,
+            fw_name=fw_name,
+            fw_path=s.framework_path,
+            verbose=config.verbose,
+        )
+        inject_resource_bundles(
+            fw_path=s.framework_path,
+            fw_name=fw_name,
+            dd_path=s.dd_path,
+            variant=sid,
+            verbose=config.verbose,
+        )
 
     output_xcframework = config.output_dir / f"{unit.name}.xcframework"
     info(f"  Creating {unit.name}.xcframework...")
     create_xcframework(
         output_xcframework=output_xcframework,
-        device_fw=device_slice.framework_path,
-        sim_fw=sim_slice.framework_path,
+        frameworks=[s.framework_path for s in archive_slices.values()],
         verbose=config.verbose,
     )
     # Bundle any `.systemLibrary` Clang modules the build unit depends on
@@ -5506,26 +5797,36 @@ def _run_one_unit(
     fw_type = detect_framework_type(output_xcframework)
     success(f"  {unit.name}.xcframework ready [{fw_type}]")
 
-    dep_xcframeworks: List[Path] = []
+    dep_xcframeworks: List[DependencyXcframework] = []
     if prepared.plan.include_deps:
-        dep_xcframeworks = _build_dependency_xcframeworks(
-            unit=unit,
-            package=prepared.package,
-            device_slice=device_slice,
-            sim_slice=sim_slice,
-            primary_fw_name=fw_name,
-            output_dir=config.output_dir,
-            verbose=config.verbose,
-        )
+        ios_dev = archive_slices.get("ios-arm64")
+        ios_sim = archive_slices.get("ios-simulator")
+        if ios_dev is not None and ios_sim is not None:
+            dep_xcframeworks = _build_dependency_xcframeworks(
+                unit=unit,
+                package=prepared.package,
+                device_slice=ios_dev,
+                sim_slice=ios_sim,
+                primary_fw_name=fw_name,
+                output_dir=config.output_dir,
+                verbose=config.verbose,
+            )
+        else:
+            # iOS not selected — main() already rejects this case before
+            # Execute runs, so reaching here is a programmer error.
+            warn(
+                f"  {unit.name}: --include-deps skipped (iOS device + "
+                "simulator slices not in this build)"
+            )
 
     return ExecutedUnit(
         name=unit.name,
-        device=device_slice,
-        simulator=sim_slice,
+        slices=list(archive_slices.values()),
         xcframework_path=output_xcframework,
         framework_name=fw_name,
         framework_type=fw_type,
         expected_language=unit.language,
+        expected_slice_classes=_expected_slice_classes(config),
         dependency_xcframeworks=dep_xcframeworks,
     )
 
@@ -5805,6 +6106,7 @@ def execute_binary_plan(
                 # this empty makes Verify fall back to post-hoc detection
                 # for binary units, which is the only thing it can do.
                 expected_language=Language.NA,
+                expected_slice_classes=_expected_slice_classes(config),
                 is_binary_copy=True,
             )
         )
@@ -6183,17 +6485,39 @@ def _verify_one_unit(unit: ExecutedUnit, output_dir: Path) -> VerifyResult:
         fatal.append("Info.plist has no AvailableLibraries array")
         return result
 
-    # Fatal #3: at least 2 slices (device + simulator).
-    if len(available) < 2:
-        fatal.append(
-            f"only {len(available)} slice(s) in Info.plist; "
-            "expected ≥ 2 (device + simulator)"
-        )
-        # Don't `return` — we still want the per-slice diagnostics below
-        # so the user sees the binary linkage issue alongside the slice
-        # count complaint instead of one issue at a time.
+    # Coverage check: when the unit carries `expected_slice_classes`,
+    # every requested (platform, variant) pair must be represented by at
+    # least one AvailableLibraries entry. The (platform, variant) shape
+    # is tighter than family coverage — an iOS-device-only binary would
+    # otherwise satisfy `--min-ios` despite missing the simulator slice
+    # that the same flag promises to produce. Primary motivation is
+    # binary mode, where we copy a vendor artifact unchanged and have no
+    # other way to verify the requested coverage is actually present.
+    if unit.expected_slice_classes:
+        covered_pairs: Set[Tuple[str, str]] = set()
+        for entry in available:
+            if not isinstance(entry, dict):
+                continue
+            lid = str(entry.get("LibraryIdentifier") or "")
+            plat = _platform_from_library_identifier(lid)
+            if plat is None:
+                continue
+            covered_pairs.add((plat, _variant_from_library_identifier(lid)))
+        missing_pairs = [
+            (p, v) for (p, v) in unit.expected_slice_classes
+            if (p, v) not in covered_pairs
+        ]
+        if missing_pairs:
+            missing_repr = ", ".join(f"{p}-{v}" for p, v in missing_pairs)
+            covered_repr = ", ".join(
+                sorted(f"{p}-{v}" for p, v in covered_pairs)
+            ) or "(none)"
+            fatal.append(
+                f"xcframework missing requested slice(s): {missing_repr} "
+                f"(covered: {covered_repr})"
+            )
 
-    # Fatal #4: every slice's binary must be dynamically linked.
+    # Fatal: every slice's binary must be dynamically linked.
     for entry in available:
         if not isinstance(entry, dict):
             fatal.append(f"AvailableLibraries entry is not a dict: {entry!r}")
@@ -6510,9 +6834,21 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> Tuple[argparse.Namespace
     parser.add_argument("--revision", default=None,
                         help="Verify git tag resolves to this commit SHA before building")
     parser.add_argument("--min-ios", default="15.0",
-                        help="Minimum iOS deployment target (default: 15.0)")
+                        help="Minimum iOS deployment target (default: 15.0). Pass --no-ios to skip iOS.")
+    parser.add_argument("--no-ios", action="store_true",
+                        help="Skip iOS entirely; requires at least one other --min-* flag.")
+    parser.add_argument("--min-macos", default=None,
+                        help="Minimum macOS deployment target (e.g. 11.0). Adds the macOS slice.")
+    parser.add_argument("--min-maccatalyst", default=None,
+                        help="Minimum Mac Catalyst deployment target (e.g. 15.0). Adds the Mac Catalyst slice.")
+    parser.add_argument("--min-tvos", default=None,
+                        help="Minimum tvOS deployment target (e.g. 15.0). Adds tvOS device + simulator slices.")
+    parser.add_argument("--min-watchos", default=None,
+                        help="Minimum watchOS deployment target (e.g. 8.0). Adds watchOS device + simulator slices.")
+    parser.add_argument("--min-visionos", default=None,
+                        help="Minimum visionOS deployment target (e.g. 1.0). Adds visionOS device + simulator slices.")
     parser.add_argument("--include-deps", action="store_true",
-                        help="Also build xcframeworks for transitive dependencies")
+                        help="Also build xcframeworks for transitive dependencies (iOS-only in v1)")
     parser.add_argument("--verbose", action="store_true",
                         help="Show full build output")
     parser.add_argument("--dry-run", action="store_true",
@@ -6560,7 +6896,12 @@ def _config_from_args(ns: argparse.Namespace) -> Config:
         product_filters=list(ns.products or []),
         target_filters=list(ns.targets or []),
         revision=ns.revision,
-        min_ios=ns.min_ios,
+        min_ios=None if ns.no_ios else ns.min_ios,
+        min_macos=ns.min_macos,
+        min_maccatalyst=ns.min_maccatalyst,
+        min_tvos=ns.min_tvos,
+        min_watchos=ns.min_watchos,
+        min_visionos=ns.min_visionos,
         include_deps=ns.include_deps,
         binary_mode=ns.binary,
         verbose=ns.verbose,
@@ -6597,6 +6938,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if config.binary_mode and config.target_filters:
         die("--target is a source-build escape hatch and cannot be combined with --binary.")
+
+    # Validate that the user has selected at least one platform.
+    enabled = _enabled_platforms(config)
+    if not enabled:
+        die("No platforms selected. Pass at least one of --min-ios, --min-macos, "
+            "--min-maccatalyst, --min-tvos, --min-watchos, --min-visionos. "
+            "(--no-ios disables iOS, so combine it with one of the others.)")
+
+    # --include-deps is iOS-only in v1. Fail-fast if iOS is disabled; warn
+    # if iOS is enabled alongside non-iOS platforms.
+    if config.include_deps:
+        if "ios" not in enabled:
+            die("--include-deps requires iOS to be enabled in v1. "
+                "Drop --no-ios or omit --include-deps.")
+        non_ios = [p for p in enabled if p != "ios"]
+        if non_ios:
+            warn(
+                "--include-deps: dependency xcframeworks will be iOS-only; "
+                f"non-iOS slices ({', '.join(non_ios)}) won't carry dep artifacts."
+            )
 
     # Resolve the version tag now, before any clones, so we can populate
     # both user_version and resolved_version (bug 1 fix). Binary mode
