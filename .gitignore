@@ -3,3 +3,4 @@ xcframeworks/
 __pycache__/
 *.pyc
 .claude/
+.build/

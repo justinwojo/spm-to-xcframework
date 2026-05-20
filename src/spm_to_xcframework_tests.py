@@ -35,16 +35,13 @@ from spm_to_xcframework import *  # noqa: F401,F403 — test convenience
 from spm_to_xcframework import (  # noqa: F401
     _apply_dedup_overlap_substitutions,
     _archive_framework_path,
-    _archive_static_lib_path,
     _assert_no_unsupported_swift_constructs,
     _balanced_close,
     _BUG_CLASS_ERRORS,
     _check_binary_dynamic,
     _compute_dedup_substitutions,
-    _count_source_files,
     _default_target_path,
     _derive_package_label,
-    _find_library_call_for_product,
     _ensure_root_symlink,
     _find_objc_headers_dir,
     _find_project_modulemap_for_module,
@@ -386,90 +383,89 @@ def _selftest_validate_git_ref() -> None:
 
 
 def _selftest_language_counter(tmp_root: Path) -> None:
-    """Synthetic file tree → confirm Swift / ObjC / Mixed / NA classify
-    correctly. Uses a temp dir, no fixture file dependency."""
-    base = tmp_root / "lang_counter"
+    """Real Package.swift → confirm `scan_target_languages` derives the
+    right Language from `swift package describe --type json`.
+
+    Covers the cases the old FS walker hand-coded heuristics for:
+      - Swift-only target (`.target()` with .swift)
+      - ObjC target (`.target()` with .m + publicHeadersPath)
+      - Header-only target (ObjC umbrella; .h with no .swift / .m)
+      - Swift target with a stub umbrella .h alongside the Swift
+        sources (BlinkIDUX regression: must still classify as Swift,
+        not Mixed — SPM classifies it as SwiftTarget because the
+        manifest is `.target()`).
+
+    Mixed-language is intentionally not exercised here: SwiftPM today
+    rejects a target with both .swift and .m at manifest parse, so it
+    can't be set up as a fixture. `_MODULE_TYPE_LANGUAGE` carries the
+    mapping so the moment SwiftPM enables the experimental
+    `MixedLanguageTarget` for real it already classifies correctly.
+    """
+    base = tmp_root / "lang_counter_pkg"
     base.mkdir()
+    (base / "Sources" / "SwiftOnly").mkdir(parents=True)
+    (base / "Sources" / "SwiftOnly" / "Foo.swift").write_text("public func a() {}\n")
+    (base / "Sources" / "ObjCOnly" / "include").mkdir(parents=True)
+    (base / "Sources" / "ObjCOnly" / "Bar.m").write_text("void b(void) {}\n")
+    (base / "Sources" / "ObjCOnly" / "include" / "Bar.h").write_text("void b(void);\n")
+    (base / "Sources" / "HeadersOnly" / "include").mkdir(parents=True)
+    (base / "Sources" / "HeadersOnly" / "include" / "Public.h").write_text("void p(void);\n")
+    (base / "Sources" / "HeadersOnly" / "stub.c").write_text("/* SPM requires one source */\n")
+    (base / "Sources" / "SwiftWithUmbrella").mkdir(parents=True)
+    (base / "Sources" / "SwiftWithUmbrella" / "X.swift").write_text("public func x() {}\n")
+    (base / "Sources" / "SwiftWithUmbrella" / "SwiftWithUmbrella.h").write_text("// auto-generated umbrella stub\n")
+    (base / "Package.swift").write_text(
+        '// swift-tools-version: 5.9\n'
+        'import PackageDescription\n'
+        'let package = Package(\n'
+        '    name: "LangProbe",\n'
+        '    products: [\n'
+        '        .library(name: "SwiftOnly", targets: ["SwiftOnly"]),\n'
+        '        .library(name: "ObjCOnly", targets: ["ObjCOnly"]),\n'
+        '        .library(name: "HeadersOnly", targets: ["HeadersOnly"]),\n'
+        '        .library(name: "SwiftWithUmbrella", targets: ["SwiftWithUmbrella"]),\n'
+        '    ],\n'
+        '    targets: [\n'
+        '        .target(name: "SwiftOnly"),\n'
+        '        .target(name: "ObjCOnly", publicHeadersPath: "include"),\n'
+        '        .target(name: "HeadersOnly", publicHeadersPath: "include"),\n'
+        '        .target(name: "SwiftWithUmbrella"),\n'
+        '    ]\n'
+        ')\n'
+    )
 
-    swift_only = base / "swift_only"
-    swift_only.mkdir()
-    (swift_only / "Foo.swift").write_text("// swift")
-    s, oi, oh = _count_source_files(swift_only)
-    _assert(s == 1 and oi == 0 and oh == 0, f"swift-only got ({s},{oi},{oh})")
-
-    objc_only = base / "objc_only"
-    objc_only.mkdir()
-    (objc_only / "Bar.m").write_text("// m")
-    (objc_only / "Bar.h").write_text("// h")
-    s, oi, oh = _count_source_files(objc_only)
-    _assert(s == 0 and oi == 1 and oh == 1, f"objc-only got ({s},{oi},{oh})")
-
-    # Header-only ObjC target (umbrella framework shape).
-    headers_only = base / "headers_only"
-    headers_only.mkdir()
-    (headers_only / "Public.h").write_text("// h")
-    s, oi, oh = _count_source_files(headers_only)
-    _assert(s == 0 and oi == 0 and oh == 1, f"headers-only got ({s},{oi},{oh})")
-
-    mixed = base / "mixed"
-    mixed.mkdir()
-    (mixed / "X.swift").write_text("// swift")
-    (mixed / "Y.mm").write_text("// mm")
-    s, oi, oh = _count_source_files(mixed)
-    _assert(s == 1 and oi == 1 and oh == 0, f"mixed got ({s},{oi},{oh})")
-
-    # Swift target with a bare umbrella .h stub: NOT mixed (BlinkIDUX
-    # regression — Xcode-generated framework targets ship a stub
-    # header alongside the Swift sources, but the build is Swift-only).
-    swift_with_umbrella = base / "swift_with_umbrella"
-    swift_with_umbrella.mkdir()
-    (swift_with_umbrella / "X.swift").write_text("// swift")
-    (swift_with_umbrella / "Module.h").write_text("// h")
-    s, oi, oh = _count_source_files(swift_with_umbrella)
-    _assert(s == 1 and oi == 0 and oh == 1, f"swift+umbrella got ({s},{oi},{oh})")
-
-    # Tests/ skip pruning
-    skipper = base / "skipper"
-    skipper.mkdir()
-    (skipper / "X.swift").write_text("// swift")
-    tests = skipper / "Tests"
-    tests.mkdir()
-    (tests / "Junk.swift").write_text("// swift")
-    s, oi, oh = _count_source_files(skipper)
-    _assert(s == 1 and oi == 0 and oh == 0,
-            f"skip-tests got ({s},{oi},{oh}); Tests/ should be pruned")
-
-    # End-to-end: scan_target_languages must classify the umbrella-stub
-    # case as Swift, not Mixed. Pre-fix, BlinkIDUX (7 .swift + 1 stub
-    # umbrella .h) classified as Mixed and Verify failed expecting a
-    # Headers/ + module.modulemap surface that a Swift-only build never
-    # produces.
     targets = [
-        Target(name="swift_only", kind=TargetKind.REGULAR, path="swift_only",
-               public_headers_path=None, dependencies=[], exclude=[]),
-        Target(name="objc_only", kind=TargetKind.REGULAR, path="objc_only",
-               public_headers_path=None, dependencies=[], exclude=[]),
-        Target(name="headers_only", kind=TargetKind.REGULAR, path="headers_only",
-               public_headers_path=None, dependencies=[], exclude=[]),
-        Target(name="mixed", kind=TargetKind.REGULAR, path="mixed",
-               public_headers_path=None, dependencies=[], exclude=[]),
-        Target(name="swift_with_umbrella", kind=TargetKind.REGULAR,
-               path="swift_with_umbrella", public_headers_path=None,
+        Target(name="SwiftOnly", kind=TargetKind.REGULAR,
+               path="Sources/SwiftOnly", public_headers_path=None,
+               dependencies=[], exclude=[]),
+        Target(name="ObjCOnly", kind=TargetKind.REGULAR,
+               path="Sources/ObjCOnly", public_headers_path="include",
+               dependencies=[], exclude=[]),
+        Target(name="HeadersOnly", kind=TargetKind.REGULAR,
+               path="Sources/HeadersOnly", public_headers_path="include",
+               dependencies=[], exclude=[]),
+        Target(name="SwiftWithUmbrella", kind=TargetKind.REGULAR,
+               path="Sources/SwiftWithUmbrella", public_headers_path=None,
                dependencies=[], exclude=[]),
     ]
     scan_target_languages(base, targets)
     by_name = {t.name: t.language for t in targets}
-    _assert(by_name["swift_only"] == Language.SWIFT,
-            f"swift_only → {by_name['swift_only']}")
-    _assert(by_name["objc_only"] == Language.OBJC,
-            f"objc_only → {by_name['objc_only']}")
-    _assert(by_name["headers_only"] == Language.OBJC,
-            f"headers_only → {by_name['headers_only']}")
-    _assert(by_name["mixed"] == Language.MIXED,
-            f"mixed → {by_name['mixed']}")
-    _assert(by_name["swift_with_umbrella"] == Language.SWIFT,
-            "swift+umbrella must classify as Swift, not Mixed (BlinkIDUX "
-            f"regression); got {by_name['swift_with_umbrella']}")
+    _assert(by_name["SwiftOnly"] == Language.SWIFT,
+            f"SwiftOnly → {by_name['SwiftOnly']}")
+    _assert(by_name["ObjCOnly"] == Language.OBJC,
+            f"ObjCOnly → {by_name['ObjCOnly']}")
+    _assert(by_name["HeadersOnly"] == Language.OBJC,
+            f"HeadersOnly (umbrella ObjC shape) → {by_name['HeadersOnly']}")
+    _assert(by_name["SwiftWithUmbrella"] == Language.SWIFT,
+            "SwiftWithUmbrella must classify as Swift, not Mixed "
+            "(BlinkIDUX regression — SPM ignores the stub umbrella .h "
+            f"because the manifest is `.target()`); got {by_name['SwiftWithUmbrella']}")
+
+    # source_file_count reflects describe's `sources` list (SPM-applied
+    # exclude/include rules), not a raw FS walk. SwiftOnly = 1 (Foo.swift).
+    swift_only_tgt = next(t for t in targets if t.name == "SwiftOnly")
+    _assert(swift_only_tgt.source_file_count == 1,
+            f"SwiftOnly.source_file_count={swift_only_tgt.source_file_count}; expected 1")
 
 
 def _selftest_minimixed_fetch_integration() -> None:
@@ -480,6 +476,15 @@ def _selftest_minimixed_fetch_integration() -> None:
       - MiniMixed.xcodeproj is excluded
       - Sources/MiniSwift/Excluded.txt (per package's `exclude:` list)
         gets removed by the second pass
+
+    Also asserts the Inspect-phase contract for a fixture whose
+    `MiniMixed` target contains both `.swift` and `.m` sources:
+    `swift package describe --type json` refuses to classify
+    mixed-language targets ("feature not supported"), and the new
+    describe-based `scan_target_languages` surfaces that as an
+    `InspectError` rather than silently falling through to a stale
+    FS-walk classification. The fixture is the canonical regression
+    case for that boundary.
     """
     # `__file__` now lives under `src/`, so walk up one level to the
     # repo root where `testdata/` lives.
@@ -540,26 +545,43 @@ def _selftest_minimixed_fetch_integration() -> None:
                 "exclude cleanup (dump-package succeeded, so the cleanup "
                 "really did run)")
 
-        # Inspect against the staged dir (the test exercises the full Fetch
-        # → Inspect contract — including dump-package, language scan, and
-        # scheme discovery — against a real swift toolchain).
-        pkg = inspect_package(config, staged)
-        _assert(pkg.name == "MiniMixed", f"package name was {pkg.name!r}")
-        _assert(len(pkg.products) == 3, f"expected 3 products, got {len(pkg.products)}")
-        by_name = {p.name: p for p in pkg.products}
+        # dump_package classifies products/targets without needing
+        # describe — it must succeed even though the fixture contains a
+        # mixed-language target that SPM's describe pass rejects.
+        raw, products, targets, _platforms, name, _tv = dump_package(staged)
+        _assert(name == "MiniMixed", f"package name was {name!r}")
+        _assert(len(products) == 3, f"expected 3 products, got {len(products)}")
+        by_name = {p.name: p for p in products}
         _assert("MiniSwift" in by_name and "MiniObjC" in by_name and "MiniMixed" in by_name,
                 f"missing expected product, got {list(by_name.keys())}")
-        for p in pkg.products:
+        for p in products:
             _assert(p.linkage == Linkage.AUTOMATIC, f"{p.name} linkage was {p.linkage!r}")
 
-        # Language classification
-        lang_by_target = {t.name: t.language for t in pkg.targets}
-        _assert(lang_by_target.get("MiniSwift") == Language.SWIFT,
-                f"MiniSwift language was {lang_by_target.get('MiniSwift')!r}")
-        _assert(lang_by_target.get("MiniObjC") == Language.OBJC,
-                f"MiniObjC language was {lang_by_target.get('MiniObjC')!r}")
-        _assert(lang_by_target.get("MiniMixed") == Language.MIXED,
-                f"MiniMixed language was {lang_by_target.get('MiniMixed')!r}")
+        # Mixed-language regression contract: SPM rejects the
+        # MiniMixed target at describe time, so the full
+        # inspect_package call must surface an InspectError whose
+        # message names the unsupported feature. This is the boundary
+        # the describe-based classifier is supposed to enforce — see
+        # REFACTOR_PROPOSAL.md "Open risks for B" line on mixed
+        # targets being a known-broken SPM feature.
+        try:
+            inspect_package(config, staged)
+        except InspectError as exc:
+            msg = str(exc)
+            _assert(
+                "mixed language source files" in msg
+                or "feature not supported" in msg,
+                f"InspectError did not name the SPM mixed-language rejection: {msg!r}",
+            )
+        else:
+            raise AssertionError(
+                "inspect_package was expected to raise InspectError on the "
+                "mixed-language MiniMixed target, but it returned cleanly. "
+                "Either SwiftPM started supporting mixed-language source "
+                "dirs (good — update this test to assert classification) "
+                "or the describe-based classifier silently dropped the "
+                "rejection (bad — strict classification regression)."
+            )
 
 
 # --- Planner self-tests ---------------------------------------------------
@@ -594,8 +616,11 @@ def _selftest_scheme_resolver() -> None:
 
 
 def _selftest_planner_grdb() -> None:
-    """GRDB: force_dynamic on GRDB, NO force_dynamic on GRDB-dynamic,
-    GRDBSQLite dropped entirely because it's a system-target wrapper.
+    """GRDB: synth_dynamic_library for the non-dynamic GRDB product (added
+    as a parallel dynamic product via `swift package add-product`, then
+    renamed post-archive back to GRDB.framework). The already-dynamic
+    GRDB-dynamic product is built as-is with no edit. GRDBSQLite is
+    dropped entirely — it's a system-target wrapper.
     """
     pkg = _mk_package_from_snapshot(
         GRDB_DUMP_SNAPSHOT,
@@ -613,18 +638,47 @@ def _selftest_planner_grdb() -> None:
     _assert("GRDB-dynamic" in names, f"GRDB-dynamic must be built; got {names}")
     _assert("GRDBSQLite" not in names, f"GRDBSQLite must be skipped; got {names}")
 
-    edits = {(e.kind, e.product_name) for e in plan.package_swift_edits}
+    # Find the synthetic dynamic edit for GRDB. The exact synthetic name
+    # is allocator-driven (e.g. GRDBDynamic, GRDB__Dynamic) — the
+    # contract is "exactly one synth_dynamic_library whose targets
+    # match GRDB's backing targets, and the build unit it backs reports
+    # framework_name='GRDB'".
+    synth_dyn_edits = [
+        e for e in plan.package_swift_edits if e.kind == "synth_dynamic_library"
+    ]
     _assert(
-        ("force_dynamic", "GRDB") in edits,
-        f"force_dynamic on GRDB missing; got {edits}",
+        len(synth_dyn_edits) == 1,
+        f"expected exactly one synth_dynamic_library edit, got {synth_dyn_edits}",
+    )
+    grdb_edit = synth_dyn_edits[0]
+    _assert(
+        grdb_edit.targets == ["GRDB"],
+        f"synth_dynamic_library targets should be ['GRDB']; got {grdb_edit.targets}",
+    )
+
+    # The build unit named GRDB carries the framework_name='GRDB' contract
+    # (consumer-facing bundle name after the post-archive rename) while
+    # scheme is the synthetic product name we added to Package.swift.
+    grdb_bu = next(bu for bu in plan.build_units if bu.name == "GRDB")
+    _assert(
+        grdb_bu.framework_name == "GRDB",
+        f"GRDB framework_name should be 'GRDB' (post-rename); got '{grdb_bu.framework_name}'",
     )
     _assert(
-        ("force_dynamic", "GRDB-dynamic") not in edits,
-        f"must not force_dynamic the already-dynamic GRDB-dynamic; got {edits}",
+        grdb_bu.scheme == grdb_edit.product_name,
+        f"GRDB scheme should be the synthetic product name '{grdb_edit.product_name}'; got '{grdb_bu.scheme}'",
+    )
+
+    # The already-dynamic GRDB-dynamic build unit must NOT have a
+    # synthetic edit — it ships as the existing product, no renaming.
+    grdb_dyn_bu = next(bu for bu in plan.build_units if bu.name == "GRDB-dynamic")
+    _assert(
+        grdb_dyn_bu.framework_name == "GRDB-dynamic",
+        f"GRDB-dynamic must build as itself; got framework_name '{grdb_dyn_bu.framework_name}'",
     )
     _assert(
-        ("force_dynamic", "GRDBSQLite") not in edits,
-        "must not emit force_dynamic for the skipped system product",
+        grdb_dyn_bu.scheme == "GRDB-dynamic",
+        f"GRDB-dynamic scheme should match the literal product name; got '{grdb_dyn_bu.scheme}'",
     )
 
     skipped_names = [n for n, _ in plan.skipped]
@@ -633,18 +687,13 @@ def _selftest_planner_grdb() -> None:
         f"expected GRDBSQLite in skipped list; got {plan.skipped}",
     )
 
-    # Scheme resolution: GRDB should pick the literal scheme, not
-    # GRDB-Package. This is the session-1 inversion noted in the brief.
-    grdb_bu = next(bu for bu in plan.build_units if bu.name == "GRDB")
-    _assert(
-        grdb_bu.scheme == "GRDB",
-        f"GRDB scheme should be literal 'GRDB' not '{grdb_bu.scheme}'",
-    )
-
 
 def _selftest_planner_alamofire() -> None:
-    """Alamofire-shape: two products over the same target — plan both,
-    but only force_dynamic the non-dynamic one."""
+    """Alamofire-shape: two products over the same target — plan both
+    build units, but only emit a synth_dynamic_library edit for the
+    non-dynamic one. The synthetic name collides with the existing
+    AlamofireDynamic, so the allocator falls back (Alamofire__Dynamic
+    or similar)."""
     pkg = _mk_package_from_snapshot(
         ALAMOFIRE_DUMP_SNAPSHOT,
         schemes=["Alamofire", "AlamofireDynamic", "Alamofire-Package"],
@@ -662,14 +711,38 @@ def _selftest_planner_alamofire() -> None:
         f"Alamofire should plan both build units, got {names}",
     )
 
-    edits = {(e.kind, e.product_name) for e in plan.package_swift_edits}
+    synth_dyn_edits = [
+        e for e in plan.package_swift_edits if e.kind == "synth_dynamic_library"
+    ]
     _assert(
-        ("force_dynamic", "Alamofire") in edits,
-        f"force_dynamic on Alamofire; got {edits}",
+        len(synth_dyn_edits) == 1,
+        f"expected exactly one synth_dynamic_library edit, got {synth_dyn_edits}",
+    )
+    edit = synth_dyn_edits[0]
+    _assert(
+        edit.targets == ["Alamofire"],
+        f"edit targets should be ['Alamofire']; got {edit.targets}",
+    )
+    # Collision-aware naming: cannot use 'AlamofireDynamic' since it
+    # already exists, so allocator picks a fallback (e.g. Alamofire__Dynamic).
+    _assert(
+        edit.product_name != "AlamofireDynamic" and edit.product_name != "Alamofire",
+        f"synthetic name must not collide; got {edit.product_name!r}",
+    )
+
+    alamo_bu = next(bu for bu in plan.build_units if bu.name == "Alamofire")
+    _assert(
+        alamo_bu.framework_name == "Alamofire",
+        f"Alamofire framework_name should be 'Alamofire' (post-rename); got '{alamo_bu.framework_name}'",
     )
     _assert(
-        ("force_dynamic", "AlamofireDynamic") not in edits,
-        f"must not force_dynamic the already-dynamic AlamofireDynamic; got {edits}",
+        alamo_bu.scheme == edit.product_name,
+        f"Alamofire scheme should be the synthetic name; got '{alamo_bu.scheme}'",
+    )
+    alamo_dyn_bu = next(bu for bu in plan.build_units if bu.name == "AlamofireDynamic")
+    _assert(
+        alamo_dyn_bu.framework_name == "AlamofireDynamic",
+        f"AlamofireDynamic should ship as itself; got '{alamo_dyn_bu.framework_name}'",
     )
 
 
@@ -706,30 +779,43 @@ def _selftest_planner_stripe_synthetic_libraries() -> None:
         "Stripe is a real product, not synthetic",
     )
 
-    synthetic_edits = {
+    # synth_library: --target on a target that has no matching product
+    # synthesizes a fresh dynamic library with the target's name as the
+    # product name (no collision risk by construction).
+    synth_lib_names = {
         e.product_name for e in plan.package_swift_edits
-        if e.kind == "add_synthetic_library"
+        if e.kind == "synth_library"
     }
     _assert(
-        synthetic_edits == {"StripeCore", "StripeUICore"},
-        f"synthetic edits should be {{StripeCore, StripeUICore}}, got {synthetic_edits}",
+        synth_lib_names == {"StripeCore", "StripeUICore"},
+        f"synth_library edits should be {{StripeCore, StripeUICore}}, got {synth_lib_names}",
     )
-    force_names = {
-        e.product_name for e in plan.package_swift_edits
-        if e.kind == "force_dynamic"
-    }
+
+    # synth_dynamic_library: the existing 'Stripe' product is non-dynamic,
+    # so the planner adds a parallel dynamic product (allocator-chosen
+    # name) and the build unit renames the bundle back to 'Stripe' after
+    # the archive. Exactly one such edit, targeting Stripe's backing
+    # targets.
+    synth_dyn_edits = [
+        e for e in plan.package_swift_edits if e.kind == "synth_dynamic_library"
+    ]
     _assert(
-        "Stripe" in force_names,
-        f"Stripe should get force_dynamic; got {force_names}",
+        len(synth_dyn_edits) == 1,
+        f"expected exactly one synth_dynamic_library edit; got {synth_dyn_edits}",
+    )
+    stripe_edit = synth_dyn_edits[0]
+    _assert(
+        stripe_edit.product_name != "Stripe",
+        f"synthetic name must differ from the existing Stripe product; got {stripe_edit.product_name!r}",
+    )
+    stripe_bu = by_name["Stripe"]
+    _assert(
+        stripe_bu.framework_name == "Stripe",
+        f"Stripe build unit framework_name should be 'Stripe' (post-rename); got '{stripe_bu.framework_name}'",
     )
     _assert(
-        "StripeCore" not in force_names,
-        "synthetic library StripeCore should NOT get force_dynamic "
-        "(the synthetic edit is already .dynamic)",
-    )
-    _assert(
-        "StripeUICore" not in force_names,
-        "synthetic library StripeUICore should NOT get force_dynamic",
+        stripe_bu.scheme == stripe_edit.product_name,
+        f"Stripe build unit scheme should match the synthetic name; got '{stripe_bu.scheme}'",
     )
 
 
@@ -938,16 +1024,32 @@ def _selftest_planner_skips_binary_only_product_in_mixed_package() -> None:
         f"expected only the source product in build_units, got {bu_names}",
     )
 
-    edits = {(e.kind, e.product_name) for e in plan.package_swift_edits}
+    # The source product MixedKitSrc is non-dynamic, so the planner
+    # adds a parallel synthetic dynamic product (allocator-chosen name)
+    # that the build unit will archive then rename back to MixedKitSrc.
+    synth_dyn_edits = [
+        e for e in plan.package_swift_edits if e.kind == "synth_dynamic_library"
+    ]
     _assert(
-        ("force_dynamic", "MixedKitSrc") in edits,
-        f"source product should still get force_dynamic; edits={edits}",
+        len(synth_dyn_edits) == 1,
+        f"source product should get a synth_dynamic_library edit; got {plan.package_swift_edits}",
     )
     _assert(
-        ("force_dynamic", "MixedKitBin") not in edits,
-        f"binary product MUST NOT get force_dynamic (SPM would reject); "
-        f"edits={edits}",
+        synth_dyn_edits[0].targets == ["MixedKitSrc"],
+        f"synth_dynamic_library targets should be ['MixedKitSrc']; got {synth_dyn_edits[0].targets}",
     )
+
+    # Binary product never gets a synth edit — it gets replaced by a
+    # `.binaryTarget` reference via `replace_with_binary_target` (its
+    # own edit kind), or is left alone in source mode and recorded in
+    # plan.skipped. The contract here: no `synth_*` edit names the
+    # binary product.
+    for e in plan.package_swift_edits:
+        if e.kind in ("synth_dynamic_library", "synth_library"):
+            _assert(
+                e.product_name != "MixedKitBin",
+                f"binary product MUST NOT receive synth edits; got {e}",
+            )
 
     skipped_by_name = {n: reason for n, reason in plan.skipped}
     _assert(
@@ -1068,7 +1170,7 @@ def _selftest_planner_duplicate_target_filters_deduped() -> None:
 
     synthetic_names = [
         e.product_name for e in plan.package_swift_edits
-        if e.kind == "add_synthetic_library"
+        if e.kind == "synth_library"
     ]
     _assert(
         synthetic_names.count("StripeCore") == 1,
@@ -1111,11 +1213,11 @@ def _selftest_planner_target_matching_existing_product_uses_existing() -> None:
         f"expected warning about existing product; got {plan.warnings}",
     )
 
-    # No synthetic edit should be added — the existing product is reused.
-    synthetic = [e for e in plan.package_swift_edits if e.kind == "add_synthetic_library"]
+    # No synth_library edit should be added — the existing product is reused.
+    synthetic = [e for e in plan.package_swift_edits if e.kind == "synth_library"]
     _assert(
         not synthetic,
-        f"no synthetic library should be added when --target matches an "
+        f"no synth_library edit should be added when --target matches an "
         f"existing product; got {synthetic}",
     )
     # Exactly one GRDB build unit.
@@ -1129,14 +1231,11 @@ def _selftest_planner_target_matching_existing_product_uses_existing() -> None:
 
 def _selftest_planner_target_reinstates_filtered_product() -> None:
     """If `--product` excludes a product but `--target T` names that same
-    product, the planner must re-include it exactly once and emit a
-    force_dynamic edit for it (since it's still a non-dynamic product).
-    This covers the otherwise-untested branch where the existing product
-    hasn't already been planned.
+    product, the planner must re-include it exactly once. In B's edit
+    model the reinstated non-dynamic product gets a synth_dynamic_library
+    edit (parallel dynamic product + post-archive rename) — there's no
+    longer a separate "force_dynamic" pathway.
     """
-    # Use Alamofire: --product AlamofireDynamic narrows to just the
-    # already-dynamic one, then --target Alamofire forces the non-dynamic
-    # regular product back in via the "existing product" branch.
     pkg = _mk_package_from_snapshot(
         ALAMOFIRE_DUMP_SNAPSHOT,
         schemes=["Alamofire", "AlamofireDynamic"],
@@ -1154,7 +1253,6 @@ def _selftest_planner_target_reinstates_filtered_product() -> None:
         sorted(names) == ["Alamofire", "AlamofireDynamic"],
         f"expected both Alamofire and AlamofireDynamic, got {names}",
     )
-    # Alamofire appears exactly once (not duplicated as synthetic).
     _assert(
         names.count("Alamofire") == 1,
         f"Alamofire should appear once, got {names}",
@@ -1162,20 +1260,33 @@ def _selftest_planner_target_reinstates_filtered_product() -> None:
     by_name = {bu.name: bu for bu in plan.build_units}
     _assert(
         not by_name["Alamofire"].synthetic,
-        "reinstated Alamofire should not be marked synthetic",
+        "reinstated Alamofire should not be marked synthetic (this branch "
+        "reuses the existing product, just routed through the dynamic-rename flow)",
     )
-    # Force_dynamic on Alamofire, but not on AlamofireDynamic.
-    force_names = {
-        e.product_name for e in plan.package_swift_edits
-        if e.kind == "force_dynamic"
-    }
+    # Reinstated Alamofire goes through synth_dynamic_library; the
+    # already-dynamic AlamofireDynamic is untouched.
+    synth_dyn_edits = [
+        e for e in plan.package_swift_edits if e.kind == "synth_dynamic_library"
+    ]
     _assert(
-        force_names == {"Alamofire"},
-        f"force_dynamic should be exactly {{Alamofire}}, got {force_names}",
+        len(synth_dyn_edits) == 1,
+        f"expected one synth_dynamic_library edit for reinstated Alamofire; got {synth_dyn_edits}",
     )
-    # And no synthetic edits — we reused the existing product.
-    synthetic = [e for e in plan.package_swift_edits if e.kind == "add_synthetic_library"]
-    _assert(not synthetic, f"no synthetic edits expected, got {synthetic}")
+    _assert(
+        synth_dyn_edits[0].targets == ["Alamofire"],
+        f"synth_dynamic_library targets should be ['Alamofire']; got {synth_dyn_edits[0].targets}",
+    )
+    _assert(
+        by_name["Alamofire"].framework_name == "Alamofire",
+        f"reinstated Alamofire framework_name should be 'Alamofire' (post-rename); "
+        f"got '{by_name['Alamofire'].framework_name}'",
+    )
+    # No `synth_library` edits — we reused the existing product instead
+    # of synthesizing a fresh one from the target.
+    synth_lib_edits = [
+        e for e in plan.package_swift_edits if e.kind == "synth_library"
+    ]
+    _assert(not synth_lib_edits, f"no synth_library edits expected, got {synth_lib_edits}")
 
 
 def _selftest_planner_binary_dedupes_duplicate_artifacts() -> None:
@@ -1564,153 +1675,6 @@ def _selftest_balanced_close_comments() -> None:
     _assert(_balanced_close(s, 0) == -1,
             f"unterminated-nested-comment should return -1, got "
             f"{_balanced_close(s, 0)}")
-
-
-def _selftest_edit_force_dynamic_grdb_targets_correct_library() -> None:
-    """The CRITICAL hazard: GRDB has two libraries whose names start with
-    'GRDB'. force_dynamic('GRDB') must edit the middle one ('GRDB'), NOT
-    the third one ('GRDB-dynamic') and NOT GRDBSQLite. This is the bug
-    the session-2 worker called out by name."""
-    out = edit_force_dynamic(GRDB_PACKAGE_SWIFT_FIXTURE, "GRDB")
-    # The GRDB line must now contain `type: .dynamic`.
-    grdb_line = [
-        ln for ln in out.splitlines()
-        if 'name: "GRDB",' in ln and ".library(" in ln
-    ]
-    _assert(len(grdb_line) == 1, f"expected exactly one GRDB .library line, got {len(grdb_line)}")
-    _assert("type: .dynamic" in grdb_line[0],
-            f"GRDB line missing type: .dynamic — {grdb_line[0]}")
-    # GRDB-dynamic line must be unchanged: still contains the same shape.
-    grdb_dyn_line = [
-        ln for ln in out.splitlines()
-        if 'name: "GRDB-dynamic"' in ln
-    ]
-    _assert(len(grdb_dyn_line) == 1, "GRDB-dynamic line missing")
-    _assert(
-        grdb_dyn_line[0].count("type: .dynamic") == 1,
-        f"GRDB-dynamic line should still have exactly one type: .dynamic — {grdb_dyn_line[0]}",
-    )
-    # GRDBSQLite line must be untouched (still no type: clause).
-    grdb_sqlite_line = [
-        ln for ln in out.splitlines()
-        if 'name: "GRDBSQLite"' in ln and ".library(" in ln
-    ]
-    _assert(len(grdb_sqlite_line) == 1, "GRDBSQLite line missing")
-    _assert(
-        "type:" not in grdb_sqlite_line[0],
-        f"GRDBSQLite line should NOT have a type: clause — {grdb_sqlite_line[0]}",
-    )
-
-
-def _selftest_edit_force_dynamic_already_dynamic_is_noop() -> None:
-    """Defensive: if the edit is somehow applied to an already-dynamic
-    library, it must not introduce a duplicate clause or otherwise
-    corrupt the manifest."""
-    out = edit_force_dynamic(GRDB_PACKAGE_SWIFT_FIXTURE, "GRDB-dynamic")
-    _assert(out == GRDB_PACKAGE_SWIFT_FIXTURE,
-            "force_dynamic on already-dynamic product should be a no-op")
-
-
-def _selftest_edit_force_dynamic_replaces_existing_type() -> None:
-    """If a library already has `type: .static`, the edit replaces it
-    with `type: .dynamic` rather than appending a second `type:` clause."""
-    src = '''let p = Package(
-    products: [
-        .library(name: "Foo", type: .static, targets: ["Foo"]),
-    ]
-)
-'''
-    out = edit_force_dynamic(src, "Foo")
-    _assert("type: .dynamic" in out, f"expected .dynamic in output: {out}")
-    _assert(".static" not in out, f"static not removed: {out}")
-    # Make sure exactly one type: clause exists.
-    _assert(out.count("type:") == 1, f"expected exactly one type: clause, got {out.count('type:')}")
-
-
-def _selftest_edit_force_dynamic_multiline_arguments() -> None:
-    """Stripe-shape: the .library(...) call uses multi-line arguments. The
-    balanced-paren walker must navigate them correctly."""
-    out = edit_force_dynamic(STRIPE_PACKAGE_SWIFT_FIXTURE, "Stripe")
-    # The Stripe library should now have type: .dynamic injected after
-    # the name line. The simplest assertion: the modified text contains
-    # `name: "Stripe", type: .dynamic` (with whatever exact spacing the
-    # editor uses).
-    _assert('name: "Stripe", type: .dynamic' in out,
-            f"Stripe edit didn't land — searched for 'name: \"Stripe\", type: .dynamic'")
-    # And StripePayments must remain untouched (its `name:` line is on
-    # its own line, no type: clause should be added).
-    _assert('name: "StripePayments",\n            targets:' in out,
-            "StripePayments was unexpectedly modified")
-
-
-def _selftest_edit_force_dynamic_missing_product_raises() -> None:
-    """Deliberate-failure path: requesting force_dynamic on a name that
-    doesn't exist must raise PrepareUserError (clean message path), not
-    silently no-op and not traceback — this is the canonical `--product
-    NoSuchProduct` shape."""
-    try:
-        edit_force_dynamic(GRDB_PACKAGE_SWIFT_FIXTURE, "DoesNotExist")
-    except PrepareUserError as exc:
-        _assert("DoesNotExist" in str(exc), f"error mentions name: {exc}")
-        # Must also satisfy the user-facing isinstance check so main()
-        # routes it through the clean-message handler.
-        _assert(
-            isinstance(exc, _USER_FACING_ERRORS),
-            "PrepareUserError must be in _USER_FACING_ERRORS for clean exit",
-        )
-        return
-    raise AssertionError("expected PrepareUserError for missing product")
-
-
-def _selftest_edit_add_synthetic_library_no_trailing_comma() -> None:
-    """Stripe-shape `]` (no trailing comma after last entry): the editor
-    must insert a leading comma + new entry before the close bracket."""
-    out = edit_add_synthetic_library(STRIPE_PACKAGE_SWIFT_FIXTURE, "StripeCore", ["StripeCore"])
-    _assert(
-        '.library(name: "StripeCore", type: .dynamic, targets: ["StripeCore"])' in out,
-        "synthetic library entry missing",
-    )
-    # The previous last entry's closing `)` should now be followed by a `,`.
-    # Find the last existing entry's close paren in the modified text.
-    idx = out.find('.library(\n            name: "StripeConnect"')
-    _assert(idx != -1, "StripeConnect entry should still be there")
-    after = out[idx:]
-    # The first `)` after StripeConnect's open should be followed by `,`.
-    rp = after.find(")")
-    _assert(rp != -1, "StripeConnect close paren missing")
-    _assert(after[rp + 1] == ",", f"expected `,` after StripeConnect's `)`, got {after[rp+1]!r}")
-
-
-def _selftest_edit_add_synthetic_library_with_trailing_comma() -> None:
-    """GRDB-shape `,]`: the editor must NOT add a duplicate comma."""
-    out = edit_add_synthetic_library(GRDB_PACKAGE_SWIFT_FIXTURE, "MyExtra", ["GRDB"])
-    _assert(
-        '.library(name: "MyExtra", type: .dynamic, targets: ["GRDB"])' in out,
-        "synthetic library entry missing",
-    )
-    # GRDB-dynamic line ends with `,` — check we didn't double up.
-    grdb_dyn_idx = out.find('.library(name: "GRDB-dynamic"')
-    _assert(grdb_dyn_idx != -1, "GRDB-dynamic line should still be there")
-    rp = out.find(")", grdb_dyn_idx)
-    _assert(out[rp + 1] == ",", f"GRDB-dynamic should still end with `,`, got {out[rp+1]!r}")
-    _assert(out[rp + 2] != ",", f"no double comma — got {out[rp+1:rp+3]!r}")
-
-
-def _selftest_edit_add_synthetic_library_empty_array() -> None:
-    """An empty `products: []` should accept a new entry without
-    corrupting the brackets."""
-    src = '''let p = Package(
-    name: "Empty",
-    products: [],
-    targets: []
-)
-'''
-    out = edit_add_synthetic_library(src, "Foo", ["Foo"])
-    _assert('.library(name: "Foo", type: .dynamic, targets: ["Foo"])' in out,
-            f"missing entry: {out}")
-    # `[]` was empty; after edit, products list should be a valid array.
-    # Specifically the `[]` close bracket must still be present somewhere.
-    _assert("]," in out and "products: [" in out, f"shape broken: {out}")
 
 
 # ---------------------------------------------------------------------------
@@ -2327,6 +2291,198 @@ let p = Package(
             "second edit through string-literal manifest was not a no-op")
 
 
+def _selftest_edit_demote_synthetic_product_spm_multiline() -> None:
+    """[Codex round-3 High] Canonical SPM `add-product` output —
+    multi-line, `type: .dynamic,` on its own line — gets cleanly
+    demoted to automatic-library shape. The resulting manifest must
+    parse cleanly through `swift package dump-package` (verified by a
+    later integration test) AND must preserve everything else
+    byte-for-byte (other products, all targets, comments).
+    """
+    text = (
+        "// swift-tools-version: 5.9\n"
+        "import PackageDescription\n"
+        "\n"
+        "let package = Package(\n"
+        '    name: "Probe",\n'
+        "    products: [\n"
+        "        .library(\n"
+        '            name: "FooDynamic",\n'
+        "            type: .dynamic,\n"
+        '            targets: [ "Foo" ]\n'
+        "        ),\n"
+        "    ],\n"
+        "    targets: [\n"
+        '        .target(name: "Foo"),\n'
+        "    ]\n"
+        ")\n"
+    )
+    out = edit_demote_synthetic_product(text, "FooDynamic")
+    _assert("type: .dynamic" not in out,
+            f"type: .dynamic still present after demote:\n{out}")
+    _assert('name: "FooDynamic"' in out,
+            f"product name was clobbered by the demote:\n{out}")
+    _assert('targets: [ "Foo" ]' in out,
+            f"targets array was clobbered by the demote:\n{out}")
+    _assert('.target(name: "Foo")' in out,
+            f"unrelated target was modified by the demote:\n{out}")
+
+
+def _selftest_edit_demote_synthetic_product_single_line() -> None:
+    """The demoter must also work on single-line `.library(...)`
+    declarations — uncommon in SPM-generated output but well-formed
+    Swift. The result is the same automatic-library shape minus
+    `type: .dynamic`.
+    """
+    text = (
+        "let package = Package(\n"
+        "    products: [\n"
+        '        .library(name: "FooDynamic", type: .dynamic, targets: ["Foo"]),\n'
+        "    ]\n"
+        ")\n"
+    )
+    out = edit_demote_synthetic_product(text, "FooDynamic")
+    _assert("type: .dynamic" not in out,
+            f"type: .dynamic still present:\n{out}")
+    _assert(
+        '.library(name: "FooDynamic", targets: ["Foo"])' in out,
+        f"single-line shape not cleaned up properly:\n{out}",
+    )
+
+
+def _selftest_edit_demote_synthetic_product_idempotent() -> None:
+    """Running the demoter twice — or on an already-automatic library
+    — must be a no-op. Same idempotency contract as
+    `edit_replace_with_binary_target`."""
+    text = (
+        "let package = Package(\n"
+        "    products: [\n"
+        '        .library(name: "Foo", targets: ["Foo"]),\n'
+        "    ]\n"
+        ")\n"
+    )
+    out = edit_demote_synthetic_product(text, "Foo")
+    _assert(out == text, "demote on automatic-shape product must be a no-op")
+
+
+def _selftest_edit_demote_synthetic_product_unknown_raises() -> None:
+    """Demoter must raise `PrepareUserError` if the named product
+    isn't present in the manifest. (Same surface as
+    `edit_replace_with_binary_target` for symmetry.)"""
+    text = (
+        "let package = Package(\n"
+        "    products: [\n"
+        '        .library(name: "Foo", targets: ["Foo"]),\n'
+        "    ]\n"
+        ")\n"
+    )
+    raised = False
+    try:
+        edit_demote_synthetic_product(text, "DoesNotExist")
+    except tool.PrepareUserError:
+        raised = True
+    _assert(raised, "expected PrepareUserError for missing product")
+
+
+def _selftest_edit_demote_synthetic_product_ignores_target_name() -> None:
+    """When a regular `.target(name: "MyProduct", ...)` and a synth
+    `.library(name: "MyProduct", ...)` share a name (the `--target T`
+    escape-hatch case), the demoter must target the LIBRARY call, not
+    the target call. Otherwise the demote would mis-fire on the source
+    target and leave the synth library's `type: .dynamic` intact.
+    """
+    text = (
+        "let package = Package(\n"
+        "    products: [\n"
+        "        .library(\n"
+        '            name: "MyTarget",\n'
+        "            type: .dynamic,\n"
+        '            targets: ["MyTarget"]\n'
+        "        ),\n"
+        "    ],\n"
+        "    targets: [\n"
+        '        .target(name: "MyTarget"),\n'
+        "    ]\n"
+        ")\n"
+    )
+    out = edit_demote_synthetic_product(text, "MyTarget")
+    _assert("type: .dynamic" not in out,
+            f"library's type: .dynamic was not stripped:\n{out}")
+    _assert('.target(name: "MyTarget")' in out,
+            f"the unrelated `.target(name: \"MyTarget\")` was clobbered:\n{out}")
+
+
+def _selftest_edit_demote_synthetic_product_dumppackage_roundtrip(tmp_root: Path) -> None:
+    """End-to-end: write a manifest with a synth-dynamic product
+    pointing at a binary target → confirm it FAILS `dump-package`
+    (the very invariant we're defending against) → demote → confirm
+    it PASSES `dump-package`. Pins the Codex round-3 fix's actual
+    contract: the demoted manifest is what unblocks subsequent
+    `.binaryTarget` substitution.
+    """
+    work = tmp_root / "demote-roundtrip"
+    work.mkdir()
+    pkg = work / "Package.swift"
+    pkg.write_text(
+        "// swift-tools-version: 5.9\n"
+        "import PackageDescription\n"
+        "\n"
+        "let package = Package(\n"
+        '    name: "Probe",\n'
+        "    products: [\n"
+        "        .library(\n"
+        '            name: "FooDynamic",\n'
+        "            type: .dynamic,\n"
+        '            targets: [ "Foo" ]\n'
+        "        ),\n"
+        "    ],\n"
+        "    targets: [\n"
+        '        .binaryTarget(name: "Foo", path: "Foo.xcframework"),\n'
+        "    ]\n"
+        ")\n"
+    )
+    fw = work / "Foo.xcframework"
+    fw.mkdir()
+    (fw / "Info.plist").write_text(
+        '<?xml version="1.0"?>'
+        '<plist version="1.0"><dict>'
+        "<key>AvailableLibraries</key><array/>"
+        "<key>CFBundlePackageType</key><string>XFWK</string>"
+        "<key>XCFrameworkFormatVersion</key><string>1.0</string>"
+        "</dict></plist>"
+    )
+
+    # 1) Confirm the pre-demote manifest is rejected by SPM with the
+    #    documented "binary-only products must be automatic" message.
+    pre = subprocess.run(
+        ["swift", "package", "dump-package"],
+        cwd=str(work), capture_output=True, text=True,
+    )
+    _assert(pre.returncode != 0,
+            "expected SPM to reject .library(type: .dynamic) wrapping "
+            f"a binary target, but dump-package succeeded:\n{pre.stdout[-400:]}")
+    _assert("automatic library products" in pre.stderr or
+            "binary product" in pre.stderr,
+            f"unexpected dump-package error shape:\n{pre.stderr[-400:]}")
+
+    # 2) Demote and re-write.
+    out = edit_demote_synthetic_product(pkg.read_text(), "FooDynamic")
+    pkg.write_text(out)
+
+    # 3) Re-run dump-package; this MUST succeed.
+    post = subprocess.run(
+        ["swift", "package", "dump-package"],
+        cwd=str(work), capture_output=True, text=True,
+    )
+    _assert(post.returncode == 0,
+            f"post-demote dump-package failed (exit {post.returncode}):\n"
+            f"stderr:\n{post.stderr[-400:]}")
+    # The product itself must still appear in dump-package output (we
+    # demoted, not removed).
+    _assert('"FooDynamic"' in post.stdout,
+            "demoted product disappeared from the dumped manifest")
+
+
 def _selftest_compute_dedup_substitutions_single_target_sibling() -> None:
     """[Codex P2 r5 regression — happy path] Sibling unit with
     `source_targets == [dep_t]` IS substituted: the xcframework was
@@ -2498,6 +2654,84 @@ def _selftest_compute_dedup_substitutions_mixes_single_and_multi() -> None:
     # Sorted dep walk visits 'A' (multi-target sibling — skip) then 'Core' (substitute).
     _assert(subs == [("Core", core_xcf)],
             f"mix should yield only Core substitution, got {subs!r}")
+
+
+def _selftest_compute_dedup_substitutions_synth_dynamic_target_skipped() -> None:
+    """[Codex final-review High] When a sibling's manifest carries a
+    `synth_dynamic_library` edit naming its single source target,
+    rewriting that target to `.binaryTarget(...)` would leave the
+    surviving `.library(type: .dynamic, targets: [T])` product
+    pointing at a binary-only target. SPM rejects exactly that shape
+    at the next archive's manifest parse:
+
+        "invalid type for binary product; products referencing only
+         binary targets must be executable or automatic library
+         products"
+
+    The substitution must be skipped (slower per-unit re-compile of T,
+    but correct manifest state).
+    """
+    BU = tool.BuildUnit
+    sibling = BU(name="StripeCore", scheme="StripeCoreDynamic",
+                 framework_name="StripeCore", language="Swift",
+                 archive_strategy="archive", source_targets=["StripeCore"])
+    umbrella = BU(name="Stripe", scheme="StripeDynamic",
+                  framework_name="Stripe", language="Swift",
+                  archive_strategy="archive", source_targets=["Stripe"])
+    target_to_unit = {"StripeCore": sibling, "Stripe": umbrella}
+    built = {"StripeCore": tool.ExecutedUnit(
+        name="StripeCore",
+        xcframework_path=Path("/build/StripeCore.xcframework"),
+        framework_name="StripeCore",
+    )}
+    deps = {"Stripe": {"StripeCore"}, "StripeCore": set()}
+
+    subs = _compute_dedup_substitutions(
+        unit=umbrella,
+        target_to_unit=target_to_unit,
+        built_by_unit=built,
+        target_deps=deps,
+        synth_dynamic_protected={"StripeCore"},
+    )
+    _assert(subs == [],
+            "synth_dynamic_library-protected target must not be substituted; "
+            f"got {subs!r}")
+
+
+def _selftest_synth_dynamic_protected_targets_helper() -> None:
+    """[Codex final-review round 2 High] Helper collects every target
+    named by either kind of synthetic dynamic-library edit. Both
+    `synth_dynamic_library` AND `synth_library` are applied through
+    `_invoke_swift_add_product` with `--type dynamic-library`, so both
+    produce `.library(type: .dynamic, ...)` products that SPM rejects
+    when their target list contains only `.binaryTarget` entries. The
+    original round-1 fix only protected `synth_dynamic_library`, which
+    left `--target T` builds exposed to the same regression — this
+    test pins the corrected behavior.
+    """
+    edits = [
+        tool.PackageSwiftEdit(
+            kind="synth_dynamic_library",
+            product_name="StripeCoreDynamic",
+            targets=["StripeCore"],
+        ),
+        tool.PackageSwiftEdit(
+            kind="synth_library",
+            product_name="MyTarget",
+            targets=["MyTarget"],
+        ),
+        tool.PackageSwiftEdit(
+            kind="synth_dynamic_library",
+            product_name="KitDynamic",
+            targets=["A", "B"],
+        ),
+    ]
+    protected = tool._synth_dynamic_protected_targets(edits)
+    _assert(
+        protected == {"StripeCore", "A", "B", "MyTarget"},
+        f"expected protected set to cover BOTH synth_dynamic_library and "
+        f"synth_library targets, got {protected!r}",
+    )
 
 
 def _selftest_apply_dedup_overlap_substitutions_guards_unsupported_constructs(tmp_root: Path) -> None:
@@ -3979,113 +4213,6 @@ def _selftest_find_resource_bundles_dedupe_and_filter(tmp_root: Path) -> None:
     _assert(pkg_b == archive_b, f"expected {archive_b}, got {pkg_b}")
 
 
-def _selftest_detect_system_frameworks_linker_settings(tmp_root: Path) -> None:
-    """detect_system_frameworks unions linker settings with source-tree
-    imports. This test exercises the linker-settings half: a target with
-    no source files but a `linkedFramework` setting must still be picked
-    up."""
-    base = tmp_root / "detect_linker"
-    staged = base / "staged"
-    target_dir = staged / "Sources" / "Linked"
-    target_dir.mkdir(parents=True)
-    raw_dump = {
-        "products": [{"name": "Linked", "type": {"library": ["automatic"]}, "targets": ["Linked"]}],
-        "targets": [
-            {
-                "name": "Linked",
-                "type": "regular",
-                "path": "Sources/Linked",
-                "publicHeadersPath": None,
-                "dependencies": [],
-                "settings": [
-                    {"tool": "linker", "kind": {"linkedFramework": "CoreLocation"}},
-                    {"tool": "linker", "kind": {"linkedFramework": "Security"}},
-                    {"tool": "swift", "kind": {"define": "FOO"}},
-                ],
-            }
-        ],
-    }
-    package = Package(
-        name="Linked",
-        tools_version="5.7.0",
-        platforms=[],
-        products=[Product(name="Linked", linkage=Linkage.AUTOMATIC, targets=["Linked"])],
-        targets=[Target(
-            name="Linked",
-            kind=TargetKind.REGULAR,
-            path="Sources/Linked",
-            public_headers_path=None,
-            dependencies=[],
-            exclude=[],
-            language=Language.SWIFT,
-        )],
-        schemes=[],
-        raw_dump=raw_dump,
-        staged_dir=staged,
-    )
-    fws = detect_system_frameworks(package, "Linked")
-    _assert(fws == ["CoreLocation", "Security"],
-            f"linker frameworks not detected: {fws}")
-
-
-def _selftest_detect_system_frameworks_source_imports(tmp_root: Path) -> None:
-    """detect_system_frameworks scans target source files for
-    `#import <Framework/...>` and `@import Framework` lines. The Tests/
-    subdirectory must be excluded so a Demo app's UIKit import doesn't
-    leak into the library's framework list."""
-    base = tmp_root / "detect_source"
-    staged = base / "staged"
-    target_dir = staged / "Sources" / "Scan"
-    target_dir.mkdir(parents=True)
-    (target_dir / "Header.h").write_text(
-        "#import <UIKit/UIKit.h>\n"
-        "@import CoreFoundation;\n"
-    )
-    (target_dir / "Impl.m").write_text(
-        "#import <CoreGraphics/CoreGraphics.h>\n"
-    )
-    tests = target_dir / "Tests"
-    tests.mkdir()
-    (tests / "Junk.m").write_text("#import <CoreData/CoreData.h>\n")
-    raw_dump = {
-        "products": [{"name": "Scan", "type": {"library": ["automatic"]}, "targets": ["Scan"]}],
-        "targets": [
-            {
-                "name": "Scan",
-                "type": "regular",
-                "path": "Sources/Scan",
-                "publicHeadersPath": None,
-                "dependencies": [],
-            }
-        ],
-    }
-    package = Package(
-        name="Scan",
-        tools_version="5.7.0",
-        platforms=[],
-        products=[Product(name="Scan", linkage=Linkage.AUTOMATIC, targets=["Scan"])],
-        targets=[Target(
-            name="Scan",
-            kind=TargetKind.REGULAR,
-            path="Sources/Scan",
-            public_headers_path=None,
-            dependencies=[],
-            exclude=[],
-            language=Language.OBJC,
-        )],
-        schemes=[],
-        raw_dump=raw_dump,
-        staged_dir=staged,
-    )
-    fws = detect_system_frameworks(package, "Scan")
-    _assert("UIKit" in fws, f"UIKit missing from detected frameworks: {fws}")
-    _assert("CoreFoundation" in fws, f"CoreFoundation missing from detected frameworks: {fws}")
-    _assert("CoreGraphics" in fws, f"CoreGraphics missing from detected frameworks: {fws}")
-    _assert("CoreData" not in fws,
-            f"CoreData should not appear (Tests/ subdir should be pruned): {fws}")
-    _assert("Scan" not in fws, f"Scan should be removed as a self-reference: {fws}")
-
-
 def _selftest_find_objc_headers_dir_priority(tmp_root: Path) -> None:
     """fw_name match wins over product_name match wins over any-target."""
     base = tmp_root / "headers_priority"
@@ -4688,86 +4815,6 @@ def _selftest_find_objc_headers_dir_dep_walk_internal_default_include(tmp_root: 
         f"expected internal dep's default include/ to be folded into "
         f"the parent framework, got {found!r}",
     )
-
-
-def _selftest_detect_system_frameworks_follows_target_edge(tmp_root: Path) -> None:
-    """Regression for Codex [P1]: `detect_system_frameworks` must walk
-    first-level `target`-shape deps so system frameworks declared by
-    depended-on ObjC targets still reach the clang -dynamiclib line
-    during static→dynamic promotion."""
-    base = tmp_root / "detect_target_edge"
-    staged = base / "staged"
-    shell_dir = staged / "Sources" / "Shell"
-    shell_dir.mkdir(parents=True)
-    guts_dir = staged / "Sources" / "Guts"
-    guts_dir.mkdir(parents=True)
-    # Guts imports UIKit from source AND declares a CoreLocation linker
-    # setting. Both should land in the result because we walked the
-    # .target() edge to reach Guts.
-    (guts_dir / "Guts.m").write_text("#import <UIKit/UIKit.h>\n")
-
-    raw_dump = {
-        "products": [
-            {
-                "name": "Shell",
-                "type": {"library": ["automatic"]},
-                "targets": ["Shell"],
-            }
-        ],
-        "targets": [
-            {
-                "name": "Shell",
-                "type": "regular",
-                "path": "Sources/Shell",
-                "dependencies": [{"target": ["Guts", None]}],
-            },
-            {
-                "name": "Guts",
-                "type": "regular",
-                "path": "Sources/Guts",
-                "dependencies": [],
-                "settings": [
-                    {"tool": "linker", "kind": {"linkedFramework": "CoreLocation"}},
-                ],
-            },
-        ],
-    }
-    package = Package(
-        name="Shell",
-        tools_version="5.7.0",
-        platforms=[],
-        products=[Product(name="Shell", linkage=Linkage.AUTOMATIC, targets=["Shell"])],
-        targets=[
-            Target(name="Shell", kind=TargetKind.REGULAR,
-                   path="Sources/Shell", public_headers_path=None,
-                   dependencies=["Guts"], exclude=[],
-                   language=Language.OBJC),
-            Target(name="Guts", kind=TargetKind.REGULAR,
-                   path="Sources/Guts", public_headers_path=None,
-                   dependencies=[], exclude=[], language=Language.OBJC),
-        ],
-        schemes=[],
-        raw_dump=raw_dump,
-        staged_dir=staged,
-    )
-    fws = detect_system_frameworks(package, "Shell")
-    _assert("UIKit" in fws,
-            f"source-scan walked through .target() edge should surface UIKit: {fws}")
-    _assert("CoreLocation" in fws,
-            f"linker settings walked through .target() edge should surface "
-            f"CoreLocation: {fws}")
-
-
-def _selftest_archive_static_lib_path_picks_first(tmp_root: Path) -> None:
-    """_archive_static_lib_path returns the first lib*.a it finds, sorted."""
-    base = tmp_root / "static_pick"
-    products = base / "Products" / "usr" / "local" / "lib"
-    products.mkdir(parents=True)
-    (products / "libBeta.a").write_text("")
-    (products / "libAlpha.a").write_text("")
-    found = _archive_static_lib_path(base)
-    _assert(found is not None and found.name == "libAlpha.a",
-            f"expected libAlpha.a (sorted), got {found}")
 
 
 def _selftest_archive_framework_path_recursive(tmp_root: Path) -> None:
@@ -5399,6 +5446,46 @@ def _selftest_verify_missing_output_dir(tmp_root: Path) -> None:
         )
         return
     raise AssertionError("missing output_dir should raise VerifyUserError")
+
+
+def _selftest_cli_resolves_relative_output_dir() -> None:
+    """Smoke-regression: a relative `--output` must be resolved to an
+    absolute path at config construction. Two failure modes this guards
+    against, both surfaced by the first end-to-end `stripe-ios --target
+    StripeCore --product Stripe` smoke run:
+      - Without absolute resolution, dedup-overlap writes the same
+        relative string into the staged Package.swift, where SPM
+        resolves it against the staged manifest's directory (a tempdir,
+        not the user's CWD) → "binary target does not contain a binary
+        artifact".
+      - The subsequent edit-site fix (`os.path.relpath` against
+        `staged_dir`) depends on the source being absolute. A relative
+        source would yield an unstable rel-path that's relative to
+        whatever CWD `os.path.relpath` happens to see.
+    """
+    import argparse as _ap
+    parse_args = tool.parse_args
+    _config_from_args = tool._config_from_args
+
+    # The default — Path("./xcframeworks").
+    ns, _ = parse_args(["pkg-source"])
+    cfg = _config_from_args(ns)
+    _assert(cfg.output_dir.is_absolute(),
+            f"default output_dir must be absolute; got {cfg.output_dir!r}")
+
+    # User-supplied relative path.
+    ns2, _ = parse_args(["pkg-source", "-o", "./foo/bar"])
+    cfg2 = _config_from_args(ns2)
+    _assert(cfg2.output_dir.is_absolute(),
+            f"-o ./foo/bar must resolve to absolute; got {cfg2.output_dir!r}")
+    _assert(cfg2.output_dir.name == "bar",
+            f"resolved path must preserve the leaf; got {cfg2.output_dir!r}")
+
+    # Already-absolute path passes through unchanged-shape.
+    ns3, _ = parse_args(["pkg-source", "-o", "/tmp/some/place"])
+    cfg3 = _config_from_args(ns3)
+    _assert(cfg3.output_dir.is_absolute(),
+            f"absolute -o input must stay absolute; got {cfg3.output_dir!r}")
 
 
 def _selftest_verify_mixed_losing_objc_surface_fails(tmp_root: Path) -> None:
@@ -6097,14 +6184,24 @@ def _roundtrip_apply_and_dump(
 
 
 def _roundtrip_grdb() -> None:
-    """GRDB: force_dynamic on GRDB only. Verify GRDB ends up dynamic;
-    GRDBSQLite + GRDB-dynamic remain unchanged."""
-    edits = [PackageSwiftEdit(kind="force_dynamic", product_name="GRDB", targets=["GRDB"])]
+    """GRDB: synth_dynamic_library spawns a parallel `GRDBDynamic` product
+    via `swift package add-product`. The ORIGINAL GRDB product is left
+    automatic in the manifest (the rename pass relabels the bundle
+    after archive — never at the manifest level). The synthetic product
+    is dynamic. GRDB-dynamic + GRDBSQLite are untouched."""
+    edits = [PackageSwiftEdit(kind="synth_dynamic_library", product_name="GRDBDynamic", targets=["GRDB"])]
     staged, plan, dump = _roundtrip_apply_and_dump(GRDB_PACKAGE_SWIFT_FIXTURE, edits)
     try:
         prods = {p["name"]: p for p in dump["products"]}
-        _assert(prods["GRDB"]["type"]["library"][0] == "dynamic",
-                f"GRDB linkage: {prods['GRDB']['type']}")
+        _assert("GRDBDynamic" in prods,
+                f"synthetic GRDBDynamic missing: {sorted(prods.keys())}")
+        _assert(prods["GRDBDynamic"]["type"]["library"][0] == "dynamic",
+                f"GRDBDynamic linkage: {prods['GRDBDynamic']['type']}")
+        _assert(prods["GRDBDynamic"]["targets"] == ["GRDB"],
+                f"GRDBDynamic targets: {prods['GRDBDynamic']['targets']}")
+        _assert(prods["GRDB"]["type"]["library"][0] == "automatic",
+                f"original GRDB must stay automatic (rename is post-archive): "
+                f"{prods['GRDB']['type']}")
         _assert(prods["GRDB-dynamic"]["type"]["library"][0] == "dynamic",
                 f"GRDB-dynamic linkage: {prods['GRDB-dynamic']['type']}")
         _assert(prods["GRDBSQLite"]["type"]["library"][0] == "automatic",
@@ -6114,16 +6211,20 @@ def _roundtrip_grdb() -> None:
 
 
 def _roundtrip_alamofire() -> None:
-    """Alamofire: force_dynamic on Alamofire (the automatic one). Verify
-    BOTH products survive and AlamofireDynamic isn't double-patched."""
-    edits = [PackageSwiftEdit(kind="force_dynamic", product_name="Alamofire", targets=["Alamofire"])]
+    """Alamofire: synth_dynamic_library on Alamofire (allocator picks a
+    non-colliding name since 'AlamofireDynamic' already exists). The
+    synthetic product is dynamic; the original Alamofire stays automatic
+    in the manifest; AlamofireDynamic is unchanged."""
+    edits = [PackageSwiftEdit(kind="synth_dynamic_library", product_name="Alamofire__Dynamic", targets=["Alamofire"])]
     staged, plan, dump = _roundtrip_apply_and_dump(ALAMOFIRE_PACKAGE_SWIFT_FIXTURE, edits)
     try:
         prods = {p["name"]: p for p in dump["products"]}
-        _assert(set(prods.keys()) == {"Alamofire", "AlamofireDynamic"},
+        _assert(set(prods.keys()) == {"Alamofire", "AlamofireDynamic", "Alamofire__Dynamic"},
                 f"Alamofire products: {sorted(prods.keys())}")
-        _assert(prods["Alamofire"]["type"]["library"][0] == "dynamic",
-                f"Alamofire linkage: {prods['Alamofire']['type']}")
+        _assert(prods["Alamofire__Dynamic"]["type"]["library"][0] == "dynamic",
+                f"synthetic Alamofire__Dynamic linkage: {prods['Alamofire__Dynamic']['type']}")
+        _assert(prods["Alamofire"]["type"]["library"][0] == "automatic",
+                f"original Alamofire stays automatic: {prods['Alamofire']['type']}")
         _assert(prods["AlamofireDynamic"]["type"]["library"][0] == "dynamic",
                 f"AlamofireDynamic linkage: {prods['AlamofireDynamic']['type']}")
     finally:
@@ -6185,16 +6286,16 @@ def _roundtrip_alamofire_multi_manifest_layout() -> None:
 
         plan = Plan()
         plan.package_swift_edits = [
-            PackageSwiftEdit(kind="force_dynamic", product_name="Alamofire", targets=["Alamofire"]),
+            PackageSwiftEdit(kind="synth_dynamic_library",
+                             product_name="Alamofire__Dynamic",
+                             targets=["Alamofire"]),
         ]
         apply_package_swift_edits(tmp, plan)
 
-        # The base file should have been edited; the version-specific
-        # siblings should still carry their DO_NOT_EDIT markers verbatim.
-        base_text = (tmp / "Package.swift").read_text()
-        _assert("type: .dynamic" in base_text,
-                "expected force_dynamic edit in base Package.swift, "
-                "got:\n" + base_text)
+        # Version-specific siblings must still carry their DO_NOT_EDIT
+        # markers verbatim — `swift package add-product` resolves the
+        # active manifest itself, so siblings can't be accidentally
+        # touched.
         sibling_5_10_after = (tmp / "Package@swift-5.10.swift").read_text()
         sibling_5_9_after = (tmp / "Package@swift-5.9.swift").read_text()
         _assert(sibling_5_10_after == sibling_5_10_before,
@@ -6204,9 +6305,9 @@ def _roundtrip_alamofire_multi_manifest_layout() -> None:
                 "Package@swift-5.9.swift should be byte-identical, got:\n"
                 + sibling_5_9_after)
 
-        # Round-trip through SPM and verify the dump now reports
-        # Alamofire as dynamic. This is what the validator would do — it's
-        # the test that would have caught the original bug.
+        # Round-trip through SPM and verify the dump now contains the
+        # synthetic dynamic product. This is what the validator would
+        # do — it's the test that would have caught the original bug.
         cp = subprocess.run(
             ["swift", "package", "dump-package"],
             cwd=str(tmp),
@@ -6220,34 +6321,45 @@ def _roundtrip_alamofire_multi_manifest_layout() -> None:
             )
         dump = json.loads(cp.stdout)
         prods = {p["name"]: p for p in dump["products"]}
-        _assert(prods["Alamofire"]["type"]["library"][0] == "dynamic",
-                f"post-edit Alamofire linkage = "
-                f"{prods['Alamofire']['type']}; the edit didn't take effect")
+        _assert("Alamofire__Dynamic" in prods,
+                f"synthetic Alamofire__Dynamic product missing: {sorted(prods.keys())}")
+        _assert(prods["Alamofire__Dynamic"]["type"]["library"][0] == "dynamic",
+                f"post-edit Alamofire__Dynamic linkage = "
+                f"{prods['Alamofire__Dynamic']['type']}; the edit didn't take effect")
+        _assert(prods["Alamofire"]["type"]["library"][0] == "automatic",
+                "original Alamofire must stay automatic (rename is post-archive)")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _roundtrip_stripe_force_dynamic_and_synthetic() -> None:
-    """Stripe: force_dynamic on Stripe + add_synthetic_library StripeCore.
-    Verify both edits land and the existing 4 products survive."""
+    """Stripe: synth_dynamic_library on Stripe (parallel dynamic
+    product, allocator-named) + synth_library StripeCore (synthesize a
+    fresh dynamic library directly from a target). Verify both
+    `swift package add-product` invocations land and the existing 4
+    products survive."""
     edits = [
-        PackageSwiftEdit(kind="force_dynamic", product_name="Stripe", targets=["Stripe"]),
-        PackageSwiftEdit(kind="add_synthetic_library", product_name="StripeCore", targets=["StripeCore"]),
+        PackageSwiftEdit(kind="synth_dynamic_library", product_name="StripeDynamic", targets=["Stripe"]),
+        PackageSwiftEdit(kind="synth_library", product_name="StripeCore", targets=["StripeCore"]),
     ]
     staged, plan, dump = _roundtrip_apply_and_dump(STRIPE_PACKAGE_SWIFT_FIXTURE, edits)
     try:
         prods = {p["name"]: p for p in dump["products"]}
-        # All 4 original + 1 synthetic
-        expected = {"Stripe", "StripePayments", "StripeFinancialConnections", "StripeConnect", "StripeCore"}
+        expected = {"Stripe", "StripePayments", "StripeFinancialConnections",
+                    "StripeConnect", "StripeDynamic", "StripeCore"}
         _assert(set(prods.keys()) == expected,
                 f"Stripe products: {sorted(prods.keys())}; expected {sorted(expected)}")
-        _assert(prods["Stripe"]["type"]["library"][0] == "dynamic",
-                f"Stripe linkage: {prods['Stripe']['type']}")
+        _assert(prods["StripeDynamic"]["type"]["library"][0] == "dynamic",
+                f"StripeDynamic linkage: {prods['StripeDynamic']['type']}")
+        _assert(prods["StripeDynamic"]["targets"] == ["Stripe"],
+                f"StripeDynamic targets: {prods['StripeDynamic']['targets']}")
         _assert(prods["StripeCore"]["type"]["library"][0] == "dynamic",
                 f"StripeCore linkage: {prods['StripeCore']['type']}")
         _assert(prods["StripeCore"]["targets"] == ["StripeCore"],
                 f"StripeCore targets: {prods['StripeCore']['targets']}")
-        # Untouched products should still be automatic
+        _assert(prods["Stripe"]["type"]["library"][0] == "automatic",
+                f"original Stripe must stay automatic (rename is post-archive): "
+                f"{prods['Stripe']['type']}")
         _assert(prods["StripePayments"]["type"]["library"][0] == "automatic",
                 f"StripePayments linkage: {prods['StripePayments']['type']}")
     finally:
@@ -6256,15 +6368,16 @@ def _roundtrip_stripe_force_dynamic_and_synthetic() -> None:
 
 def _roundtrip_system_library_left_alone() -> None:
     """A package with a system library + a regular target: the planner
-    skips the system one, so Prepare only force_dynamics the regular
-    one. Validator must accept this without complaint."""
-    edits = [PackageSwiftEdit(kind="force_dynamic", product_name="Wrapper", targets=["Wrapper"])]
+    skips the system one, so Prepare only adds a synth product for the
+    regular one. Validator must accept this without complaint."""
+    edits = [PackageSwiftEdit(kind="synth_dynamic_library", product_name="WrapperDynamic", targets=["Wrapper"])]
     staged, plan, dump = _roundtrip_apply_and_dump(SYSTEM_LIB_PACKAGE_SWIFT_FIXTURE, edits)
     try:
         prods = {p["name"]: p for p in dump["products"]}
-        _assert(prods["Wrapper"]["type"]["library"][0] == "dynamic",
-                f"Wrapper linkage: {prods['Wrapper']['type']}")
-        # Sqlite3 left alone — still automatic.
+        _assert(prods["WrapperDynamic"]["type"]["library"][0] == "dynamic",
+                f"WrapperDynamic linkage: {prods['WrapperDynamic']['type']}")
+        _assert(prods["Wrapper"]["type"]["library"][0] == "automatic",
+                f"original Wrapper stays automatic: {prods['Wrapper']['type']}")
         _assert(prods["Sqlite3"]["type"]["library"][0] == "automatic",
                 f"Sqlite3 linkage: {prods['Sqlite3']['type']}")
     finally:
@@ -6272,39 +6385,37 @@ def _roundtrip_system_library_left_alone() -> None:
 
 
 def _roundtrip_validator_catches_missing_product() -> None:
-    """The mandatory round-trip validator must raise PrepareUserError when
-    the planner asks Prepare to force_dynamic a product that doesn't
-    exist in the manifest — this is the canonical `--product NoSuchProduct`
-    shape and must land on the clean-error path, not a traceback."""
+    """The mandatory round-trip validator must raise a clean error when
+    the planner asks Prepare to operate on a target that doesn't exist
+    in the manifest. `swift package add-product --targets <UnknownTarget>`
+    fails at the SPM layer; Prepare must surface that as a clean
+    PrepareError/PrepareUserError, not a traceback."""
     tmp = Path(tempfile.mkdtemp(prefix="spm2xc-prep-bad-"))
     try:
         (tmp / "Package.swift").write_text(GRDB_PACKAGE_SWIFT_FIXTURE)
         plan = Plan()
         plan.package_swift_edits = [
-            PackageSwiftEdit(kind="force_dynamic", product_name="DoesNotExist",
+            PackageSwiftEdit(kind="synth_library", product_name="DoesNotExist",
                              targets=["DoesNotExist"]),
         ]
         try:
             prepare(tmp, plan, verbose=False)
-        except PrepareUserError as exc:
+        except (PrepareUserError, PrepareError) as exc:
             _assert("DoesNotExist" in str(exc),
-                    f"PrepareUserError should mention DoesNotExist: {exc}")
-            _assert(
-                isinstance(exc, _USER_FACING_ERRORS),
-                "PrepareUserError must be user-facing",
-            )
+                    f"error should mention DoesNotExist: {exc}")
             return
-        raise AssertionError("expected PrepareUserError for non-existent product")
+        raise AssertionError("expected PrepareError for non-existent target")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _roundtrip_foo_force_dynamic() -> None:
-    """Minimal Foo fixture: force_dynamic on the lone .library product
-    must produce a Package.swift that survives `swift package dump-package`
-    and ends up dynamic in the dumped JSON. This is the smallest possible
-    end-to-end gate for edit_force_dynamic against a real swift toolchain."""
-    edits = [PackageSwiftEdit(kind="force_dynamic", product_name="Foo", targets=["Foo"])]
+    """Minimal Foo fixture: synth_dynamic_library on the lone .library
+    product must produce a Package.swift that survives `swift package
+    dump-package` with a fresh dynamic FooDynamic alongside the
+    original. Smallest possible end-to-end gate for B's
+    `swift package add-product` invocation against a real toolchain."""
+    edits = [PackageSwiftEdit(kind="synth_dynamic_library", product_name="FooDynamic", targets=["Foo"])]
     tmp = Path(tempfile.mkdtemp(prefix="spm2xc-prep-foo-"))
     try:
         (tmp / "Package.swift").write_text(_FOO_PACKAGE_SWIFT_FIXTURE)
@@ -6329,29 +6440,33 @@ def _roundtrip_foo_force_dynamic() -> None:
             )
         dump = json.loads(cp.stdout)
         prods = {p["name"]: p for p in dump["products"]}
-        _assert("Foo" in prods, f"Foo product missing from dump: {sorted(prods.keys())}")
-        _assert(prods["Foo"]["type"]["library"][0] == "dynamic",
-                f"Foo linkage: {prods['Foo']['type']}")
+        _assert("FooDynamic" in prods, f"FooDynamic missing from dump: {sorted(prods.keys())}")
+        _assert(prods["FooDynamic"]["type"]["library"][0] == "dynamic",
+                f"FooDynamic linkage: {prods['FooDynamic']['type']}")
+        _assert(prods["Foo"]["type"]["library"][0] == "automatic",
+                "original Foo must stay automatic in manifest")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _roundtrip_full_prepare_grdb() -> None:
     """End-to-end Prepare on a GRDB-shaped Plan: confirms validator
-    accepts the planner's exact edit list (force_dynamic on GRDB only,
-    leaving GRDB-dynamic and GRDBSQLite alone). This is the gate that
-    catches edit/planner drift across sessions."""
+    accepts the planner's exact edit list — synth_dynamic_library
+    spawns GRDBDynamic, leaving GRDB-dynamic and GRDBSQLite alone.
+    This is the gate that catches edit/planner drift across sessions."""
     tmp = Path(tempfile.mkdtemp(prefix="spm2xc-prep-grdb-"))
     try:
         (tmp / "Package.swift").write_text(GRDB_PACKAGE_SWIFT_FIXTURE)
         plan = Plan()
         plan.package_swift_edits = [
-            PackageSwiftEdit(kind="force_dynamic", product_name="GRDB", targets=["GRDB"]),
+            PackageSwiftEdit(kind="synth_dynamic_library",
+                             product_name="GRDBDynamic",
+                             targets=["GRDB"]),
         ]
         plan.build_units = [
             BuildUnit(
                 name="GRDB",
-                scheme="GRDB",
+                scheme="GRDBDynamic",
                 framework_name="GRDB",
                 language=Language.SWIFT,
                 archive_strategy="archive",
@@ -6368,13 +6483,14 @@ def _roundtrip_full_prepare_grdb() -> None:
         ]
         prepared = prepare(tmp, plan, verbose=False)
         prods = {p.name: p for p in prepared.package.products}
-        _assert(prods["GRDB"].linkage == Linkage.DYNAMIC,
-                f"GRDB linkage: {prods['GRDB'].linkage}")
+        _assert("GRDBDynamic" in prods,
+                f"synthetic GRDBDynamic missing from dumped products: {sorted(prods.keys())}")
+        _assert(prods["GRDBDynamic"].linkage == Linkage.DYNAMIC,
+                f"GRDBDynamic linkage: {prods['GRDBDynamic'].linkage}")
+        _assert(prods["GRDB"].linkage == Linkage.AUTOMATIC,
+                f"original GRDB must stay automatic in manifest: {prods['GRDB'].linkage}")
         _assert(prods["GRDB-dynamic"].linkage == Linkage.DYNAMIC,
                 f"GRDB-dynamic linkage: {prods['GRDB-dynamic'].linkage}")
-        # GRDBSQLite was not in build_units (planner skipped it), so the
-        # validator's "every build_unit's product is present" check
-        # doesn't fire on it. The product itself is still in the dump.
         _assert("GRDBSQLite" in prods, "GRDBSQLite missing from dumped products")
         _assert(prods["GRDBSQLite"].linkage == Linkage.AUTOMATIC,
                 f"GRDBSQLite should be untouched, got {prods['GRDBSQLite'].linkage}")
@@ -7655,6 +7771,217 @@ def _selftest_pick_primary_framework_in_slice_honors_library_path(
     )
 
 
+def _build_stub_dylib(dst: Path, install_name: str) -> None:
+    """Compile a tiny Mach-O dylib at `dst` with `-install_name
+    <install_name>` so the framework rename test has a real binary
+    `install_name_tool` and `codesign --verify` can operate on. Uses
+    `clang` because it's available on every macOS box with Xcode CLI
+    tools (which spm-to-xcframework already requires).
+    """
+    src = dst.parent / f"_stub_{dst.name}.c"
+    src.write_text("int spm_to_xcframework_stub(void) { return 0; }\n")
+    cp = subprocess.run(
+        [
+            "clang", "-dynamiclib",
+            "-arch", "arm64",
+            "-Wl,-install_name," + install_name,
+            "-o", str(dst), str(src),
+        ],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    src.unlink(missing_ok=True)
+    if cp.returncode != 0:
+        raise AssertionError(
+            f"failed to compile stub dylib for rename test:\n  {cp.stderr.strip()}"
+        )
+
+
+def _write_minimal_info_plist(
+    plist_path: Path, *, executable: str, bundle_id: Optional[str] = None
+) -> None:
+    """Write a minimal binary-format Info.plist mirroring what
+    xcodebuild produces for a `dynamic-library` SPM scheme.
+    """
+    import plistlib
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "CFBundleExecutable": executable,
+        "CFBundleName": executable,
+        "CFBundleIdentifier": bundle_id if bundle_id is not None else f"org.swift.{executable}",
+        "CFBundleInfoDictionaryVersion": "6.0",
+        "CFBundlePackageType": "FMWK",
+        "CFBundleShortVersionString": "1.0",
+        "CFBundleVersion": "1",
+    }
+    with plist_path.open("wb") as fh:
+        plistlib.dump(data, fh, fmt=plistlib.FMT_BINARY)
+
+
+def _selftest_rename_framework_bundle_flat(tmp_root: Path) -> None:
+    """[Grok final-review Medium #1] End-to-end rename of a flat-style
+    framework (iOS/tvOS/watchOS/visionOS layout): bundle dir,
+    executable, install_name, Info.plist keys and re-codesign must
+    all line up after `rename_framework_bundle`.
+    """
+    import plistlib
+    base = tmp_root / "rename_flat"
+    fw = base / "FooDynamic.framework"
+    fw.mkdir(parents=True)
+    _build_stub_dylib(
+        fw / "FooDynamic",
+        install_name="@rpath/FooDynamic.framework/FooDynamic",
+    )
+    _write_minimal_info_plist(fw / "Info.plist", executable="FooDynamic")
+
+    new_fw = rename_framework_bundle(fw, new_name="Foo", verbose=False)
+
+    _assert(new_fw == base / "Foo.framework",
+            f"unexpected new path: {new_fw}")
+    _assert(new_fw.is_dir(), "renamed framework dir missing")
+    _assert(not fw.exists(), "old framework dir should be gone")
+    _assert((new_fw / "Foo").is_file(), "renamed inner executable missing")
+
+    with (new_fw / "Info.plist").open("rb") as fh:
+        plist = plistlib.load(fh)
+    _assert(plist["CFBundleExecutable"] == "Foo",
+            f"CFBundleExecutable={plist['CFBundleExecutable']!r}")
+    _assert(plist["CFBundleName"] == "Foo",
+            f"CFBundleName={plist['CFBundleName']!r}")
+    _assert(plist["CFBundleIdentifier"] == "org.swift.Foo",
+            f"CFBundleIdentifier should have been rewritten via substring "
+            f"replace: {plist['CFBundleIdentifier']!r}")
+
+    # install_name and codesign verify
+    otool = subprocess.run(
+        ["otool", "-D", str(new_fw / "Foo")],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    _assert(otool.returncode == 0,
+            f"otool -D failed: {otool.stderr!r}")
+    _assert("@rpath/Foo.framework/Foo" in otool.stdout,
+            f"install_name not rewritten; otool said:\n{otool.stdout}")
+
+    verify = subprocess.run(
+        ["codesign", "--verify", "--strict", str(new_fw)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    _assert(verify.returncode == 0,
+            f"codesign --verify failed:\n{verify.stderr}")
+
+
+def _selftest_rename_framework_bundle_versioned(tmp_root: Path) -> None:
+    """[Grok final-review Medium #1] End-to-end rename of a macOS-style
+    versioned framework: the inner executable lives under
+    `Versions/A/`, the Info.plist under `Versions/A/Resources/`, and
+    the framework root carries symlinks (`<exec>`, `Resources`,
+    `Versions/Current`). The rename must swap the executable-name
+    symlink, leave `Versions/Current` and `Resources` alone, and the
+    re-codesign at the end must verify cleanly.
+    """
+    import plistlib
+    base = tmp_root / "rename_versioned"
+    fw = base / "FooDynamic.framework"
+    versions_a = fw / "Versions" / "A"
+    versions_a.mkdir(parents=True)
+    _build_stub_dylib(
+        versions_a / "FooDynamic",
+        install_name="@rpath/FooDynamic.framework/FooDynamic",
+    )
+    _write_minimal_info_plist(
+        versions_a / "Resources" / "Info.plist",
+        executable="FooDynamic",
+    )
+    # Standard versioned-bundle symlinks.
+    (fw / "Versions" / "Current").symlink_to("A")
+    (fw / "FooDynamic").symlink_to(Path("Versions") / "Current" / "FooDynamic")
+    (fw / "Resources").symlink_to(Path("Versions") / "Current" / "Resources")
+
+    new_fw = rename_framework_bundle(fw, new_name="Foo", verbose=False)
+
+    _assert(new_fw == base / "Foo.framework",
+            f"unexpected new path: {new_fw}")
+    _assert((new_fw / "Versions" / "A" / "Foo").is_file(),
+            "renamed inner executable missing under Versions/A/")
+    _assert(not (new_fw / "Versions" / "A" / "FooDynamic").exists(),
+            "old inner-executable name should be gone under Versions/A/")
+    # Root-level symlink for the executable must point at the NEW name.
+    root_exec_link = new_fw / "Foo"
+    _assert(root_exec_link.is_symlink(),
+            "root <Foo> symlink missing after rename")
+    _assert(str(root_exec_link.readlink()) == "Versions/Current/Foo",
+            f"root <Foo> symlink target wrong: {root_exec_link.readlink()}")
+    _assert(not (new_fw / "FooDynamic").exists(),
+            "root old-name symlink should be gone")
+    # Content-shaped symlinks are unchanged.
+    _assert((new_fw / "Versions" / "Current").is_symlink(),
+            "Versions/Current symlink missing")
+    _assert(str((new_fw / "Versions" / "Current").readlink()) == "A",
+            "Versions/Current target should still be 'A'")
+    _assert((new_fw / "Resources").is_symlink(),
+            "root Resources symlink missing")
+
+    with (new_fw / "Versions" / "A" / "Resources" / "Info.plist").open("rb") as fh:
+        plist = plistlib.load(fh)
+    _assert(plist["CFBundleExecutable"] == "Foo",
+            f"CFBundleExecutable={plist['CFBundleExecutable']!r}")
+    _assert(plist["CFBundleIdentifier"] == "org.swift.Foo",
+            f"CFBundleIdentifier={plist['CFBundleIdentifier']!r}")
+
+    verify = subprocess.run(
+        ["codesign", "--verify", "--strict", str(new_fw)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    _assert(verify.returncode == 0,
+            f"codesign --verify failed:\n{verify.stderr}")
+
+
+def _selftest_rename_framework_bundle_preserves_custom_bundle_id(
+    tmp_root: Path,
+) -> None:
+    """[Grok final-review Low #1 + Codex r2 Low] When the source
+    framework's `CFBundleIdentifier` does NOT have SPM's default
+    `org.swift.<scheme>` shape, the renamer must leave it alone —
+    replacing it with the new-name-derived form would silently lose
+    user state. This covers two flavours that BOTH must be
+    preserved:
+
+      (a) An obviously-custom identifier that never mentions the old
+          scheme name: `com.acme.proprietary.module`.
+      (b) A custom identifier that happens to contain the old scheme
+          name as a substring: `com.acme.FooDynamic.module`. The
+          original substring-only check would have clobbered this
+          one; the tightened `startswith("org.swift.")` guard now
+          preserves it.
+    """
+    import plistlib
+
+    for label, bid in (
+        ("acme-proprietary", "com.acme.proprietary.module"),
+        ("acme-contains-scheme", "com.acme.FooDynamic.module"),
+    ):
+        base = tmp_root / f"rename_custom_bid_{label}"
+        fw = base / "FooDynamic.framework"
+        fw.mkdir(parents=True)
+        _build_stub_dylib(
+            fw / "FooDynamic",
+            install_name="@rpath/FooDynamic.framework/FooDynamic",
+        )
+        _write_minimal_info_plist(
+            fw / "Info.plist",
+            executable="FooDynamic",
+            bundle_id=bid,
+        )
+
+        new_fw = rename_framework_bundle(fw, new_name="Foo", verbose=False)
+        with (new_fw / "Info.plist").open("rb") as fh:
+            plist = plistlib.load(fh)
+        _assert(
+            plist["CFBundleIdentifier"] == bid,
+            f"[{label}] custom CFBundleIdentifier was clobbered: "
+            f"expected {bid!r}, got {plist['CFBundleIdentifier']!r}",
+        )
+
+
 def _selftest_detect_framework_type_nested_library_path(
     tmp_root: Path,
 ) -> None:
@@ -7775,9 +8102,10 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          lambda: _selftest_validate_package_source(tmp_root), False),
         ("fetch: _validate_git_ref tag-shape guard",
          _selftest_validate_git_ref, False),
-        ("language counter (synthetic tree)", lambda: _selftest_language_counter(tmp_root), False),
+        ("language scan via swift package describe (real swift)",
+         lambda: _selftest_language_counter(tmp_root), True),
         ("scheme resolver", _selftest_scheme_resolver, False),
-        ("planner: GRDB (force_dynamic + skip system + leave dynamic alone)",
+        ("planner: GRDB (synth_dynamic_library + skip system + leave dynamic alone)",
          _selftest_planner_grdb, False),
         ("planner: Alamofire (regular + already-dynamic over same target)",
          _selftest_planner_alamofire, False),
@@ -7814,22 +8142,6 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
         ("balanced paren walker basic", _selftest_balanced_close_basic, False),
         ("balanced paren walker strings", _selftest_balanced_close_strings, False),
         ("balanced paren walker comments", _selftest_balanced_close_comments, False),
-        ("edit_force_dynamic GRDB three-library hazard",
-         _selftest_edit_force_dynamic_grdb_targets_correct_library, False),
-        ("edit_force_dynamic already-dynamic no-op",
-         _selftest_edit_force_dynamic_already_dynamic_is_noop, False),
-        ("edit_force_dynamic replaces existing type",
-         _selftest_edit_force_dynamic_replaces_existing_type, False),
-        ("edit_force_dynamic multiline arguments (Stripe)",
-         _selftest_edit_force_dynamic_multiline_arguments, False),
-        ("edit_force_dynamic missing product raises",
-         _selftest_edit_force_dynamic_missing_product_raises, False),
-        ("edit_add_synthetic_library no trailing comma (Stripe)",
-         _selftest_edit_add_synthetic_library_no_trailing_comma, False),
-        ("edit_add_synthetic_library with trailing comma (GRDB)",
-         _selftest_edit_add_synthetic_library_with_trailing_comma, False),
-        ("edit_add_synthetic_library empty products array",
-         _selftest_edit_add_synthetic_library_empty_array, False),
         ("dedup-overlap: compute_internal_target_deps Stripe transitive closure",
          _selftest_compute_internal_target_deps_stripe, False),
         ("dedup-overlap: compute_internal_target_deps filters external products",
@@ -7872,6 +8184,18 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          _selftest_make_code_token_view_blanks_strings_and_comments, False),
         ("dedup-overlap [Codex P2 r4]: _apply_dedup_overlap_substitutions guards triple-quoted/raw/interpolation",
          lambda: _selftest_apply_dedup_overlap_substitutions_guards_unsupported_constructs(tmp_root), False),
+        ("dedup-overlap [Codex r3]: edit_demote_synthetic_product strips type: .dynamic (SPM multiline shape)",
+         _selftest_edit_demote_synthetic_product_spm_multiline, False),
+        ("dedup-overlap [Codex r3]: edit_demote_synthetic_product handles single-line library",
+         _selftest_edit_demote_synthetic_product_single_line, False),
+        ("dedup-overlap [Codex r3]: edit_demote_synthetic_product is idempotent on automatic shape",
+         _selftest_edit_demote_synthetic_product_idempotent, False),
+        ("dedup-overlap [Codex r3]: edit_demote_synthetic_product raises on unknown product",
+         _selftest_edit_demote_synthetic_product_unknown_raises, False),
+        ("dedup-overlap [Codex r3]: edit_demote_synthetic_product targets library, not target, on name collision",
+         _selftest_edit_demote_synthetic_product_ignores_target_name, False),
+        ("dedup-overlap [Codex r3]: demote round-trips through swift package dump-package",
+         lambda: _selftest_edit_demote_synthetic_product_dumppackage_roundtrip(tmp_root), True),
         ("dedup-overlap [Codex P2 r5]: _compute_dedup_substitutions substitutes single-target siblings",
          _selftest_compute_dedup_substitutions_single_target_sibling, False),
         ("dedup-overlap [Codex P2 r5]: _compute_dedup_substitutions skips MULTI-target siblings",
@@ -7882,6 +8206,10 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          _selftest_compute_dedup_substitutions_unbuilt_sibling_skipped, False),
         ("dedup-overlap [Codex P2 r5]: _compute_dedup_substitutions mixes single-target sub + multi-target skip",
          _selftest_compute_dedup_substitutions_mixes_single_and_multi, False),
+        ("dedup-overlap [Codex final-review]: synth_dynamic_library targets are skipped (binary-product invariant)",
+         _selftest_compute_dedup_substitutions_synth_dynamic_target_skipped, False),
+        ("dedup-overlap [Codex final-review]: _synth_dynamic_protected_targets helper excludes synth_library",
+         _selftest_synth_dynamic_protected_targets_helper, False),
         ("dedup-overlap [Codex P2]: external .product collision must not become an internal edge",
          _selftest_compute_internal_target_deps_external_product_collision, False),
         ("dedup-overlap [Codex P2]: mixed internal byName + external product with same name",
@@ -7941,10 +8269,6 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          lambda: _selftest_inject_resource_bundles_idempotent(tmp_root), False),
         ("execute: _find_resource_bundles dedupes ArchiveIntermediates vs Build/Products",
          lambda: _selftest_find_resource_bundles_dedupe_and_filter(tmp_root), False),
-        ("execute: detect_system_frameworks linker settings",
-         lambda: _selftest_detect_system_frameworks_linker_settings(tmp_root), False),
-        ("execute: detect_system_frameworks source imports + Tests/ pruning",
-         lambda: _selftest_detect_system_frameworks_source_imports(tmp_root), False),
         ("execute: ObjC headers dir priority (fw_name > product_name > any)",
          lambda: _selftest_find_objc_headers_dir_priority(tmp_root), False),
         ("execute: ObjC headers dir follows .target() dep edge (P1)",
@@ -7963,10 +8287,6 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          lambda: _selftest_find_objc_headers_dir_dep_walk_no_implicit_leak(tmp_root), False),
         ("execute: ObjC headers dir dep walk folds internal default include/",
          lambda: _selftest_find_objc_headers_dir_dep_walk_internal_default_include(tmp_root), False),
-        ("execute: detect_system_frameworks follows .target() dep edge (P1)",
-         lambda: _selftest_detect_system_frameworks_follows_target_edge(tmp_root), False),
-        ("execute: archive static lib path picks first sorted",
-         lambda: _selftest_archive_static_lib_path_picks_first(tmp_root), False),
         ("execute: archive framework path recursive search",
          lambda: _selftest_archive_framework_path_recursive(tmp_root), False),
         ("execute: promote_modulemap_to_framework_form (GRDBSQLite shape)",
@@ -8039,6 +8359,12 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          lambda: _selftest_read_xcframework_library_paths_robust_to_corruption(tmp_root), False),
         ("execute: pick_primary_framework_in_slice honors LibraryPath (P1)",
          lambda: _selftest_pick_primary_framework_in_slice_honors_library_path(tmp_root), False),
+        ("execute: rename_framework_bundle flat layout end-to-end (Grok M1)",
+         lambda: _selftest_rename_framework_bundle_flat(tmp_root), False),
+        ("execute: rename_framework_bundle versioned layout end-to-end (Grok M1)",
+         lambda: _selftest_rename_framework_bundle_versioned(tmp_root), False),
+        ("execute: rename_framework_bundle preserves custom CFBundleIdentifier (Grok L1)",
+         lambda: _selftest_rename_framework_bundle_preserves_custom_bundle_id(tmp_root), False),
         ("execute: detect_framework_type honors nested LibraryPath (P1)",
          lambda: _selftest_detect_framework_type_nested_library_path(tmp_root), False),
         ("verify: nested LibraryPath unit enforces language surface (P1)",
@@ -8079,6 +8405,8 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          lambda: _selftest_verify_malformed_available_libraries(tmp_root), False),
         ("verify: missing output_dir raises VerifyError",
          lambda: _selftest_verify_missing_output_dir(tmp_root), False),
+        ("cli: relative --output is resolved to absolute (dedup-overlap path fix)",
+         _selftest_cli_resolves_relative_output_dir, False),
         ("verify: Mixed-expected unit without ObjC surface must fail (P1)",
          lambda: _selftest_verify_mixed_losing_objc_surface_fails(tmp_root), False),
         ("verify: Mixed-expected unit without Swift surface must fail",
@@ -8110,19 +8438,19 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
         ("manifest: --no-cleanup-stale preserves AND keeps tracking",
          lambda: _selftest_manifest_no_cleanup_stale_preserves_and_tracks(tmp_root), False),
         ("MiniMixed fetch+stage+inspect (real swift)", _selftest_minimixed_fetch_integration, True),
-        ("round-trip: GRDB (force_dynamic + skip system)", _roundtrip_grdb, True),
-        ("round-trip: Alamofire (force_dynamic regular, leave dynamic)",
+        ("round-trip: GRDB (synth_dynamic_library + skip system)", _roundtrip_grdb, True),
+        ("round-trip: Alamofire (synth_dynamic_library with collision-aware naming)",
          _roundtrip_alamofire, True),
         ("round-trip: Alamofire multi-manifest layout (Package.swift wins over @swift-5.10)",
          _roundtrip_alamofire_multi_manifest_layout, True),
-        ("round-trip: Stripe (force_dynamic + add_synthetic_library)",
+        ("round-trip: Stripe (synth_dynamic_library + synth_library)",
          _roundtrip_stripe_force_dynamic_and_synthetic, True),
         ("round-trip: system library left alone",
          _roundtrip_system_library_left_alone, True),
-        ("round-trip: validator catches missing product (PrepareError)",
+        ("round-trip: validator surfaces unknown-target as clean PrepareError",
          _roundtrip_validator_catches_missing_product, True),
         ("round-trip: full prepare() flow on GRDB", _roundtrip_full_prepare_grdb, True),
-        ("round-trip: Foo minimal fixture force_dynamic", _roundtrip_foo_force_dynamic, True),
+        ("round-trip: Foo minimal fixture synth_dynamic_library", _roundtrip_foo_force_dynamic, True),
     ]
 
 

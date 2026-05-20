@@ -1,0 +1,74 @@
+"""Parsed CLI options as a `Config` dataclass.
+
+The single source of truth for user intent. `cli.parse_args()` produces
+an argparse `Namespace`, `cli._config_from_args()` turns it into one of
+these, and every downstream phase reads only what it needs from the
+instance.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import List, Optional
+
+
+@dataclass
+class Config:
+    """Parsed CLI arguments. The single source of truth for user intent.
+
+    Two version fields, by design (bug 1 in SPM_TO_XCFRAMEWORK_NOTES.md):
+      - user_version: exactly what the user typed. Fed to SPM `exact:`.
+      - resolved_version: tag rewritten via normalize_version_tag if the
+        user said "1.2.3" but the repo only has "v1.2.3". Used for git
+        operations.
+    """
+
+    package_source: str
+    user_version: str = ""
+    resolved_version: str = ""
+    output_dir: Path = field(default_factory=lambda: Path("./xcframeworks"))
+    product_filters: List[str] = field(default_factory=list)
+    target_filters: List[str] = field(default_factory=list)
+    revision: Optional[str] = None
+    # Per-platform deployment targets. `None` means "don't build this platform".
+    # iOS defaults to "15.0" for backward compatibility; pass --no-ios to opt out.
+    # Each non-iOS platform is opt-in via its --min-* flag.
+    min_ios: Optional[str] = "15.0"
+    min_macos: Optional[str] = None
+    min_maccatalyst: Optional[str] = None
+    min_tvos: Optional[str] = None
+    min_watchos: Optional[str] = None
+    min_visionos: Optional[str] = None
+    include_deps: bool = False
+    binary_mode: bool = False
+    verbose: bool = False
+    dry_run: bool = False
+    keep_work: bool = False
+    inspect_only: bool = False
+    # When False (default), Finalize cleans up stale xcframeworks from
+    # prior runs recorded in `.spm-to-xcframework-manifest.json`. When
+    # True, cleanup is skipped for this run AND the surviving old
+    # entries are merged into the new manifest so they remain tracked
+    # — a subsequent normal run will clean them. See REFACTOR_PLAN.md
+    # Task 3 for the "delay cleanup by one run" semantics.
+    no_cleanup_stale: bool = False
+    # When False (default), Execute walks build units in topological order
+    # and rewrites each already-built sibling target to a `.binaryTarget`
+    # in Package.swift before the next unit's archive runs. This stops
+    # umbrella products like Stripe from statically embedding all their
+    # transitive sibling targets' Mach-O — the umbrella links dynamically
+    # against the sibling xcframeworks instead. Pass --no-dedup-overlap
+    # to opt out (e.g. to reproduce legacy single-shot behavior for
+    # debugging). See REWRITE_DESIGN.md §5.4 dedup-overlap.
+    no_dedup_overlap: bool = False
+    work_dir: Optional[Path] = None  # set in main() before fetch/inspect run
+
+    @property
+    def is_remote(self) -> bool:
+        s = self.package_source
+        return (
+            s.startswith("http://")
+            or s.startswith("https://")
+            or s.startswith("git@")
+            or s.startswith("ssh://")
+        )
