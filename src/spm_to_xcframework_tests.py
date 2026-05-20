@@ -52,8 +52,10 @@ from spm_to_xcframework import (  # noqa: F401
     _framework_content_root,
     _finalize_with_verify,
     _format_size_iec,
+    _is_binary_only_product,
     _is_toxic_entry,
     _modules_declared_in_modulemap,
+    _package_is_binary_only,
     _parse_dependencies,
     _parse_dump,
     _parse_linkage,
@@ -749,6 +751,251 @@ def _selftest_planner_stripe_rejects_binary_target() -> None:
         )
         return
     raise AssertionError("plan_source_build should have raised PlanError for a binary target")
+
+
+# --- Binary-only product detection + planner suppression ------------------
+#
+# Kidoz SDK (issue #39) ships a Package.swift whose only product is backed
+# by a single binaryTarget. Source mode used to die at SPM resolve with
+# "invalid type for binary product" because the unconditional force_dynamic
+# patch is invalid for binary-only products. The fix has two pieces, both
+# tested here: (a) `_is_binary_only_product` / `_package_is_binary_only`
+# classifiers, and (b) `plan_source_build` skipping force_dynamic AND
+# the build unit for binary-only products inside a mixed package.
+
+
+# Pure-binary Package.swift shape (one product, one binaryTarget,
+# nothing else). Mirrors the Kidoz/iCarousel-as-binary shape.
+KIDOZ_LIKE_DUMP_SNAPSHOT: dict = {
+    "name": "kidoz-sdk-swift-package",
+    "toolsVersion": {"_version": "5.7.0"},
+    "platforms": [{"options": [], "platformName": "ios", "version": "13.0"}],
+    "products": [
+        {"name": "KidozSDK", "type": {"library": ["automatic"]}, "targets": ["KidozSDK"]},
+    ],
+    "targets": [
+        {"name": "KidozSDK", "type": "binary", "path": None,
+         "publicHeadersPath": None, "dependencies": []},
+    ],
+}
+
+# Mixed: one binary product + one source product. The source product
+# should plan normally (force_dynamic + BuildUnit); the binary one
+# should be skipped with a clear reason.
+MIXED_BINARY_AND_SOURCE_SNAPSHOT: dict = {
+    "name": "MixedKit",
+    "toolsVersion": {"_version": "5.7.0"},
+    "platforms": [{"options": [], "platformName": "ios", "version": "15.0"}],
+    "products": [
+        {"name": "MixedKitBin", "type": {"library": ["automatic"]},
+         "targets": ["MixedKitBin"]},
+        {"name": "MixedKitSrc", "type": {"library": ["automatic"]},
+         "targets": ["MixedKitSrc"]},
+    ],
+    "targets": [
+        {"name": "MixedKitBin", "type": "binary", "path": None,
+         "publicHeadersPath": None, "dependencies": []},
+        {"name": "MixedKitSrc", "type": "regular",
+         "path": "Sources/MixedKitSrc",
+         "publicHeadersPath": None, "dependencies": []},
+    ],
+}
+
+
+def _selftest_is_binary_only_product_classifier() -> None:
+    """`_is_binary_only_product` returns True iff every backing target is
+    TargetKind.BINARY. Empty target lists and missing targets are False
+    (paranoid: malformed → not-binary so xcodebuild surfaces the real
+    problem). Mixed-kind products are False.
+    """
+    pkg_pure = _mk_package_from_snapshot(KIDOZ_LIKE_DUMP_SNAPSHOT)
+    kidoz = pkg_pure.products[0]
+    _assert(
+        _is_binary_only_product(kidoz, pkg_pure),
+        "pure binary product should be classified as binary-only",
+    )
+
+    pkg_mixed = _mk_package_from_snapshot(MIXED_BINARY_AND_SOURCE_SNAPSHOT)
+    by_name = {p.name: p for p in pkg_mixed.products}
+    _assert(
+        _is_binary_only_product(by_name["MixedKitBin"], pkg_mixed),
+        "binary leg of a mixed package is still binary-only",
+    )
+    _assert(
+        not _is_binary_only_product(by_name["MixedKitSrc"], pkg_mixed),
+        "regular-target product must NOT be classified as binary-only",
+    )
+
+    # Empty target list → False (paranoid).
+    empty_product = Product(name="Empty", linkage=Linkage.AUTOMATIC, targets=[])
+    _assert(
+        not _is_binary_only_product(empty_product, pkg_pure),
+        "empty target list must not classify as binary-only",
+    )
+
+    # Target name with no matching Target object → False.
+    dangling = Product(name="Dangling", linkage=Linkage.AUTOMATIC,
+                       targets=["NoSuchTarget"])
+    _assert(
+        not _is_binary_only_product(dangling, pkg_pure),
+        "undefined target name must not classify as binary-only",
+    )
+
+
+def _selftest_package_is_binary_only() -> None:
+    """Package-level classifier: True iff every (non-system) product is
+    binary-only. System-only products are skipped from the check so a
+    package with one binary library + one system-shim library still
+    counts as binary-only. Zero-product packages return False (no
+    binaries to copy in --binary mode either).
+    """
+    pkg_pure = _mk_package_from_snapshot(KIDOZ_LIKE_DUMP_SNAPSHOT)
+    _assert(
+        _package_is_binary_only(pkg_pure),
+        "pure-binary package must be classified as binary-only",
+    )
+
+    pkg_mixed = _mk_package_from_snapshot(MIXED_BINARY_AND_SOURCE_SNAPSHOT)
+    _assert(
+        not _package_is_binary_only(pkg_mixed),
+        "mixed package (one source + one binary) must NOT be binary-only "
+        "at the package level — source mode still has work to do",
+    )
+
+    # GRDB ships a system-target wrapper alongside source targets — the
+    # presence of the system product must NOT short-circuit the check,
+    # but it must also not block the binary-only verdict when paired
+    # with binary products.
+    pkg_grdb = _mk_package_from_snapshot(GRDB_DUMP_SNAPSHOT)
+    _assert(
+        not _package_is_binary_only(pkg_grdb),
+        "GRDB (has source targets) must NOT be binary-only",
+    )
+
+    # Zero products → False.
+    empty_pkg = Package(
+        name="empty", tools_version="5.7", platforms=[], products=[],
+        targets=[], schemes=[], raw_dump={}, staged_dir=Path("/tmp/x"),
+    )
+    _assert(
+        not _package_is_binary_only(empty_pkg),
+        "package with zero products is not binary-only "
+        "(--binary mode would also find nothing to copy)",
+    )
+
+    # System-only + binary-only co-existing → still binary-only at the
+    # package level. Construct a synthetic snapshot to exercise this.
+    sys_plus_binary_snapshot = {
+        "name": "SysPlusBinary",
+        "toolsVersion": {"_version": "5.7.0"},
+        "platforms": [{"options": [], "platformName": "ios", "version": "15.0"}],
+        "products": [
+            {"name": "SysShim", "type": {"library": ["automatic"]},
+             "targets": ["SysShim"]},
+            {"name": "TheBinary", "type": {"library": ["automatic"]},
+             "targets": ["TheBinary"]},
+        ],
+        "targets": [
+            {"name": "SysShim", "type": "system", "path": "Sources/SysShim",
+             "publicHeadersPath": None, "dependencies": []},
+            {"name": "TheBinary", "type": "binary", "path": None,
+             "publicHeadersPath": None, "dependencies": []},
+        ],
+    }
+    pkg_mixed_sys = _mk_package_from_snapshot(sys_plus_binary_snapshot)
+    _assert(
+        _package_is_binary_only(pkg_mixed_sys),
+        "system + binary products: should still be binary-only because "
+        "system-only products are dropped from the package check (the "
+        "planner drops them too)",
+    )
+
+
+def _selftest_planner_skips_binary_only_product_in_mixed_package() -> None:
+    """Mixed package (one binary product + one source product) processed
+    in source mode: binary product is recorded in plan.skipped (NOT in
+    plan.build_units) with a clear reason that points users at --binary.
+    The source product still receives force_dynamic + a BuildUnit.
+
+    This is the "force_dynamic patch on a binary product breaks SPM"
+    fix from issue #39, plus the follow-up that source mode also can't
+    archive a binaryTarget-backed product so the BuildUnit goes too.
+    """
+    pkg = _mk_package_from_snapshot(
+        MIXED_BINARY_AND_SOURCE_SNAPSHOT,
+        schemes=["MixedKitSrc", "MixedKitBin"],
+    )
+    config = Config(
+        package_source="./mixedkit",
+        user_version="",
+    )
+    plan = plan_source_build(config, pkg)
+
+    # Source product plans normally.
+    bu_names = [bu.name for bu in plan.build_units]
+    _assert(
+        bu_names == ["MixedKitSrc"],
+        f"expected only the source product in build_units, got {bu_names}",
+    )
+
+    edits = {(e.kind, e.product_name) for e in plan.package_swift_edits}
+    _assert(
+        ("force_dynamic", "MixedKitSrc") in edits,
+        f"source product should still get force_dynamic; edits={edits}",
+    )
+    _assert(
+        ("force_dynamic", "MixedKitBin") not in edits,
+        f"binary product MUST NOT get force_dynamic (SPM would reject); "
+        f"edits={edits}",
+    )
+
+    skipped_by_name = {n: reason for n, reason in plan.skipped}
+    _assert(
+        "MixedKitBin" in skipped_by_name,
+        f"binary product must be recorded in plan.skipped; "
+        f"got {plan.skipped}",
+    )
+    _assert(
+        "binary" in skipped_by_name["MixedKitBin"].lower(),
+        f"skip reason should mention 'binary'; "
+        f"got {skipped_by_name['MixedKitBin']!r}",
+    )
+
+
+def _selftest_planner_pure_binary_package_reaches_planner_raises() -> None:
+    """End-to-end shape: if a pure-binary package somehow reaches
+    `plan_source_build` (bypassing the `_run_source_mode` auto-switch
+    — e.g. through a future refactor that drops the switch, or a test
+    invoking the planner directly), every product is recorded as
+    skipped and the planner refuses to ship a zero-build-unit plan,
+    raising PlanError. This is the belt-and-braces guard: a bad Plan
+    can never reach Prepare even if the auto-switch is removed, and
+    the error message points at the cause.
+
+    Note: in the real CLI path this case is unreachable because the
+    auto-switch hands off to `_run_binary_mode` *before* the planner
+    runs. The test pins the contract for direct planner callers.
+    """
+    pkg = _mk_package_from_snapshot(KIDOZ_LIKE_DUMP_SNAPSHOT, schemes=[])
+    config = Config(
+        package_source="https://github.com/Kidoz-SDK/kidoz-sdk-swift-package.git",
+        user_version="10.1.5",
+    )
+    try:
+        plan_source_build(config, pkg)
+    except PlanError as exc:
+        msg = str(exc)
+        _assert(
+            "zero build units" in msg or "non-library" in msg,
+            f"PlanError should mention the empty-plan reason; got: {exc}",
+        )
+        return
+    raise AssertionError(
+        "plan_source_build on a pure-binary package should have raised "
+        "PlanError (the auto-switch is supposed to catch this earlier; if "
+        "we reach the planner directly, refusing to ship an empty plan is "
+        "the right outcome)."
+    )
 
 
 def _selftest_planner_rejects_executable_target() -> None:
@@ -4664,6 +4911,178 @@ def _selftest_verify_happy_path_swift(tmp_root: Path) -> None:
     _assert(not r.warnings, f"unexpected warnings: {r.warnings!r}")
 
 
+# --- Binary-mode static→dynamic promotion ---------------------------------
+#
+# Issue #39 / Kidoz path: vendor xcframeworks that ship static archives
+# masquerading as framework binaries used to fail the Verify check with
+# "static archive masquerading as a framework?" even though the .xcframework
+# was on disk and structurally fine. `promote_binary_xcframework_static_to_dynamic`
+# rewrites those slice binaries in place. The clang invocation itself is hard
+# to unit-test (would require mocking subprocess + xcrun), so we cover the
+# parts that exercise pure logic: the helper classifiers, the early-exit
+# no-op path when every slice is already dynamic, and the malformed-plist
+# fail-soft branch.
+
+
+def _selftest_promote_binary_no_op_when_all_slices_dynamic(tmp_root: Path) -> None:
+    """If every slice's binary already reports dynamically-linked, the
+    promote function returns an empty list without touching the tree.
+    No subprocess calls (clang / lipo) are needed for this path — it's
+    pure traversal + the `_check_binary_dynamic` short-circuit.
+    """
+    from spm_to_xcframework import promote_binary_xcframework_static_to_dynamic
+    base = tmp_root / "promote_no_op"
+    base.mkdir()
+    xc = _build_synthetic_xcframework(
+        base, "AlreadyDyn", flavor="swift",
+        slices=("ios-arm64", "ios-arm64_x86_64-simulator"),
+    )
+    # Capture the binary bytes per slice so we can assert no mutation.
+    snapshots = {}
+    for slice_id in ("ios-arm64", "ios-arm64_x86_64-simulator"):
+        b = xc / slice_id / "AlreadyDyn.framework" / "AlreadyDyn"
+        snapshots[slice_id] = b.read_bytes()
+
+    mod = tool
+    saved = mod._check_binary_dynamic
+    try:
+        mod._check_binary_dynamic = lambda _b: True  # "everything is dynamic"
+        promoted = promote_binary_xcframework_static_to_dynamic(xc)
+    finally:
+        mod._check_binary_dynamic = saved
+
+    _assert(promoted == [],
+            f"already-dynamic xcframework must produce empty promotion list, "
+            f"got {promoted!r}")
+    for slice_id, before in snapshots.items():
+        after = (xc / slice_id / "AlreadyDyn.framework" / "AlreadyDyn").read_bytes()
+        _assert(before == after,
+                f"slice {slice_id} binary was modified despite being dynamic")
+
+
+def _selftest_promote_binary_missing_info_plist_returns_empty(tmp_root: Path) -> None:
+    """A directory that looks like an xcframework but lacks Info.plist
+    is silently skipped (returns []) — the verifier surfaces the real
+    issue separately. This is the fail-soft contract documented on the
+    function.
+    """
+    from spm_to_xcframework import promote_binary_xcframework_static_to_dynamic
+    base = tmp_root / "promote_no_plist"
+    base.mkdir()
+    xc = _build_synthetic_xcframework(base, "Hollow", flavor="swift",
+                                      omit_info_plist=True)
+    promoted = promote_binary_xcframework_static_to_dynamic(xc)
+    _assert(promoted == [],
+            f"missing Info.plist should yield empty promotion list, "
+            f"got {promoted!r}")
+
+
+def _selftest_promote_binary_corrupt_info_plist_returns_empty(tmp_root: Path) -> None:
+    """A corrupt Info.plist (the AppleDouble ghost case) returns [] rather
+    than raising. The verifier will mark the unit as fatal-per-unit
+    elsewhere; promotion shouldn't crash on its way through.
+    """
+    from spm_to_xcframework import promote_binary_xcframework_static_to_dynamic
+    base = tmp_root / "promote_corrupt_plist"
+    base.mkdir()
+    xc = _build_synthetic_xcframework(base, "Ghost", flavor="swift",
+                                      corrupt_info_plist=True)
+    promoted = promote_binary_xcframework_static_to_dynamic(xc)
+    _assert(promoted == [],
+            f"corrupt Info.plist should yield empty promotion list, "
+            f"got {promoted!r}")
+
+
+def _selftest_platform_slice_for_library_identifier() -> None:
+    """The xcframework `LibraryIdentifier` → `PlatformSlice` mapping
+    drives SDK + clang min-version flag selection for promotion. Cover
+    the common Apple shapes (device/simulator/maccatalyst across the
+    platforms we ship).
+    """
+    from spm_to_xcframework import _platform_slice_for_library_identifier
+    # iOS device + simulator
+    s = _platform_slice_for_library_identifier("ios-arm64")
+    _assert(s is not None and s.sdk_name == "iphoneos",
+            f"ios-arm64 → iphoneos, got {s}")
+    s = _platform_slice_for_library_identifier("ios-arm64_x86_64-simulator")
+    _assert(s is not None and s.sdk_name == "iphonesimulator",
+            f"ios sim → iphonesimulator, got {s}")
+    # macOS device + maccatalyst
+    s = _platform_slice_for_library_identifier("macos-arm64_x86_64")
+    _assert(s is not None and s.sdk_name == "macosx",
+            f"macos → macosx, got {s}")
+    s = _platform_slice_for_library_identifier("ios-arm64_x86_64-maccatalyst")
+    _assert(s is not None and s.platform == "maccatalyst",
+            f"maccatalyst id → maccatalyst slice, got {s}")
+    # tvOS + watchOS + visionOS basic shapes
+    s = _platform_slice_for_library_identifier("tvos-arm64")
+    _assert(s is not None and s.sdk_name == "appletvos",
+            f"tvos device → appletvos, got {s}")
+    s = _platform_slice_for_library_identifier("watchos-arm64")
+    _assert(s is not None and s.sdk_name == "watchos",
+            f"watchos device → watchos sdk, got {s}")
+    s = _platform_slice_for_library_identifier("xros-arm64")
+    _assert(s is not None and s.platform == "visionos",
+            f"xros → visionos platform, got {s}")
+    # Unrecognised → None (callers treat as "cannot promote")
+    s = _platform_slice_for_library_identifier("freebsd-amd64")
+    _assert(s is None,
+            f"unrecognised platform should return None, got {s}")
+
+
+def _selftest_slice_minimum_deployment_target() -> None:
+    """The minimum-deployment-target reader prefers the slice plist's
+    explicit value (under either of the two key spellings Apple uses)
+    and falls back to a sane per-platform default when absent. The
+    `-undefined dynamic_lookup` safety net means the exact value is
+    not load-bearing for correctness, but the test pins the fallback
+    table so a future drift gets caught.
+    """
+    from spm_to_xcframework import _slice_minimum_deployment_target
+
+    # Explicit value via `MinimumOSVersion`.
+    _assert(
+        _slice_minimum_deployment_target(
+            {"MinimumOSVersion": "16.4"}, "ios") == "16.4",
+        "MinimumOSVersion should win",
+    )
+    # Explicit value via the alternate key spelling.
+    _assert(
+        _slice_minimum_deployment_target(
+            {"MinimumDeploymentTarget": "12.0"}, "macos") == "12.0",
+        "MinimumDeploymentTarget should win when MinimumOSVersion absent",
+    )
+    # MinimumOSVersion takes precedence over MinimumDeploymentTarget.
+    _assert(
+        _slice_minimum_deployment_target(
+            {"MinimumOSVersion": "17.0",
+             "MinimumDeploymentTarget": "12.0"}, "ios") == "17.0",
+        "MinimumOSVersion should win when both keys are present",
+    )
+    # Fallback table per platform.
+    _assert(_slice_minimum_deployment_target({}, "ios") == "13.0",
+            "ios fallback")
+    _assert(_slice_minimum_deployment_target({}, "macos") == "11.0",
+            "macos fallback")
+    _assert(_slice_minimum_deployment_target({}, "maccatalyst") == "13.0",
+            "maccatalyst fallback")
+    _assert(_slice_minimum_deployment_target({}, "tvos") == "13.0",
+            "tvos fallback")
+    _assert(_slice_minimum_deployment_target({}, "watchos") == "6.0",
+            "watchos fallback")
+    _assert(_slice_minimum_deployment_target({}, "visionos") == "1.0",
+            "visionos fallback")
+    # Unknown platform → generic 13.0 fallback (defensive).
+    _assert(_slice_minimum_deployment_target({}, "freebsd") == "13.0",
+            "unknown platform falls back to 13.0")
+    # Whitespace-only / empty string ignored, falls through to default.
+    _assert(
+        _slice_minimum_deployment_target(
+            {"MinimumOSVersion": "   "}, "ios") == "13.0",
+        "whitespace-only MinimumOSVersion should be treated as absent",
+    )
+
+
 def _selftest_verify_happy_path_objc(tmp_root: Path) -> None:
     """ObjC tree with public header + modulemap passes strict verify."""
     base = tmp_root / "verify_happy_objc"
@@ -7366,6 +7785,14 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          _selftest_planner_stripe_synthetic_libraries, False),
         ("planner: Stripe3DS2 binary target rejection",
          _selftest_planner_stripe_rejects_binary_target, False),
+        ("planner: _is_binary_only_product classifier (issue #39)",
+         _selftest_is_binary_only_product_classifier, False),
+        ("planner: _package_is_binary_only classifier (issue #39)",
+         _selftest_package_is_binary_only, False),
+        ("planner: mixed package — skip binary product, plan source (issue #39)",
+         _selftest_planner_skips_binary_only_product_in_mixed_package, False),
+        ("planner: pure-binary package reaching planner raises PlanError (issue #39)",
+         _selftest_planner_pure_binary_package_reaches_planner_raises, False),
         ("planner: executable target rejection (P2)",
          _selftest_planner_rejects_executable_target, False),
         ("planner: duplicate --target filters are deduped (P2)",
@@ -7622,6 +8049,16 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          lambda: _selftest_verify_happy_path_swift(tmp_root), False),
         ("verify: happy path ObjC xcframework",
          lambda: _selftest_verify_happy_path_objc(tmp_root), False),
+        ("promote: no-op when all slices already dynamic (issue #39)",
+         lambda: _selftest_promote_binary_no_op_when_all_slices_dynamic(tmp_root), False),
+        ("promote: missing Info.plist fails soft (issue #39)",
+         lambda: _selftest_promote_binary_missing_info_plist_returns_empty(tmp_root), False),
+        ("promote: corrupt Info.plist fails soft (issue #39)",
+         lambda: _selftest_promote_binary_corrupt_info_plist_returns_empty(tmp_root), False),
+        ("promote: _platform_slice_for_library_identifier (issue #39)",
+         _selftest_platform_slice_for_library_identifier, False),
+        ("promote: _slice_minimum_deployment_target (issue #39)",
+         _selftest_slice_minimum_deployment_target, False),
         ("verify: corrupt Info.plist (__MACOSX ghost)",
          lambda: _selftest_verify_corrupt_info_plist(tmp_root), False),
         ("verify: missing xcframework directory",

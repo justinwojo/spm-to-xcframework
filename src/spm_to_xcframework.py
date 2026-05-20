@@ -1587,6 +1587,53 @@ def _is_system_only_product(product: Product, package: Package) -> bool:
     return True
 
 
+def _is_binary_only_product(product: Product, package: Package) -> bool:
+    """True iff every backing target of `product` is TargetKind.BINARY.
+
+    Such a product is backed entirely by `binaryTarget(...)` entries —
+    SPM does not allow an explicit `type: .dynamic` on it ("invalid type
+    for binary product; products referencing only binary targets must be
+    executable or automatic library products"). The source-mode planner
+    uses this to suppress the `force_dynamic` patch for those products,
+    and `_package_is_binary_only` uses it to recognise packages that
+    should be handled by `--binary` mode instead of source mode.
+    Empty target list returns False — same convention as
+    `_is_system_only_product` (treat malformed products as not-binary
+    and let xcodebuild surface the real problem).
+    """
+    if not product.targets:
+        return False
+    for tname in product.targets:
+        t = package.target_by_name(tname)
+        if t is None or t.kind != TargetKind.BINARY:
+            return False
+    return True
+
+
+def _package_is_binary_only(package: Package) -> bool:
+    """True iff every (non-system) product in `package` is backed only by
+    binaryTarget targets.
+
+    Source-mode planning for such a package would fail at SPM resolve
+    time because the unconditional `force_dynamic` patch produces
+    `.library(..., type: .dynamic, targets: [<binary>])`, which SPM
+    rejects. The caller switches transparently to `--binary` mode when
+    this returns True. System-only products are skipped from the check
+    (the planner drops them anyway), so a package with one binary
+    library + one system-shim library still counts as binary-only.
+    Packages with zero products return False — there's nothing for
+    binary mode to discover either.
+    """
+    binary_products = 0
+    for product in package.products:
+        if _is_system_only_product(product, package):
+            continue
+        if not _is_binary_only_product(product, package):
+            return False
+        binary_products += 1
+    return binary_products > 0
+
+
 def compute_internal_target_deps(package: Package) -> Dict[str, Set[str]]:
     """For every target in `package`, return the set of TRANSITIVELY
     reachable internal target names — i.e. names that are also defined
@@ -1796,6 +1843,27 @@ def plan_source_build(config: Config, package: Package) -> Plan:
             plan.skipped.append((product.name, "system-library product"))
             continue
 
+        # Binary-only products in a *mixed* package are skipped entirely
+        # from source-mode planning. The pure-binary whole-package case is
+        # already auto-routed to --binary mode by `_run_source_mode` (we
+        # never enter this loop for that input). What's left is the rarer
+        # mixed shape — e.g. one .library backed by `binaryTarget` plus
+        # other .libraries backed by Swift/ObjC source — where:
+        #   - Emitting `force_dynamic` would trigger SPM's "invalid type
+        #     for binary product" error and abort the whole package.
+        #   - Emitting an `archive` BuildUnit would push xcodebuild at a
+        #     scheme that produces no source artefact; it can't build
+        #     a binaryTarget-backed product as a fresh framework, only
+        #     consume the prebuilt artefact as a dependency.
+        # Source mode therefore can't service the binary product. We drop
+        # it with a clear reason; users who want it should switch to
+        # --binary or consume the upstream xcframework directly.
+        if _is_binary_only_product(product, package):
+            plan.skipped.append(
+                (product.name, "binary-only product (use --binary mode)")
+            )
+            continue
+
         # force_dynamic edit — only if the product isn't already dynamic.
         # This is the Alamofire/GRDB-dynamic invariant from the Session 2
         # brief: planning both GRDB and GRDB-dynamic is correct; emitting
@@ -1875,6 +1943,16 @@ def plan_source_build(config: Config, package: Package) -> Plan:
                         f"--target {target_name!r}: existing product has "
                         "only system targets and cannot be built."
                     )
+                if _is_binary_only_product(existing, package):
+                    # Mirrors the first-pass skip above: an existing
+                    # binary-only product surfaced via --target cannot be
+                    # source-built. Record the skip and continue so the
+                    # rest of the --target pass still processes other
+                    # requested targets.
+                    plan.skipped.append(
+                        (existing.name, "binary-only product (use --binary mode)")
+                    )
+                    continue
                 if existing.linkage != Linkage.DYNAMIC:
                     plan.package_swift_edits.append(
                         PackageSwiftEdit(
@@ -6143,6 +6221,259 @@ def execute_source_plan(
     return results
 
 
+# ----- promote_binary_xcframework_static_to_dynamic ------------------------
+#
+# Binary-mode counterpart of `promote_static_to_framework`. The source-mode
+# helper (line ~4201) rebuilds a `.framework` bundle from scratch out of a
+# `.a` static archive produced by `xcodebuild archive`. Here we have a
+# different shape: a vendor-shipped xcframework whose slice binaries are
+# `current ar archive` files masquerading as the framework's executable
+# (e.g. KidozSDK 10.1.5). The bundle layout is already correct — only the
+# binary needs to be re-linked.
+
+
+def _slice_minimum_deployment_target(
+    available_entry: dict,
+    platform: str,
+) -> str:
+    """Pull the slice's `MinimumOSVersion`/`MinimumDeploymentTarget` out
+    of an xcframework `AvailableLibraries[]` entry. Falls back to a
+    permissive low version per platform when the plist doesn't carry one
+    — clang only uses it to set the load command, and the
+    `-undefined dynamic_lookup` safety net means the link itself does not
+    depend on the precise minimum.
+    """
+    for key in ("MinimumOSVersion", "MinimumDeploymentTarget"):
+        v = available_entry.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return {
+        "ios": "13.0",
+        "macos": "11.0",
+        "maccatalyst": "13.0",
+        "tvos": "13.0",
+        "watchos": "6.0",
+        "visionos": "1.0",
+    }.get(platform, "13.0")
+
+
+def _platform_slice_for_library_identifier(lid: str) -> Optional[PlatformSlice]:
+    """Map an xcframework `LibraryIdentifier` (e.g. `ios-arm64`,
+    `ios-arm64_x86_64-simulator`) onto the matching `PlatformSlice` so we
+    can pick the right SDK + clang min-version flag template. Returns
+    None for identifiers we don't recognise; the caller treats that as
+    "can't promote, surface the original verifier error".
+    """
+    platform = _platform_from_library_identifier(lid)
+    if platform is None:
+        return None
+    variant = _variant_from_library_identifier(lid)
+    for s in _PLATFORM_SLICES.get(platform, ()):
+        if _variant_for_platform_slice(s) == variant:
+            return s
+    return None
+
+
+def promote_binary_xcframework_static_to_dynamic(
+    xcframework_path: Path,
+    *,
+    verbose: bool = False,
+) -> List[str]:
+    """Re-link every static-archive slice binary in a vendor xcframework as
+    a dynamic Mach-O, in place. Returns the list of `LibraryIdentifier`s
+    that were promoted (empty list when every slice is already dynamic).
+
+    Why this exists: some upstream SDKs (Kidoz, others) ship xcframeworks
+    whose `<slice>/<X>.framework/<X>` files are `current ar archive`
+    static libraries rather than dynamically-linked Mach-O. Apple's
+    xcframework spec tolerates this layout, but downstream consumers
+    that need to `dlopen` the framework — notably .NET P/Invoke in the
+    swift-bindings pipeline — cannot load a static archive. We rewrite
+    each slice's binary into a real dynamic library using the same
+    `clang -dynamiclib + -Xlinker -all_load + -Xlinker -undefined
+    dynamic_lookup` recipe the source-mode `promote_static_to_framework`
+    uses, and drop the now-stale `_CodeSignature/` (Xcode resigns on
+    embed; the user can also `codesign --force` post-hoc).
+
+    System framework discovery is out of reach here — we don't have the
+    Package.swift target to scan, only an opaque set of object files.
+    The `-undefined dynamic_lookup` safety net handles that: any UIKit
+    / Foundation / SDK symbol the static archive references is resolved
+    at runtime by dyld instead of at link time. This matches what the
+    source-mode promote does after its `-framework X` enumeration.
+
+    Side effects (per slice that needs promotion):
+      - Replace `<slice>/<lib>/<X>` with a freshly-linked dynamic Mach-O.
+      - Delete `<slice>/<lib>/_CodeSignature/` (no longer matches bytes).
+      - macOS versioned bundles: same operation under `Versions/A/`.
+
+    Raises `ExecuteError` if any slice promotion fails. Mid-loop
+    failures leave already-promoted slices in their new state — Verify
+    will surface the remaining static one and the run reports a clean
+    failure.
+    """
+    info_plist = xcframework_path / "Info.plist"
+    if not info_plist.is_file():
+        return []
+    try:
+        with info_plist.open("rb") as fh:
+            data = plistlib.load(fh)
+    except (plistlib.InvalidFileException, OSError, ValueError):
+        return []
+    available = data.get("AvailableLibraries")
+    if not isinstance(available, list):
+        return []
+
+    promoted: List[str] = []
+    for entry in available:
+        if not isinstance(entry, dict):
+            continue
+        identifier = entry.get("LibraryIdentifier")
+        library_path = entry.get("LibraryPath")
+        binary_path_field = entry.get("BinaryPath")
+        if not isinstance(identifier, str) or not isinstance(library_path, str):
+            continue
+
+        # Reconstruct the binary path the same way the verifier does — so
+        # both agree on which file represents the slice executable.
+        if isinstance(binary_path_field, str) and binary_path_field:
+            binary_rel = binary_path_field
+        else:
+            lib_basename = os.path.basename(library_path.rstrip("/"))
+            if not lib_basename.endswith(".framework"):
+                # `.a`-as-library or other non-framework layout. Promotion
+                # only knows about framework-wrapped statics; leave it to
+                # the verifier to flag.
+                continue
+            stem = lib_basename[: -len(".framework")]
+            binary_rel = f"{library_path.rstrip('/')}/{stem}"
+
+        binary = xcframework_path / identifier / binary_rel
+        if not binary.is_file():
+            continue
+        if _check_binary_dynamic(binary):
+            continue
+
+        platform = _platform_from_library_identifier(identifier)
+        if platform is None:
+            raise ExecuteError(
+                f"static-archive slice {identifier!r} in "
+                f"{xcframework_path.name}: unrecognised platform suffix; "
+                "cannot map to an SDK to re-link as a dynamic library."
+            )
+        platform_slice = _platform_slice_for_library_identifier(identifier)
+        if platform_slice is None:
+            raise ExecuteError(
+                f"static-archive slice {identifier!r} in "
+                f"{xcframework_path.name}: no matching PlatformSlice for "
+                f"platform {platform!r}; cannot promote to dynamic."
+            )
+
+        archs = _lipo_archs(binary)
+        if not archs:
+            raise ExecuteError(
+                f"static-archive slice {identifier!r} in "
+                f"{xcframework_path.name}: lipo could not enumerate "
+                f"architectures of {binary}."
+            )
+
+        deployment_target = _slice_minimum_deployment_target(entry, platform)
+        min_ver_flag = platform_slice.clang_min_flag_template.format(
+            version=deployment_target
+        )
+        # `install_name` is derived from the binary basename (not from
+        # LibraryPath's framework stem) because that's the name we will
+        # actually write the dylib under. Apple framework bundle
+        # conventions require the executable name inside a `.framework`
+        # to match the bundle stem, so for any well-formed xcframework
+        # the two are equal — and if they diverge, the upstream artefact
+        # was already unloadable as a framework before promotion. This
+        # mirrors how Verify reconstructs `BinaryPath` from `LibraryPath`.
+        product = binary.name
+        framework_dir = binary.parent  # `<...>.framework` (or `Versions/A`)
+        tmp_out = binary.with_name(binary.name + ".dyn.tmp")
+
+        info(
+            f"  Promoting static archive → dynamic: "
+            f"{xcframework_path.name}/{identifier} "
+            f"({platform_slice.sdk_name}: {' '.join(archs)})"
+        )
+
+        cmd: List[str] = [
+            "xcrun", "--sdk", platform_slice.sdk_name, "clang", "-dynamiclib",
+        ]
+        for a in archs:
+            cmd.extend(["-arch", a])
+        cmd.extend([
+            min_ver_flag,
+            "-install_name", f"@rpath/{product}.framework/{product}",
+            "-Xlinker", "-all_load",
+            str(binary),
+            "-Xlinker", "-undefined", "-Xlinker", "dynamic_lookup",
+            "-o", str(tmp_out),
+        ])
+        verbose_log(verbose, f"  $ {' '.join(cmd)}")
+
+        cp = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        if cp.returncode != 0:
+            if tmp_out.exists():
+                try:
+                    tmp_out.unlink()
+                except OSError:
+                    pass
+            tail = "\n".join(
+                ((cp.stderr or cp.stdout or "").rstrip().splitlines())[-10:]
+            )
+            raise ExecuteError(
+                f"Failed to re-link static archive "
+                f"{binary.relative_to(xcframework_path)} as a dynamic "
+                f"library (sdk={platform_slice.sdk_name}, archs="
+                f"{' '.join(archs)}):\n" + (tail or "  (no output)")
+            )
+
+        try:
+            os.replace(str(tmp_out), str(binary))
+        except OSError as exc:
+            # Best-effort tmp cleanup so a failed replace doesn't leave
+            # `<X>.dyn.tmp` next to the live binary forever — a second
+            # run would skip promotion (the old static archive is still
+            # in place and `_check_binary_dynamic` returns False), but
+            # subsequent reruns shouldn't accumulate orphan tmpfiles.
+            if tmp_out.exists():
+                try:
+                    tmp_out.unlink()
+                except OSError:
+                    pass
+            raise ExecuteError(
+                f"Failed to replace static archive at {binary}: {exc}"
+            )
+
+        # The prior `_CodeSignature/` no longer matches the new binary.
+        # Drop it; Xcode re-signs on embed. Check both the framework root
+        # (iOS-style flat layout) AND `Versions/A/` (macOS versioned
+        # bundles) — `binary.parent` already points at whichever one
+        # holds the executable, so removing `_CodeSignature` there is
+        # correct for both layouts. Soft-fail with a warning here: at
+        # this point the binary is already promoted and usable; a stale
+        # signature is a downstream embed warning, not a build break.
+        codesig = framework_dir / "_CodeSignature"
+        if codesig.is_dir():
+            try:
+                shutil.rmtree(codesig)
+            except OSError as exc:
+                warn(
+                    f"Could not remove stale code signature at {codesig} "
+                    f"after promoting {identifier} (binary itself was "
+                    f"successfully re-linked): {exc}"
+                )
+
+        promoted.append(identifier)
+
+    return promoted
+
+
 def execute_binary_plan(
     plan: Plan,
     config: Config,
@@ -6153,9 +6484,12 @@ def execute_binary_plan(
     The artifact paths come from the planner (which got them from
     `discover_binary_artifacts` during Fetch — same code path Execute
     would otherwise reach for, so the two phases never disagree about
-    which xcframeworks exist). The only Execute-side responsibility is
-    the copy itself plus a paranoia guard against `__MACOSX` slipping
-    in.
+    which xcframeworks exist). The Execute-side responsibilities are
+    the copy itself, a paranoia guard against `__MACOSX` slipping in,
+    and a static→dynamic promotion pass for any slice whose framework
+    binary turns out to be a `current ar archive` rather than a
+    dynamically-linked Mach-O (some vendors ship xcframeworks in that
+    shape; downstream P/Invoke consumers cannot dlopen them).
     """
     config.output_dir.mkdir(parents=True, exist_ok=True)
     copy_units = [u for u in plan.build_units if u.archive_strategy == "copy-artifact"]
@@ -6183,6 +6517,26 @@ def execute_binary_plan(
             shutil.rmtree(dest)
         info(f"  Copying {src.name}...")
         shutil.copytree(src, dest, symlinks=True)
+        # Promote any static-archive slices to dynamic in place. No-op
+        # for the common case of vendor xcframeworks that already ship
+        # dynamic binaries — `_check_binary_dynamic` short-circuits the
+        # per-slice work. Failures raise ExecuteError so the user gets
+        # a clean phase error instead of a confusing Verify rejection
+        # downstream.
+        promoted = promote_binary_xcframework_static_to_dynamic(
+            dest, verbose=config.verbose
+        )
+        if promoted:
+            success(
+                f"  Promoted {len(promoted)} static slice(s) to dynamic: "
+                + ", ".join(promoted)
+            )
+        # `detect_framework_type` classifies by header / swiftinterface
+        # presence, not by binary linkage, so promotion never changes its
+        # answer. Call it after any on-disk mutation in this loop anyway
+        # so the printed label is always derived from the final layout —
+        # cheap, and survives any future mutation that *would* affect the
+        # classification.
         fw_type = detect_framework_type(dest)
         success(f"  {dest.name} ready [{fw_type}]")
         results.append(
@@ -7248,7 +7602,18 @@ def _finalize_with_verify(
 
 
 def _run_source_mode(config: Config) -> int:
-    """Source-mode pipeline: Fetch → Inspect → Plan → Prepare → Execute → Verify."""
+    """Source-mode pipeline: Fetch → Inspect → Plan → Prepare → Execute → Verify.
+
+    If Inspect reveals that every (non-system) product is backed solely by
+    binaryTarget targets, we transparently hand off to `_run_binary_mode`.
+    Source mode for such a package is fundamentally wrong: there's nothing
+    to compile, and the unconditional `force_dynamic` patch would be
+    rejected by SPM with "invalid type for binary product". The hand-off
+    fires only when `--binary` would also have worked (remote URL +
+    explicit `--version`); for the local-path case we surface a clear
+    PlanError pointing at the limitation rather than silently failing
+    deeper in.
+    """
     source_dir = fetch_source(config)
     staged_dir = stage_source(config, source_dir)
     package = inspect_package(config, staged_dir)
@@ -7256,6 +7621,38 @@ def _run_source_mode(config: Config) -> int:
     if config.inspect_only:
         print_package(package)
         return 0
+
+    # Auto-route binary-only packages to --binary mode. This kicks in
+    # AFTER Inspect (so the package is fully parsed) but BEFORE Plan
+    # (so we don't emit the broken force_dynamic patch). Honour
+    # --target as an explicit opt-out: the source-build escape hatch
+    # is incompatible with a mode switch, and the user passing --target
+    # is a strong "stay in source mode" signal.
+    if (
+        not config.target_filters
+        and not config.inspect_only
+        and _package_is_binary_only(package)
+    ):
+        if not config.is_remote:
+            raise PlanError(
+                "Detected a binary-only Package.swift (every product is "
+                "backed only by binaryTarget targets). Auto-switching to "
+                "--binary mode requires a remote package URL plus "
+                "--version <tag>; this run was given a local path. Either "
+                "point at the remote URL, or extract the xcframework from "
+                "the upstream artifact directly."
+            )
+        if not config.user_version:
+            raise PlanError(
+                "Detected a binary-only Package.swift. Auto-switching to "
+                "--binary mode requires --version <tag>."
+            )
+        info(
+            "Detected binary-only package (all products are binaryTarget); "
+            "switching to --binary mode."
+        )
+        config.binary_mode = True
+        return _run_binary_mode(config)
 
     plan = plan_source_build(config, package)
     for w in plan.warnings:
