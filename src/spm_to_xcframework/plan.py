@@ -638,12 +638,15 @@ def plan_source_build(config: Config, package: Package) -> Plan:
     # consumer's module search path, so `import Collections` fails to
     # type-check.
     #
-    # Skipped when the manifest wraps targets in a user-defined helper
-    # type (the textual dedup-overlap rewriter can't disambiguate
-    # `.target(name: T, ...)` between `Target.target` and
-    # `CustomTarget.target` — swift-collections is the canonical case).
-    if not _manifest_uses_custom_target_wrapper(package):
-        _auto_synth_sibling_units(plan, package, taken_product_names)
+    # Wrapper-style manifests (`CustomTarget`/`.toTarget()` —
+    # canonical: swift-collections) used to bail here because the
+    # textual dedup-overlap rewriter couldn't distinguish
+    # `Target.target(...)` from `CustomTarget.target(...)`. They now
+    # take an alternate Execute-time path (`edit_inject_or_extend_overlay_binary_targets`)
+    # that intervenes at the `Package(targets: <expr>)` boundary
+    # instead — sidestepping the wrapper entirely. So planning
+    # proceeds the same way for both shapes.
+    _auto_synth_sibling_units(plan, package, taken_product_names)
 
     if not plan.build_units:
         raise PlanError(
@@ -667,6 +670,18 @@ _CUSTOM_TARGET_WRAPPER_SIGNALS = (
 )
 
 
+def _manifest_uses_custom_target_wrapper_text(text: str) -> bool:
+    """True iff `text` (a `Package.swift` body) declares its targets
+    through a user-supplied helper type whose own `.target(...)` static
+    method shadows `Target.target`. Pure-string predicate so callers
+    can run the check against either an on-disk manifest (Plan) or the
+    in-memory text being edited (Execute's dedup-overlap router).
+
+    See `_manifest_uses_custom_target_wrapper` for the rationale.
+    """
+    return any(sig in text for sig in _CUSTOM_TARGET_WRAPPER_SIGNALS)
+
+
 def _manifest_uses_custom_target_wrapper(package: Package) -> bool:
     """True iff the package's Package.swift defines its targets through
     a user-supplied helper type whose own `.target(...)` static method
@@ -675,21 +690,17 @@ def _manifest_uses_custom_target_wrapper(package: Package) -> bool:
     The textual dedup-overlap rewriter (`edit_replace_with_binary_target`)
     can't distinguish between `Target.target(name: T, ...)` and
     `CustomTarget.target(name: T, ...)` at the call site, since both
-    appear as `.target(name: T, ...)` in source. When the manifest's
-    targets array contains custom-wrapper calls, the rewriter ends up
-    replacing the wrapper call with `.binaryTarget(...)` — which fails
-    because the wrapper type has no `binaryTarget` static method.
-
-    We refuse to auto-synth sibling build units for such packages: the
-    umbrella product reverts to statically embedding its siblings (the
-    pre-auto-discovery default), and the package stays correctly
-    classified as KNOWN_BROKEN by the integration matrix instead of
-    failing hard mid-Execute.
+    appear as `.target(name: T, ...)` in source. When this returns
+    True, Execute's dedup-overlap routes through
+    `edit_inject_or_extend_overlay_binary_targets` instead — an
+    overlay edit at the `Package(targets:)` boundary that's
+    well-typed regardless of wrapper presence.
 
     Detection scans the active manifest text for either of the two
     canonical signals listed in `_CUSTOM_TARGET_WRAPPER_SIGNALS`.
     Missing-file / unreadable-manifest cases conservatively return
-    False so well-formed packages don't lose the optimisation.
+    False so well-formed packages aren't forced onto the overlay
+    path.
     """
     if package.staged_dir is None:
         return False
@@ -704,8 +715,37 @@ def _manifest_uses_custom_target_wrapper(package: Package) -> bool:
             text = manifest_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        if any(sig in text for sig in _CUSTOM_TARGET_WRAPPER_SIGNALS):
+        if _manifest_uses_custom_target_wrapper_text(text):
             return True
+    return False
+
+
+def _target_declares_linker_settings(package: Package, target_name: str) -> bool:
+    """True iff `target_name`'s entry in the raw `dump-package` output
+    declares at least one `tool: "linker"` setting (`linkedFramework`,
+    `linkedLibrary`, or linker-tooled unsafe flags).
+
+    Heuristic for "this internal helper depends on its umbrella's link
+    context and won't build standalone as a `.library(type: .dynamic)`".
+    The canonical false-positive we're avoiding: WCDB's `bridge`,
+    `common`, and `objc-core` helpers, which `.linkedFramework`
+    CoreFoundation via WCDBSwift's settings and fail at link with
+    `Undefined symbol: _CFAllocatorGetDefault` when promoted to their
+    own dynamic library.
+
+    Returns False if the target isn't found in the raw dump (best-effort
+    — caller's behaviour matches "no linker settings" since promoting
+    a phantom target is itself a no-op).
+    """
+    for raw_t in package.raw_dump.get("targets", []) or []:
+        if not isinstance(raw_t, dict):
+            continue
+        if raw_t.get("name") != target_name:
+            continue
+        for setting in raw_t.get("settings") or []:
+            if isinstance(setting, dict) and setting.get("tool") == "linker":
+                return True
+        return False
     return False
 
 
@@ -723,14 +763,28 @@ def _auto_synth_sibling_units(
         `synth_dynamic_library` edit (planner re-exports it as a dynamic
         sibling product). The build unit's name is the original product
         name so consumers depend on it by the same identifier.
-      - T is internal-only (no matching product) → SKIP. Pure helper
-        targets often rely on the umbrella's `linkerSettings` /
-        framework dependencies (e.g. WCDB's `bridge`, `common`, and
-        `objc-core` targets link against CoreFoundation via the
-        umbrella WCDBSwift's settings). Standalone-built as a dynamic
-        `.library` they'd fail at the link step with `Undefined symbol:
+      - T is internal-only (no matching product) → auto-promote IFF
+        it looks safe to build standalone:
+          * `tgt.language == Language.SWIFT` — Swift's autolink
+            machinery handles Foundation/CoreFoundation without
+            explicit linker flags, so a pure-Swift helper builds
+            cleanly as `.library(type: .dynamic)`. The canonical
+            need here is swift-collections'
+            `InternalCollectionsUtilities` (the hidden helper whose
+            symbols other siblings' `.swiftinterface` reference).
+          * No `tool: "linker"` settings declared on the target —
+            even on Swift, a target that explicitly declares
+            `.linkedFramework` / `.linkedLibrary` probably depends
+            on umbrella-level link context.
+        Anything else (ObjC/Mixed/N/A language, or any explicit
+        linker settings) → SKIP, leaving the umbrella to statically
+        embed the target. Canonical SKIP case: WCDB's `bridge`,
+        `common`, and `objc-core` ObjC helpers — they call
+        CoreFoundation but the `.linkedFramework("CoreFoundation")`
+        lives on the WCDBSwift umbrella's `linkerSettings`. Promoting
+        them standalone would fail at link with `Undefined symbol:
         _CFAllocatorGetDefault` and friends. The `--target T` escape
-        hatch still works as the explicit opt-in for this case.
+        hatch is still the explicit opt-in.
 
     Skipped (won't produce a unit):
       - Non-regular targets (system / binary / executable / test /
@@ -776,8 +830,61 @@ def _auto_synth_sibling_units(
     for sibling in siblings_to_add:
         if sibling not in existing_product_names:
             # Internal helper target with no public product wrapper.
-            # Don't auto-promote — see docstring rationale (WCDB-style
-            # CoreFoundation link failure).
+            # Auto-promote only when it looks safe to build standalone.
+            # We need this for pure-Swift helpers (canonical:
+            # swift-collections' `InternalCollectionsUtilities`): they
+            # link cleanly as their own dynamic library and MUST ship
+            # as their own xcframework so a sibling's `.swiftinterface`
+            # can resolve its `import` line at consumer build time.
+            #
+            # Two guards keep WCDB-style ObjC helpers out:
+            #   (a) language: we only promote Swift-language helpers.
+            #       ObjC helpers (canonical: WCDB's `bridge` /
+            #       `common` / `objc-core`) almost always rely on
+            #       system frameworks (CoreFoundation, Foundation)
+            #       linked through the UMBRELLA target's
+            #       `.linkedFramework(...)` settings — those flags
+            #       don't propagate when SPM builds the sibling as
+            #       its own `.library(type: .dynamic)`, so the link
+            #       fails with `Undefined symbol: _CFAllocatorGetDefault`
+            #       and friends. Swift's autolink machinery covers
+            #       Foundation/CoreFoundation for pure-Swift helpers
+            #       so the same trap doesn't apply there.
+            #   (b) explicit linker settings: even on Swift, a helper
+            #       that declares its own `.linkedLibrary`/
+            #       `.linkedFramework` likely needs umbrella-level
+            #       link context the standalone build won't have.
+            #
+            # Users can still opt skipped helpers in explicitly via
+            # `--target T`.
+            tgt = package.target_by_name(sibling)
+            if tgt is None:
+                continue
+            if tgt.language != Language.SWIFT:
+                continue
+            if _target_declares_linker_settings(package, sibling):
+                continue
+            language = Language.SWIFT
+            taken_product_names.add(sibling)
+            plan.package_swift_edits.append(
+                PackageSwiftEdit(
+                    kind="synth_library",
+                    product_name=sibling,
+                    targets=[sibling],
+                )
+            )
+            plan.build_units.append(
+                BuildUnit(
+                    name=sibling,
+                    scheme=sibling,
+                    framework_name=sibling,
+                    language=language,
+                    archive_strategy="archive",
+                    source_targets=[sibling],
+                    synthetic=True,
+                )
+            )
+            existing_planned_names.add(sibling)
             continue
         existing = next(p for p in package.products if p.name == sibling)
         if _is_system_only_product(existing, package):

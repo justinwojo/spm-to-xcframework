@@ -2712,12 +2712,15 @@ def plan_source_build(config: Config, package: Package) -> Plan:
     # consumer's module search path, so `import Collections` fails to
     # type-check.
     #
-    # Skipped when the manifest wraps targets in a user-defined helper
-    # type (the textual dedup-overlap rewriter can't disambiguate
-    # `.target(name: T, ...)` between `Target.target` and
-    # `CustomTarget.target` — swift-collections is the canonical case).
-    if not _manifest_uses_custom_target_wrapper(package):
-        _auto_synth_sibling_units(plan, package, taken_product_names)
+    # Wrapper-style manifests (`CustomTarget`/`.toTarget()` —
+    # canonical: swift-collections) used to bail here because the
+    # textual dedup-overlap rewriter couldn't distinguish
+    # `Target.target(...)` from `CustomTarget.target(...)`. They now
+    # take an alternate Execute-time path (`edit_inject_or_extend_overlay_binary_targets`)
+    # that intervenes at the `Package(targets: <expr>)` boundary
+    # instead — sidestepping the wrapper entirely. So planning
+    # proceeds the same way for both shapes.
+    _auto_synth_sibling_units(plan, package, taken_product_names)
 
     if not plan.build_units:
         raise PlanError(
@@ -2741,6 +2744,18 @@ _CUSTOM_TARGET_WRAPPER_SIGNALS = (
 )
 
 
+def _manifest_uses_custom_target_wrapper_text(text: str) -> bool:
+    """True iff `text` (a `Package.swift` body) declares its targets
+    through a user-supplied helper type whose own `.target(...)` static
+    method shadows `Target.target`. Pure-string predicate so callers
+    can run the check against either an on-disk manifest (Plan) or the
+    in-memory text being edited (Execute's dedup-overlap router).
+
+    See `_manifest_uses_custom_target_wrapper` for the rationale.
+    """
+    return any(sig in text for sig in _CUSTOM_TARGET_WRAPPER_SIGNALS)
+
+
 def _manifest_uses_custom_target_wrapper(package: Package) -> bool:
     """True iff the package's Package.swift defines its targets through
     a user-supplied helper type whose own `.target(...)` static method
@@ -2749,21 +2764,17 @@ def _manifest_uses_custom_target_wrapper(package: Package) -> bool:
     The textual dedup-overlap rewriter (`edit_replace_with_binary_target`)
     can't distinguish between `Target.target(name: T, ...)` and
     `CustomTarget.target(name: T, ...)` at the call site, since both
-    appear as `.target(name: T, ...)` in source. When the manifest's
-    targets array contains custom-wrapper calls, the rewriter ends up
-    replacing the wrapper call with `.binaryTarget(...)` — which fails
-    because the wrapper type has no `binaryTarget` static method.
-
-    We refuse to auto-synth sibling build units for such packages: the
-    umbrella product reverts to statically embedding its siblings (the
-    pre-auto-discovery default), and the package stays correctly
-    classified as KNOWN_BROKEN by the integration matrix instead of
-    failing hard mid-Execute.
+    appear as `.target(name: T, ...)` in source. When this returns
+    True, Execute's dedup-overlap routes through
+    `edit_inject_or_extend_overlay_binary_targets` instead — an
+    overlay edit at the `Package(targets:)` boundary that's
+    well-typed regardless of wrapper presence.
 
     Detection scans the active manifest text for either of the two
     canonical signals listed in `_CUSTOM_TARGET_WRAPPER_SIGNALS`.
     Missing-file / unreadable-manifest cases conservatively return
-    False so well-formed packages don't lose the optimisation.
+    False so well-formed packages aren't forced onto the overlay
+    path.
     """
     if package.staged_dir is None:
         return False
@@ -2778,8 +2789,37 @@ def _manifest_uses_custom_target_wrapper(package: Package) -> bool:
             text = manifest_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        if any(sig in text for sig in _CUSTOM_TARGET_WRAPPER_SIGNALS):
+        if _manifest_uses_custom_target_wrapper_text(text):
             return True
+    return False
+
+
+def _target_declares_linker_settings(package: Package, target_name: str) -> bool:
+    """True iff `target_name`'s entry in the raw `dump-package` output
+    declares at least one `tool: "linker"` setting (`linkedFramework`,
+    `linkedLibrary`, or linker-tooled unsafe flags).
+
+    Heuristic for "this internal helper depends on its umbrella's link
+    context and won't build standalone as a `.library(type: .dynamic)`".
+    The canonical false-positive we're avoiding: WCDB's `bridge`,
+    `common`, and `objc-core` helpers, which `.linkedFramework`
+    CoreFoundation via WCDBSwift's settings and fail at link with
+    `Undefined symbol: _CFAllocatorGetDefault` when promoted to their
+    own dynamic library.
+
+    Returns False if the target isn't found in the raw dump (best-effort
+    — caller's behaviour matches "no linker settings" since promoting
+    a phantom target is itself a no-op).
+    """
+    for raw_t in package.raw_dump.get("targets", []) or []:
+        if not isinstance(raw_t, dict):
+            continue
+        if raw_t.get("name") != target_name:
+            continue
+        for setting in raw_t.get("settings") or []:
+            if isinstance(setting, dict) and setting.get("tool") == "linker":
+                return True
+        return False
     return False
 
 
@@ -2797,14 +2837,28 @@ def _auto_synth_sibling_units(
         `synth_dynamic_library` edit (planner re-exports it as a dynamic
         sibling product). The build unit's name is the original product
         name so consumers depend on it by the same identifier.
-      - T is internal-only (no matching product) → SKIP. Pure helper
-        targets often rely on the umbrella's `linkerSettings` /
-        framework dependencies (e.g. WCDB's `bridge`, `common`, and
-        `objc-core` targets link against CoreFoundation via the
-        umbrella WCDBSwift's settings). Standalone-built as a dynamic
-        `.library` they'd fail at the link step with `Undefined symbol:
+      - T is internal-only (no matching product) → auto-promote IFF
+        it looks safe to build standalone:
+          * `tgt.language == Language.SWIFT` — Swift's autolink
+            machinery handles Foundation/CoreFoundation without
+            explicit linker flags, so a pure-Swift helper builds
+            cleanly as `.library(type: .dynamic)`. The canonical
+            need here is swift-collections'
+            `InternalCollectionsUtilities` (the hidden helper whose
+            symbols other siblings' `.swiftinterface` reference).
+          * No `tool: "linker"` settings declared on the target —
+            even on Swift, a target that explicitly declares
+            `.linkedFramework` / `.linkedLibrary` probably depends
+            on umbrella-level link context.
+        Anything else (ObjC/Mixed/N/A language, or any explicit
+        linker settings) → SKIP, leaving the umbrella to statically
+        embed the target. Canonical SKIP case: WCDB's `bridge`,
+        `common`, and `objc-core` ObjC helpers — they call
+        CoreFoundation but the `.linkedFramework("CoreFoundation")`
+        lives on the WCDBSwift umbrella's `linkerSettings`. Promoting
+        them standalone would fail at link with `Undefined symbol:
         _CFAllocatorGetDefault` and friends. The `--target T` escape
-        hatch still works as the explicit opt-in for this case.
+        hatch is still the explicit opt-in.
 
     Skipped (won't produce a unit):
       - Non-regular targets (system / binary / executable / test /
@@ -2850,8 +2904,61 @@ def _auto_synth_sibling_units(
     for sibling in siblings_to_add:
         if sibling not in existing_product_names:
             # Internal helper target with no public product wrapper.
-            # Don't auto-promote — see docstring rationale (WCDB-style
-            # CoreFoundation link failure).
+            # Auto-promote only when it looks safe to build standalone.
+            # We need this for pure-Swift helpers (canonical:
+            # swift-collections' `InternalCollectionsUtilities`): they
+            # link cleanly as their own dynamic library and MUST ship
+            # as their own xcframework so a sibling's `.swiftinterface`
+            # can resolve its `import` line at consumer build time.
+            #
+            # Two guards keep WCDB-style ObjC helpers out:
+            #   (a) language: we only promote Swift-language helpers.
+            #       ObjC helpers (canonical: WCDB's `bridge` /
+            #       `common` / `objc-core`) almost always rely on
+            #       system frameworks (CoreFoundation, Foundation)
+            #       linked through the UMBRELLA target's
+            #       `.linkedFramework(...)` settings — those flags
+            #       don't propagate when SPM builds the sibling as
+            #       its own `.library(type: .dynamic)`, so the link
+            #       fails with `Undefined symbol: _CFAllocatorGetDefault`
+            #       and friends. Swift's autolink machinery covers
+            #       Foundation/CoreFoundation for pure-Swift helpers
+            #       so the same trap doesn't apply there.
+            #   (b) explicit linker settings: even on Swift, a helper
+            #       that declares its own `.linkedLibrary`/
+            #       `.linkedFramework` likely needs umbrella-level
+            #       link context the standalone build won't have.
+            #
+            # Users can still opt skipped helpers in explicitly via
+            # `--target T`.
+            tgt = package.target_by_name(sibling)
+            if tgt is None:
+                continue
+            if tgt.language != Language.SWIFT:
+                continue
+            if _target_declares_linker_settings(package, sibling):
+                continue
+            language = Language.SWIFT
+            taken_product_names.add(sibling)
+            plan.package_swift_edits.append(
+                PackageSwiftEdit(
+                    kind="synth_library",
+                    product_name=sibling,
+                    targets=[sibling],
+                )
+            )
+            plan.build_units.append(
+                BuildUnit(
+                    name=sibling,
+                    scheme=sibling,
+                    framework_name=sibling,
+                    language=language,
+                    archive_strategy="archive",
+                    source_targets=[sibling],
+                    synthetic=True,
+                )
+            )
+            existing_planned_names.add(sibling)
             continue
         existing = next(p for p in package.products if p.name == sibling)
         if _is_system_only_product(existing, package):
@@ -3071,7 +3178,7 @@ def print_plan(
 import re
 import subprocess
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 
 
@@ -3617,6 +3724,19 @@ def _has_binary_target_with_name(text: str, target_name: str) -> bool:
 
 _PACKAGE_CALL_RE = re.compile(r"\bPackage\s*\(")
 _PRODUCTS_LABEL_RE = re.compile(r"\bproducts\s*:")
+_TARGETS_LABEL_RE = re.compile(r"\btargets\s*:")
+_OVERLAY_BINARY_TARGET_RE = re.compile(r"\bTarget\s*\.\s*binaryTarget\s*\(")
+
+# Sentinel comments wrap the auto-generated overlay block so a later
+# dedup-overlap pass can find, parse, and extend its own previous
+# output without trying to re-parse free-form Swift.
+_OVERLAY_SENTINEL_BEGIN = (
+    "// spm-to-xcframework dedup-overlap overlay — begin "
+    "(auto-generated, do not edit)"
+)
+_OVERLAY_SENTINEL_END = "// spm-to-xcframework dedup-overlap overlay — end"
+_OVERLAY_TARGETS_VAR = "_SPM2XC_OVERLAY_TARGETS"
+_OVERLAY_NAMES_VAR = "_SPM2XC_OVERLAY_NAMES"
 
 
 def edit_append_synth_product_to_package(
@@ -3768,6 +3888,548 @@ def edit_replace_with_binary_target(
     path_literal = _swift_string_literal(xcframework_path)
     replacement = f".binaryTarget(name: {name_literal}, path: {path_literal})"
     return manifest_text[:kind_start] + replacement + manifest_text[close_idx + 1 :]
+
+
+def _parse_overlay_entries(block_text: str) -> Dict[str, str]:
+    """Parse `Target.binaryTarget(name: "N", path: "P")` entries out of
+    an overlay block's array literal. Returns name → path. Strict by
+    design — the block is sentinel-bounded auto-generated text whose
+    shape we fully control, so any parse failure indicates corruption.
+    """
+    entries: Dict[str, str] = {}
+    pos = 0
+    while True:
+        m = _OVERLAY_BINARY_TARGET_RE.search(block_text, pos)
+        if not m:
+            return entries
+        open_idx = m.end() - 1
+        close_idx = _balanced_close(block_text, open_idx)
+        if close_idx == -1:
+            raise PrepareUserError(
+                "overlay edit: malformed Target.binaryTarget(...) call in "
+                "the existing overlay block (unbalanced parens)."
+            )
+        span = block_text[open_idx + 1 : close_idx]
+        flat = _flatten_to_top_level(span)
+        name_m = re.search(
+            r'\bname\s*:\s*"((?:[^"\\\n]|\\.)*)"', flat
+        )
+        path_m = re.search(
+            r'\bpath\s*:\s*"((?:[^"\\\n]|\\.)*)"', flat
+        )
+        if not name_m or not path_m:
+            raise PrepareUserError(
+                "overlay edit: Target.binaryTarget entry inside the overlay "
+                "block is missing `name:` or `path:`."
+            )
+        entries[name_m.group(1)] = path_m.group(1)
+        pos = close_idx + 1
+
+
+def _render_overlay_block(entries: Dict[str, str]) -> str:
+    """Render an overlay block from `entries` (name → path), with stable
+    sort order (by name). Sentinel-wrapped so subsequent calls can find
+    and rewrite it. Trailing newline ensures the block sits on its own
+    lines.
+    """
+    lines = [_OVERLAY_SENTINEL_BEGIN]
+    lines.append(f"let {_OVERLAY_TARGETS_VAR}: [Target] = [")
+    for name in sorted(entries):
+        lines.append(
+            f"  Target.binaryTarget("
+            f"name: {_swift_string_literal(name)}, "
+            f"path: {_swift_string_literal(entries[name])}),"
+        )
+    lines.append("]")
+    lines.append(
+        f"let {_OVERLAY_NAMES_VAR}: Set<String> = "
+        f"Set({_OVERLAY_TARGETS_VAR}.map {{ $0.name }})"
+    )
+    lines.append(_OVERLAY_SENTINEL_END)
+    return "\n".join(lines) + "\n"
+
+
+def edit_inject_or_extend_overlay_binary_targets(
+    manifest_text: str, substitutions: Sequence[Tuple[str, str]]
+) -> str:
+    """Dedup-overlap edit for wrapper-style manifests.
+
+    Used in place of `edit_replace_with_binary_target` when the
+    manifest's target list is built through a user-defined wrapper
+    (e.g. swift-collections' `CustomTarget` + `.toTarget()`), where the
+    textual `.target(name: T, ...)` finder would match wrapper calls
+    that have no `.binaryTarget` static method.
+
+    The overlay intervenes one level higher: at the top-level
+    `Package(targets: <expr>)` boundary. The wrapper's output is always
+    a `[Target]`, so we filter same-named entries out of it and
+    concatenate our own `Target.binaryTarget(...)` entries — producing
+    a well-typed `[Target]` that SPM accepts.
+
+    Two-state idempotency:
+      1. First call (no sentinel block present): injects the overlay
+         block immediately before the top-level `Package(...)` call AND
+         wraps the `targets:` argument expression as
+         `targets: (<orig>).filter { !_SPM2XC_OVERLAY_NAMES.contains($0.name) } + _SPM2XC_OVERLAY_TARGETS`.
+      2. Subsequent calls (sentinel block present): parses the existing
+         entries, merges with `substitutions` (last-wins by target
+         name), and re-renders the block in place. The `targets:`
+         wrap is left alone since it already references the overlay
+         vars.
+
+    `substitutions` is `[(target_name, xcframework_rel_path), ...]`.
+    Paths must be relative to the package root — SPM rejects absolute
+    paths in `.binaryTarget(path:)`. Caller is responsible for the
+    relpath computation (same as the literal-list path in
+    `_apply_dedup_overlap_substitutions`).
+
+    Returns the edited manifest text. A call with zero substitutions
+    AND no pre-existing overlay block is a no-op. A call that produces
+    no net change (every substitution already in the existing block
+    with the same path) returns `manifest_text` unchanged.
+
+    Raises `PrepareUserError` if the manifest has no `Package(...)`
+    call, no top-level `targets:` argument, or a malformed existing
+    overlay block.
+    """
+    code_view = _make_code_token_view(manifest_text)
+
+    # Locate any existing sentinel-bounded overlay block. We scan the
+    # raw text rather than the code view: comments are blanked out in
+    # the code view, so a sentinel COMMENT wouldn't appear there. Use
+    # the raw text directly.
+    block_start = manifest_text.find(_OVERLAY_SENTINEL_BEGIN)
+    overlay_present = block_start != -1
+    existing: Dict[str, str] = {}
+    block_end = -1
+    if overlay_present:
+        sentinel_end = manifest_text.find(_OVERLAY_SENTINEL_END, block_start)
+        if sentinel_end == -1:
+            raise PrepareUserError(
+                "overlay edit: found overlay begin sentinel without a "
+                "matching end sentinel; the manifest is in a half-edited "
+                "state."
+            )
+        block_end = sentinel_end + len(_OVERLAY_SENTINEL_END)
+        if block_end < len(manifest_text) and manifest_text[block_end] == "\n":
+            block_end += 1
+        existing = _parse_overlay_entries(manifest_text[block_start:block_end])
+
+    merged = dict(existing)
+    for name, rel_path in substitutions:
+        merged[name] = rel_path
+
+    if not merged:
+        # Nothing to do: no existing entries AND no new substitutions.
+        return manifest_text
+
+    if overlay_present:
+        if merged == existing:
+            return manifest_text
+        new_block = _render_overlay_block(merged)
+        return manifest_text[:block_start] + new_block + manifest_text[block_end:]
+
+    # First-time injection: build the block, find the Package(...) call,
+    # wrap its `targets:` argument expression, and splice the block in
+    # immediately before the line containing `Package(`.
+    new_block = _render_overlay_block(merged)
+
+    m = _PACKAGE_CALL_RE.search(code_view)
+    if not m:
+        raise PrepareUserError(
+            "overlay edit: no top-level `Package(` call found in the "
+            "manifest."
+        )
+    pkg_open = m.end() - 1
+    pkg_close = _balanced_close(manifest_text, pkg_open)
+    if pkg_close == -1:
+        raise PrepareUserError(
+            "overlay edit: unmatched `(` for `Package(`; the manifest "
+            "may be malformed."
+        )
+    body_start = pkg_open + 1
+    body_end = pkg_close
+    body = manifest_text[body_start:body_end]
+    body_dz = _depth_zero_view(body)
+    lm = _TARGETS_LABEL_RE.search(body_dz)
+    if not lm:
+        raise PrepareUserError(
+            "overlay edit: no top-level `targets:` argument inside the "
+            "Package(...) call. The manifest shape is not supported by "
+            "the overlay edit."
+        )
+    expr_start_in_body = lm.end()
+    while (
+        expr_start_in_body < len(body)
+        and body[expr_start_in_body] in " \t"
+    ):
+        expr_start_in_body += 1
+    comma_idx = body_dz.find(",", expr_start_in_body)
+    expr_end_in_body = comma_idx if comma_idx != -1 else len(body)
+    while (
+        expr_end_in_body > expr_start_in_body
+        and body[expr_end_in_body - 1] in " \t\n"
+    ):
+        expr_end_in_body -= 1
+    expr_start_offset = body_start + expr_start_in_body
+    expr_end_offset = body_start + expr_end_in_body
+
+    # Find the insertion point for the overlay block — the start of the
+    # statement that opens the Package(...) call. Walk back from
+    # pkg_open to the most recent newline + 1 (or BOF).
+    line_start = manifest_text.rfind("\n", 0, pkg_open) + 1
+
+    wrap_prefix = "("
+    wrap_suffix = (
+        f").filter {{ !{_OVERLAY_NAMES_VAR}.contains($0.name) }} "
+        f"+ {_OVERLAY_TARGETS_VAR}"
+    )
+
+    # Splice three regions in order from the end of the text so earlier
+    # offsets stay valid:
+    #   1. wrap_suffix immediately AFTER the targets-arg expression
+    #   2. wrap_prefix immediately BEFORE it
+    #   3. new_block immediately BEFORE the Package(...) statement
+    # Done as a single concatenation to avoid offset drift.
+    return (
+        manifest_text[:line_start]
+        + new_block
+        + manifest_text[line_start:expr_start_offset]
+        + wrap_prefix
+        + manifest_text[expr_start_offset:expr_end_offset]
+        + wrap_suffix
+        + manifest_text[expr_end_offset:]
+    )
+
+
+_DEPENDENCIES_LABEL_RE = re.compile(r"\bdependencies\s*:")
+
+
+def _strip_comments_to_spaces(span: str) -> str:
+    """Return a string the same length as `span` with line and block
+    comment characters (delimiters + body) replaced by spaces. Strings
+    and other code are preserved verbatim; newlines are preserved both
+    inside and outside comments so per-line offsets stay aligned.
+
+    Comment detection is string-aware: a `//` or `/*` that sits inside
+    a string literal isn't treated as a comment start. Block comments
+    nest, matching Swift's grammar.
+
+    Used as the stripped view for the backwards tail-shape scan in
+    `edit_augment_target_dependencies` so a trailing comment after the
+    last element doesn't cause the splice to land inside the comment.
+    """
+    out = list(span)
+    n = len(span)
+    i = 0
+    while i < n:
+        c = span[i]
+        if c == "/" and i + 1 < n and span[i + 1] == "/":
+            nl = span.find("\n", i + 2)
+            end = nl if nl != -1 else n
+            for j in range(i, end):
+                out[j] = " "
+            i = end
+            continue
+        if c == "/" and i + 1 < n and span[i + 1] == "*":
+            block_depth = 1
+            j = i + 2
+            while j < n and block_depth > 0:
+                if j + 1 < n and span[j] == "/" and span[j + 1] == "*":
+                    block_depth += 1
+                    j += 2
+                    continue
+                if j + 1 < n and span[j] == "*" and span[j + 1] == "/":
+                    block_depth -= 1
+                    j += 2
+                    continue
+                j += 1
+            for k in range(i, j):
+                if out[k] != "\n":
+                    out[k] = " "
+            i = j
+            continue
+        if c == '"':
+            # Skip past string literals so a // or /* inside a string
+            # isn't blanked. The string body itself stays in `out`.
+            j = i + 1
+            while j < n:
+                cc = span[j]
+                if cc == "\\" and j + 1 < n:
+                    if span[j + 1] == "(":
+                        close_idx = _balanced_close(span, j + 1)
+                        if close_idx == -1:
+                            break
+                        j = close_idx + 1
+                        continue
+                    j += 2
+                    continue
+                if cc == '"':
+                    j += 1
+                    break
+                if cc == "\n":
+                    break
+                j += 1
+            i = j
+            continue
+        i += 1
+    return "".join(out)
+
+
+def _collect_depth_zero_string_literals(span: str) -> set:
+    """Return the set of RAW string-literal source spans found at depth
+    0 of `span`. Walks character-by-character tracking nesting depth
+    and string/comment state; only string literals encountered while
+    `depth == 0` are collected.
+
+    "Raw source spans" means the value preserves backslash escapes and
+    interpolation segments verbatim — no Swift-level unescaping. For
+    `"prefix \\(x) suffix"` the collected element is the literal
+    string `prefix \\(x) suffix`. Callers are comparing against
+    proposed dep names that they construct as plain identifiers
+    (e.g. "InternalCollectionsUtilities"), so the comparison just
+    needs both sides to agree on representation. The escape-preserving
+    behaviour matches `_swift_string_literal`'s output, which is what
+    we'd emit if we ever spliced the same name in.
+
+    Used by `edit_augment_target_dependencies` to test whether a
+    proposed dep name is already a member of the array. A naive
+    `re.finditer(r'"..."', array_interior)` would falsely match a
+    string nested inside `.target(name: "X")` or `.product(name: "Y")`;
+    the dependency item there is the WHOLE call, and "X"/"Y" appear at
+    depth 1, so they should not count as direct dep names.
+
+    Escape handling: `\\n`, `\\"`, and string-interpolation `\\(...)` are
+    consumed as part of the string. Newlines inside an unterminated
+    `"..."` end the literal (matches Swift's grammar). Block comments
+    nest in Swift; line comments end at `\\n`.
+    """
+    out: set = set()
+    n = len(span)
+    i = 0
+    depth = 0
+    while i < n:
+        c = span[i]
+        if c == "/" and i + 1 < n and span[i + 1] == "/":
+            nl = span.find("\n", i + 2)
+            i = nl if nl != -1 else n
+            continue
+        if c == "/" and i + 1 < n and span[i + 1] == "*":
+            block_depth = 1
+            j = i + 2
+            while j < n and block_depth > 0:
+                if j + 1 < n and span[j] == "/" and span[j + 1] == "*":
+                    block_depth += 1
+                    j += 2
+                    continue
+                if j + 1 < n and span[j] == "*" and span[j + 1] == "/":
+                    block_depth -= 1
+                    j += 2
+                    continue
+                j += 1
+            i = j
+            continue
+        if c == '"':
+            j = i + 1
+            buf = []
+            while j < n:
+                cc = span[j]
+                if cc == "\\" and j + 1 < n:
+                    nxt = span[j + 1]
+                    if nxt == "(":
+                        close_idx = _balanced_close(span, j + 1)
+                        if close_idx == -1:
+                            break
+                        # Interpolation: opaque to the literal value.
+                        buf.append(span[j : close_idx + 1])
+                        j = close_idx + 1
+                        continue
+                    # Other escape sequences: keep them verbatim — the
+                    # caller is comparing raw source text against the
+                    # dep names it wants to inject, and would have
+                    # constructed any escapes the same way.
+                    buf.append(span[j : j + 2])
+                    j += 2
+                    continue
+                if cc == '"':
+                    j += 1
+                    if depth == 0:
+                        out.add("".join(buf))
+                    break
+                if cc == "\n":
+                    break
+                buf.append(cc)
+                j += 1
+            i = j
+            continue
+        if c in "([{":
+            depth += 1
+            i += 1
+            continue
+        if c in ")]}":
+            if depth > 0:
+                depth -= 1
+            i += 1
+            continue
+        i += 1
+    return out
+
+
+def edit_augment_target_dependencies(
+    manifest_text: str,
+    target_name: str,
+    extra_dep_names: Sequence[str],
+) -> str:
+    """Append string-literal entries to the `dependencies:` array of the
+    `.target(name: target_name, ...)` (or `.executableTarget` /
+    `.testTarget`) call.
+
+    Used by Execute's dedup-overlap pass to inject "phantom helper"
+    deps — internal sibling targets that are in an umbrella's
+    transitive dep closure but absent from its direct `dependencies:`
+    list. Without the injection, SPM doesn't add the helper's binary
+    target slice to the umbrella's `FRAMEWORK_SEARCH_PATHS`, and the
+    consumer's compile fails to resolve `import <Helper>` calls
+    embedded in another sibling's emitted `.swiftinterface`.
+
+    Canonical case: Apple swift-collections 1.1.4. `Collections` directly
+    depends on `[BitCollections, DequeModule, ...]` but each of those
+    transitively depends on `InternalCollectionsUtilities` (`kind:
+    .hidden`). After dedup-overlap, the siblings become `.binaryTarget`s
+    and their `.swiftinterface` files retain `import
+    InternalCollectionsUtilities`; SPM only adds slice dirs for binary
+    targets in the direct dep list, so `Collections`'s compile can't
+    find the helper. Augmenting `Collections`'s `dependencies:` with
+    `"InternalCollectionsUtilities"` fixes the search-path gap without
+    touching the helper module's own xcframework.
+
+    Idempotent: an entry already present in the array as a quoted
+    string literal at depth 0 is skipped. The "depth 0" qualifier matters
+    because nested `.target(name: "X")` / `.product(name: "X", ...)`
+    forms can mention any name as their own `name:` argument; those
+    don't count as members of the outer array. Other forms (a sibling
+    referenced as `.target(name: "X")` rather than `"X"`) are NOT
+    treated as duplicates — the augmentation appends a plain string
+    literal in that case, which SPM accepts alongside the existing
+    decorated form.
+
+    Raises `PrepareUserError` if:
+      - No `.target(name: target_name, ...)` (or `.executableTarget` /
+        `.testTarget`) call exists in the manifest.
+      - The target's call has no top-level `dependencies:` argument.
+      - The `dependencies:` expression is not an array literal (e.g.
+        `dependencies: someComputedArray`) — we don't attempt to
+        splice into a name-bound expression.
+
+    Wrapper-style manifests (swift-collections' `CustomTarget.target(
+    name:, dependencies:, ...)`) are supported because the regex
+    `\.(target|executableTarget|testTarget)\s*\(` matches both
+    `CustomTarget.target(` and bare `.target(` calls. The wrapper's
+    `dependencies` field is `[Target.Dependency]`-typed, which accepts
+    `ExpressibleByStringLiteral` entries the same as a real
+    `Target.target` call. The wrapper's `.toTarget()` forwards the list
+    verbatim to `Target.target(dependencies:)`, so the injection
+    propagates through to SPM's model.
+    """
+    if not extra_dep_names:
+        return manifest_text
+
+    kind_start, close_idx, _kind = _find_target_call_for_name(
+        manifest_text, target_name
+    )
+    if kind_start == -1:
+        raise PrepareUserError(
+            f"augment_target_dependencies: no `.target(name: {target_name!r}, "
+            f"...)` (or .executableTarget/.testTarget) found in the manifest."
+        )
+
+    # The call body spans (open_paren+1, close_idx).
+    open_idx = manifest_text.index("(", kind_start)
+    body_start = open_idx + 1
+    body_end = close_idx
+    body = manifest_text[body_start:body_end]
+    # `_depth_zero_view` blanks string/comment bodies AND nested-scope
+    # content while preserving offsets. So a `dependencies:` label
+    # nested inside another arg (rare but defensible) cannot false-
+    # match, and a label inside a string literal is invisible.
+    body_dz = _depth_zero_view(body)
+
+    lm = _DEPENDENCIES_LABEL_RE.search(body_dz)
+    if not lm:
+        raise PrepareUserError(
+            f"augment_target_dependencies: no top-level `dependencies:` "
+            f"argument in `.target(name: {target_name!r}, ...)` call."
+        )
+
+    # Find the `[` that opens the array literal. Skip whitespace.
+    i = lm.end()
+    while i < len(body) and body[i] in " \t\n":
+        i += 1
+    if i >= len(body) or body[i] != "[":
+        raise PrepareUserError(
+            f"augment_target_dependencies: `dependencies:` expression in "
+            f"`.target(name: {target_name!r}, ...)` is not an array literal "
+            f"(spotted `{body[i:i+10]!r}` at the position). The injection "
+            f"requires a literal `[...]` so it can splice new entries."
+        )
+    deps_open = i  # relative to body
+    deps_close = _balanced_close(body, deps_open)
+    if deps_close == -1:
+        raise PrepareUserError(
+            f"augment_target_dependencies: unmatched `[` for `dependencies:` "
+            f"array of `.target(name: {target_name!r}, ...)`."
+        )
+
+    # Idempotency: skip entries already present as depth-0 quoted strings.
+    # We can't use `_depth_zero_view` here — it blanks string-literal
+    # bodies as part of its comment-aware sanitisation, which would
+    # leave the regex matching empty strings instead of the actual
+    # names. Walk the array interior manually, tracking depth + string/
+    # comment state, and capture string literals only at depth 0.
+    array_interior = body[deps_open + 1 : deps_close]
+    existing_strings = _collect_depth_zero_string_literals(array_interior)
+
+    to_add = [d for d in extra_dep_names if d not in existing_strings]
+    if not to_add:
+        return manifest_text  # idempotent — all entries already present
+
+    # Pick the right splice shape based on what character sits at the
+    # array's logical "tail" (the last non-blank, non-comment char
+    # before `]`).
+    #   - `[` → empty array; insert `<entries>` (no leading comma needed)
+    #   - `,` → trailing comma; insert `<entries>,` (Swift accepts the
+    #     extra trailing comma; the existing one provides the separator)
+    #   - anything else → content with no trailing comma; insert `,
+    #     <entries>` (leading comma supplies the separator)
+    #
+    # We walk a comment-stripped view of `body` so a trailing line/
+    # block comment after the last element doesn't fool the decision.
+    # Without the strip, `["A", // note\n]` would land `tail_char='e'`,
+    # taking the "anything else" branch — and the inserted ", "B""
+    # would land INSIDE the line comment, becoming dead code. Strings
+    # stay in the view (a string's closing `"` is a legitimate tail).
+    body_for_tail = _strip_comments_to_spaces(body)
+    j = deps_close - 1
+    while j > deps_open and body_for_tail[j] in " \t\n":
+        j -= 1
+    tail_char = body_for_tail[j]
+    insertion_abs = body_start + j + 1  # right after the last non-blank char
+
+    entries_chunk = ", ".join(
+        _swift_string_literal(d) for d in to_add
+    )
+    if tail_char == "[":
+        insertion = entries_chunk
+    elif tail_char == ",":
+        insertion = " " + entries_chunk + ","
+    else:
+        insertion = ", " + entries_chunk
+
+    return (
+        manifest_text[:insertion_abs]
+        + insertion
+        + manifest_text[insertion_abs:]
+    )
 
 
 def _find_library_call_for_name(
@@ -7194,7 +7856,7 @@ def _build_dependency_xcframeworks(
 
 import os
 from pathlib import Path
-from typing import Iterable, List, Mapping, Sequence, Set, Tuple
+from typing import Dict, Iterable, List, Mapping, Sequence, Set, Tuple
 
 
 
@@ -7366,9 +8028,6 @@ def _apply_dedup_overlap_substitutions(
             f"editor can't reason about. {exc} Re-run with --no-dedup-overlap to "
             f"disable the inter-unit binaryTarget rewrite for this package."
         ) from exc
-    edited = text
-    applied: List[str] = []
-    skipped: List[str] = []
     # SPM's `.binaryTarget(path: ...)` rejects two shapes that look
     # superficially fine: ABSOLUTE paths ("path expected to be relative
     # to package root") and paths resolved against the wrong base. We
@@ -7381,9 +8040,74 @@ def _apply_dedup_overlap_substitutions(
     # as the base so symlinks in either direction don't desync the
     # rel-path computation.
     staged_root = staged_dir.resolve()
-    for target_name, xcframework_path in substitutions:
-        abs_path = Path(xcframework_path).resolve()
-        rel_path = os.path.relpath(abs_path, staged_root)
+    rel_subs: List[Tuple[str, Path, str]] = [
+        (
+            name,
+            Path(xcfw).resolve(),
+            os.path.relpath(Path(xcfw).resolve(), staged_root),
+        )
+        for name, xcfw in substitutions
+    ]
+
+    # Route between two edit strategies:
+    #
+    #   1. The default in-place `.target → .binaryTarget` rewrite, which
+    #      relies on locating `.target(name: T, ...)` calls in the
+    #      manifest and substituting the call in place. Fast, leaves the
+    #      manifest looking close to original, doesn't introduce new
+    #      symbols.
+    #
+    #   2. The overlay edit, which injects a sentinel-wrapped
+    #      `_SPM2XC_OVERLAY_TARGETS: [Target]` block before the
+    #      `Package(...)` call and post-processes its `targets:`
+    #      argument expression with a `filter + append`. Used when
+    #      the in-place rewrite would mis-fire — chiefly manifests
+    #      that build their target list through a user-defined wrapper
+    #      type whose `.target(name:, ...)` shadows `Target.target`,
+    #      so the textual finder would rewrite the wrapper call and
+    #      produce `CustomTarget.binaryTarget(...)` which doesn't
+    #      compile. The canonical case is swift-collections'
+    #      `CustomTarget` + `toTarget()` pattern.
+    #
+    # Detection is the same `_CUSTOM_TARGET_WRAPPER_SIGNALS` check the
+    # planner uses (`plan._manifest_uses_custom_target_wrapper_text`).
+    # If the overlay is already in place (sentinel present), keep using
+    # the overlay path so a previously-injected wrap is grown instead of
+    # being shadowed by a parallel in-place edit on the same manifest.
+    use_overlay = (
+        _manifest_uses_custom_target_wrapper_text(text)
+        or _OVERLAY_SENTINEL_BEGIN in text
+    )
+
+    if use_overlay:
+        delta = [(name, rel) for name, _abs, rel in rel_subs]
+        try:
+            edited = edit_inject_or_extend_overlay_binary_targets(text, delta)
+        except PrepareUserError as exc:
+            raise ExecuteError(
+                f"dedup-overlap substitution failed for unit {unit_name!r}: "
+                f"{exc}"
+            ) from exc
+        if edited != text:
+            manifest_path.write_text(edited)
+            applied = [f"{name} -> {abs_path.name}" for name, abs_path, _ in rel_subs]
+            info(
+                f"  {unit_name}: dedup-overlap (overlay) added "
+                f"{len(applied)} sibling target(s) to the overlay: "
+                + ", ".join(applied)
+            )
+        else:
+            verbose_log(
+                verbose,
+                f"  {unit_name}: dedup-overlap (overlay) no-op — all "
+                f"{len(rel_subs)} target(s) already present in the overlay",
+            )
+        return
+
+    edited = text
+    applied: List[str] = []
+    skipped: List[str] = []
+    for target_name, abs_path, rel_path in rel_subs:
         try:
             new_text = edit_replace_with_binary_target(edited, target_name, rel_path)
         except PrepareUserError as exc:
@@ -7409,6 +8133,136 @@ def _apply_dedup_overlap_substitutions(
             verbose,
             f"  {unit_name}: dedup-overlap left {len(skipped)} target(s) "
             f"unchanged (already .binaryTarget): " + ", ".join(skipped),
+        )
+
+
+def _compute_phantom_helper_deps(
+    *,
+    unit: BuildUnit,
+    package: Package,
+    substituted_target_names: Set[str],
+    target_deps: Mapping[str, Set[str]],
+) -> Dict[str, List[str]]:
+    """Return `{source_target: [phantom_helper_name, ...]}` for `unit`.
+
+    A "phantom helper" is a sibling target that:
+      1. Is being binary-substituted on this dedup-overlap pass (or was
+         on a prior pass — i.e. it's in `substituted_target_names`).
+      2. Is in `source_target`'s **transitive** dep closure
+         (`target_deps[source_target]`).
+      3. Is NOT in `source_target`'s **direct** manifest-declared
+         dependencies.
+
+    These are the deps SPM needs to discover for the consumer's compile
+    to resolve sibling `.swiftinterface` imports, but doesn't because
+    binary targets are opaque to SPM's source-level dep graph walker.
+    Canonical case: Apple swift-collections — `Collections`'s direct
+    deps are `[BitCollections, ..., _RopeModule]`, all six siblings
+    transitively depend on `InternalCollectionsUtilities` (`kind:
+    .hidden`), and once the siblings become `.binaryTarget`s the
+    `InternalCollectionsUtilities` slice dir never makes it onto
+    `Collections`'s `FRAMEWORK_SEARCH_PATHS`. The fix: augment
+    `Collections`'s `dependencies:` array with the helper name so SPM
+    rediscovers the binary target through the normal dep-walk machinery.
+
+    Returns an empty dict when the unit has no phantom helpers — i.e.
+    every substituted sibling is already a direct dep, or the unit
+    isn't an umbrella. The caller skips the augmentation pass in that
+    case (no-op manifest read avoided).
+    """
+
+    raw_targets_by_name: Dict[str, dict] = {}
+    for raw_t in package.raw_dump.get("targets", []) or []:
+        if isinstance(raw_t, dict):
+            nm = raw_t.get("name")
+            if isinstance(nm, str):
+                raw_targets_by_name[nm] = raw_t
+
+    result: Dict[str, List[str]] = {}
+    for src_t in unit.source_targets:
+        raw_t = raw_targets_by_name.get(src_t)
+        if raw_t is None:
+            continue
+        direct = set(_raw_internal_dep_names(raw_t))
+        transitive = target_deps.get(src_t, set())
+        phantoms = [
+            n for n in sorted(transitive & substituted_target_names)
+            if n not in direct and n != src_t
+        ]
+        if phantoms:
+            result[src_t] = phantoms
+    return result
+
+
+def _apply_phantom_helper_dep_augmentation(
+    *,
+    staged_dir: Path,
+    phantom_helpers: Mapping[str, Sequence[str]],
+    unit_name: str,
+    verbose: bool,
+) -> None:
+    """For each `(source_target, [phantom_name, ...])` pair, append the
+    phantom names to the source target's `dependencies:` array in the
+    active Package.swift.
+
+    No-op (and silent) if `phantom_helpers` is empty. Otherwise reads
+    the active manifest, applies one `edit_augment_target_dependencies`
+    call per source target, writes once at the end. Idempotent: the
+    underlying edit skips already-present entries, so re-running on a
+    manifest with the phantom already declared is a no-op.
+
+    Raises `ExecuteError` if the augmentation fails for a source target
+    that we know is in the manifest — that means our planner's view of
+    the package and the manifest text disagree, which is a hard
+    inconsistency the caller can't recover from without operator
+    intervention.
+    """
+    if not phantom_helpers:
+        return
+    manifest_path = _select_active_manifest(staged_dir)
+    if not manifest_path.is_file():
+        raise ExecuteError(
+            f"phantom-helper augmentation: cannot read active manifest at "
+            f"{manifest_path} for unit {unit_name!r}"
+        )
+    text = manifest_path.read_text()
+    try:
+        _assert_no_unsupported_swift_constructs(text)
+    except PrepareUserError as exc:
+        raise ExecuteError(
+            f"phantom-helper augmentation failed for unit {unit_name!r}: "
+            f"{exc} Re-run with --no-dedup-overlap to disable the phantom-"
+            f"helper dep injection (and inter-unit binaryTarget rewrite) "
+            f"for this package."
+        ) from exc
+
+    edited = text
+    applied: List[str] = []
+    for src_t, phantoms in phantom_helpers.items():
+        try:
+            new_text = edit_augment_target_dependencies(
+                edited, src_t, list(phantoms)
+            )
+        except PrepareUserError as exc:
+            raise ExecuteError(
+                f"phantom-helper augmentation failed for unit {unit_name!r} "
+                f"target {src_t!r}: {exc}"
+            ) from exc
+        if new_text != edited:
+            applied.append(f"{src_t}: +{','.join(phantoms)}")
+            edited = new_text
+    if edited != text:
+        manifest_path.write_text(edited)
+    if applied:
+        info(
+            f"  {unit_name}: dedup-overlap added phantom helper dep(s) to "
+            f"umbrella target(s): " + "; ".join(applied)
+        )
+    else:
+        verbose_log(
+            verbose,
+            f"  {unit_name}: phantom-helper augmentation no-op (all helper "
+            f"deps already declared)",
         )
 
 
@@ -7484,7 +8338,7 @@ def _demote_synth_product_in_manifest(
 
 
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Set
 
 
 
@@ -7735,6 +8589,15 @@ def execute_source_plan(
     results: List[ExecutedUnit] = []
     built_by_unit: Dict[str, ExecutedUnit] = {}
     staged_dir = prepared.package.staged_dir
+    # Set of every sibling target name that has been binary-substituted on
+    # any prior unit's dedup-overlap pass. Used by the phantom-helper
+    # augmentation: a helper that was promoted to a sibling xcframework
+    # by an earlier unit needs to be added to the current unit's umbrella
+    # deps even if it isn't part of THIS pass's substitutions list (the
+    # pass dedupes same-name re-substitutions, so an InternalCollections-
+    # Utilities that became a binary target two units ago doesn't show up
+    # again — but it's still a sibling whose slice the umbrella needs).
+    substituted_target_names: Set[str] = set()
 
     for unit in ordered_units:
         if not config.no_dedup_overlap:
@@ -7749,6 +8612,32 @@ def execute_source_plan(
                 _apply_dedup_overlap_substitutions(
                     staged_dir=staged_dir,
                     substitutions=substitutions,
+                    unit_name=unit.name,
+                    verbose=config.verbose,
+                )
+                for name, _path in substitutions:
+                    substituted_target_names.add(name)
+            # Inject "phantom helper" deps on the umbrella's source
+            # target — substituted sibling targets that are in the
+            # transitive but not the direct dep closure. Without this,
+            # SPM doesn't add the helper's binary-target slice to the
+            # umbrella's `FRAMEWORK_SEARCH_PATHS`, and the umbrella
+            # compile fails to resolve `import <Helper>` calls embedded
+            # in sibling `.swiftinterface` files. Runs unconditionally
+            # (even when this unit had zero new substitutions): the
+            # umbrella may still need helpers that were registered on
+            # earlier units' passes. See
+            # `_compute_phantom_helper_deps` for the predicate.
+            phantom_helpers = _compute_phantom_helper_deps(
+                unit=unit,
+                package=prepared.package,
+                substituted_target_names=substituted_target_names,
+                target_deps=target_deps,
+            )
+            if phantom_helpers:
+                _apply_phantom_helper_dep_augmentation(
+                    staged_dir=staged_dir,
+                    phantom_helpers=phantom_helpers,
                     unit_name=unit.name,
                     verbose=config.verbose,
                 )

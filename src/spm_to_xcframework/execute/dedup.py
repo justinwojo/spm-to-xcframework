@@ -15,11 +15,11 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Iterable, List, Mapping, Sequence, Set, Tuple
+from typing import Dict, Iterable, List, Mapping, Sequence, Set, Tuple
 
 from ..errors import ExecuteError, PrepareUserError
 from ..log import info, verbose_log
-from ..model import BuildUnit, ExecutedUnit, PackageSwiftEdit
+from ..model import BuildUnit, ExecutedUnit, Package, PackageSwiftEdit
 
 
 def _synth_dynamic_protected_targets(
@@ -168,9 +168,12 @@ def _apply_dedup_overlap_substitutions(
     """
     from ..prepare import (
         _assert_no_unsupported_swift_constructs,
+        _OVERLAY_SENTINEL_BEGIN,
         _select_active_manifest,
+        edit_inject_or_extend_overlay_binary_targets,
         edit_replace_with_binary_target,
     )
+    from ..plan import _manifest_uses_custom_target_wrapper_text
     manifest_path = _select_active_manifest(staged_dir)
     if not manifest_path.is_file():
         raise ExecuteError(
@@ -195,9 +198,6 @@ def _apply_dedup_overlap_substitutions(
             f"editor can't reason about. {exc} Re-run with --no-dedup-overlap to "
             f"disable the inter-unit binaryTarget rewrite for this package."
         ) from exc
-    edited = text
-    applied: List[str] = []
-    skipped: List[str] = []
     # SPM's `.binaryTarget(path: ...)` rejects two shapes that look
     # superficially fine: ABSOLUTE paths ("path expected to be relative
     # to package root") and paths resolved against the wrong base. We
@@ -210,9 +210,74 @@ def _apply_dedup_overlap_substitutions(
     # as the base so symlinks in either direction don't desync the
     # rel-path computation.
     staged_root = staged_dir.resolve()
-    for target_name, xcframework_path in substitutions:
-        abs_path = Path(xcframework_path).resolve()
-        rel_path = os.path.relpath(abs_path, staged_root)
+    rel_subs: List[Tuple[str, Path, str]] = [
+        (
+            name,
+            Path(xcfw).resolve(),
+            os.path.relpath(Path(xcfw).resolve(), staged_root),
+        )
+        for name, xcfw in substitutions
+    ]
+
+    # Route between two edit strategies:
+    #
+    #   1. The default in-place `.target → .binaryTarget` rewrite, which
+    #      relies on locating `.target(name: T, ...)` calls in the
+    #      manifest and substituting the call in place. Fast, leaves the
+    #      manifest looking close to original, doesn't introduce new
+    #      symbols.
+    #
+    #   2. The overlay edit, which injects a sentinel-wrapped
+    #      `_SPM2XC_OVERLAY_TARGETS: [Target]` block before the
+    #      `Package(...)` call and post-processes its `targets:`
+    #      argument expression with a `filter + append`. Used when
+    #      the in-place rewrite would mis-fire — chiefly manifests
+    #      that build their target list through a user-defined wrapper
+    #      type whose `.target(name:, ...)` shadows `Target.target`,
+    #      so the textual finder would rewrite the wrapper call and
+    #      produce `CustomTarget.binaryTarget(...)` which doesn't
+    #      compile. The canonical case is swift-collections'
+    #      `CustomTarget` + `toTarget()` pattern.
+    #
+    # Detection is the same `_CUSTOM_TARGET_WRAPPER_SIGNALS` check the
+    # planner uses (`plan._manifest_uses_custom_target_wrapper_text`).
+    # If the overlay is already in place (sentinel present), keep using
+    # the overlay path so a previously-injected wrap is grown instead of
+    # being shadowed by a parallel in-place edit on the same manifest.
+    use_overlay = (
+        _manifest_uses_custom_target_wrapper_text(text)
+        or _OVERLAY_SENTINEL_BEGIN in text
+    )
+
+    if use_overlay:
+        delta = [(name, rel) for name, _abs, rel in rel_subs]
+        try:
+            edited = edit_inject_or_extend_overlay_binary_targets(text, delta)
+        except PrepareUserError as exc:
+            raise ExecuteError(
+                f"dedup-overlap substitution failed for unit {unit_name!r}: "
+                f"{exc}"
+            ) from exc
+        if edited != text:
+            manifest_path.write_text(edited)
+            applied = [f"{name} -> {abs_path.name}" for name, abs_path, _ in rel_subs]
+            info(
+                f"  {unit_name}: dedup-overlap (overlay) added "
+                f"{len(applied)} sibling target(s) to the overlay: "
+                + ", ".join(applied)
+            )
+        else:
+            verbose_log(
+                verbose,
+                f"  {unit_name}: dedup-overlap (overlay) no-op — all "
+                f"{len(rel_subs)} target(s) already present in the overlay",
+            )
+        return
+
+    edited = text
+    applied: List[str] = []
+    skipped: List[str] = []
+    for target_name, abs_path, rel_path in rel_subs:
         try:
             new_text = edit_replace_with_binary_target(edited, target_name, rel_path)
         except PrepareUserError as exc:
@@ -238,6 +303,142 @@ def _apply_dedup_overlap_substitutions(
             verbose,
             f"  {unit_name}: dedup-overlap left {len(skipped)} target(s) "
             f"unchanged (already .binaryTarget): " + ", ".join(skipped),
+        )
+
+
+def _compute_phantom_helper_deps(
+    *,
+    unit: BuildUnit,
+    package: Package,
+    substituted_target_names: Set[str],
+    target_deps: Mapping[str, Set[str]],
+) -> Dict[str, List[str]]:
+    """Return `{source_target: [phantom_helper_name, ...]}` for `unit`.
+
+    A "phantom helper" is a sibling target that:
+      1. Is being binary-substituted on this dedup-overlap pass (or was
+         on a prior pass — i.e. it's in `substituted_target_names`).
+      2. Is in `source_target`'s **transitive** dep closure
+         (`target_deps[source_target]`).
+      3. Is NOT in `source_target`'s **direct** manifest-declared
+         dependencies.
+
+    These are the deps SPM needs to discover for the consumer's compile
+    to resolve sibling `.swiftinterface` imports, but doesn't because
+    binary targets are opaque to SPM's source-level dep graph walker.
+    Canonical case: Apple swift-collections — `Collections`'s direct
+    deps are `[BitCollections, ..., _RopeModule]`, all six siblings
+    transitively depend on `InternalCollectionsUtilities` (`kind:
+    .hidden`), and once the siblings become `.binaryTarget`s the
+    `InternalCollectionsUtilities` slice dir never makes it onto
+    `Collections`'s `FRAMEWORK_SEARCH_PATHS`. The fix: augment
+    `Collections`'s `dependencies:` array with the helper name so SPM
+    rediscovers the binary target through the normal dep-walk machinery.
+
+    Returns an empty dict when the unit has no phantom helpers — i.e.
+    every substituted sibling is already a direct dep, or the unit
+    isn't an umbrella. The caller skips the augmentation pass in that
+    case (no-op manifest read avoided).
+    """
+    from ..inspect import _raw_internal_dep_names
+
+    raw_targets_by_name: Dict[str, dict] = {}
+    for raw_t in package.raw_dump.get("targets", []) or []:
+        if isinstance(raw_t, dict):
+            nm = raw_t.get("name")
+            if isinstance(nm, str):
+                raw_targets_by_name[nm] = raw_t
+
+    result: Dict[str, List[str]] = {}
+    for src_t in unit.source_targets:
+        raw_t = raw_targets_by_name.get(src_t)
+        if raw_t is None:
+            continue
+        direct = set(_raw_internal_dep_names(raw_t))
+        transitive = target_deps.get(src_t, set())
+        phantoms = [
+            n for n in sorted(transitive & substituted_target_names)
+            if n not in direct and n != src_t
+        ]
+        if phantoms:
+            result[src_t] = phantoms
+    return result
+
+
+def _apply_phantom_helper_dep_augmentation(
+    *,
+    staged_dir: Path,
+    phantom_helpers: Mapping[str, Sequence[str]],
+    unit_name: str,
+    verbose: bool,
+) -> None:
+    """For each `(source_target, [phantom_name, ...])` pair, append the
+    phantom names to the source target's `dependencies:` array in the
+    active Package.swift.
+
+    No-op (and silent) if `phantom_helpers` is empty. Otherwise reads
+    the active manifest, applies one `edit_augment_target_dependencies`
+    call per source target, writes once at the end. Idempotent: the
+    underlying edit skips already-present entries, so re-running on a
+    manifest with the phantom already declared is a no-op.
+
+    Raises `ExecuteError` if the augmentation fails for a source target
+    that we know is in the manifest — that means our planner's view of
+    the package and the manifest text disagree, which is a hard
+    inconsistency the caller can't recover from without operator
+    intervention.
+    """
+    if not phantom_helpers:
+        return
+    from ..prepare import (
+        _assert_no_unsupported_swift_constructs,
+        _select_active_manifest,
+        edit_augment_target_dependencies,
+    )
+    manifest_path = _select_active_manifest(staged_dir)
+    if not manifest_path.is_file():
+        raise ExecuteError(
+            f"phantom-helper augmentation: cannot read active manifest at "
+            f"{manifest_path} for unit {unit_name!r}"
+        )
+    text = manifest_path.read_text()
+    try:
+        _assert_no_unsupported_swift_constructs(text)
+    except PrepareUserError as exc:
+        raise ExecuteError(
+            f"phantom-helper augmentation failed for unit {unit_name!r}: "
+            f"{exc} Re-run with --no-dedup-overlap to disable the phantom-"
+            f"helper dep injection (and inter-unit binaryTarget rewrite) "
+            f"for this package."
+        ) from exc
+
+    edited = text
+    applied: List[str] = []
+    for src_t, phantoms in phantom_helpers.items():
+        try:
+            new_text = edit_augment_target_dependencies(
+                edited, src_t, list(phantoms)
+            )
+        except PrepareUserError as exc:
+            raise ExecuteError(
+                f"phantom-helper augmentation failed for unit {unit_name!r} "
+                f"target {src_t!r}: {exc}"
+            ) from exc
+        if new_text != edited:
+            applied.append(f"{src_t}: +{','.join(phantoms)}")
+            edited = new_text
+    if edited != text:
+        manifest_path.write_text(edited)
+    if applied:
+        info(
+            f"  {unit_name}: dedup-overlap added phantom helper dep(s) to "
+            f"umbrella target(s): " + "; ".join(applied)
+        )
+    else:
+        verbose_log(
+            verbose,
+            f"  {unit_name}: phantom-helper augmentation no-op (all helper "
+            f"deps already declared)",
         )
 
 

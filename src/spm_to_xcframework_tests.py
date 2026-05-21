@@ -34,6 +34,8 @@ from spm_to_xcframework import *  # noqa: F401,F403 — test convenience
 # `from spm_to_xcframework import *` skips these, so we name them here.
 from spm_to_xcframework import (  # noqa: F401
     _apply_dedup_overlap_substitutions,
+    _apply_phantom_helper_dep_augmentation,
+    _compute_phantom_helper_deps,
     _archive_framework_path,
     _assert_no_unsupported_swift_constructs,
     _balanced_close,
@@ -2079,6 +2081,949 @@ let p = Package(
     twice = edit_replace_with_binary_target(out, "Foo", "/build/Foo.xcframework")
     _assert(out == twice,
             "second edit through dep-ref manifest was not a no-op")
+
+
+SWIFT_COLLECTIONS_WRAPPER_FIXTURE = '''// swift-tools-version:5.7
+import PackageDescription
+
+struct CustomTarget {
+  enum Kind { case exported, hidden, test }
+  static func target(kind: Kind, name: String, dependencies: [Target.Dependency] = []) -> CustomTarget {
+    CustomTarget()
+  }
+  func toTarget() -> Target { Target.target(name: "x") }
+}
+
+let targets: [CustomTarget] = [
+  .target(kind: .exported, name: "BitCollections"),
+  .target(kind: .exported, name: "DequeModule"),
+  .target(kind: .exported, name: "Collections", dependencies: ["BitCollections", "DequeModule"]),
+]
+
+let _targets: [Target] = targets.map { $0.toTarget() }
+
+let package = Package(
+  name: "swift-collections",
+  products: [.library(name: "Collections", targets: ["Collections"])],
+  targets: _targets
+)
+'''
+
+
+def _selftest_overlay_first_call_injects_block_and_wraps_targets_arg() -> None:
+    """[swift-collections] First overlay call on a wrapper-style manifest
+    must (a) inject the sentinel-wrapped overlay block before the
+    Package(...) constructor, (b) wrap the `targets:` argument
+    expression in a filter+append, and (c) NOT mutate the original
+    target literal — the wrapper stays exactly as the package author
+    wrote it."""
+    text = SWIFT_COLLECTIONS_WRAPPER_FIXTURE
+    out = edit_inject_or_extend_overlay_binary_targets(
+        text,
+        [("BitCollections", "./BitCollections.xcframework")],
+    )
+    _assert(
+        "spm-to-xcframework dedup-overlap overlay — begin" in out,
+        f"overlay begin sentinel missing:\n{out}",
+    )
+    _assert(
+        "spm-to-xcframework dedup-overlap overlay — end" in out,
+        f"overlay end sentinel missing:\n{out}",
+    )
+    _assert(
+        'Target.binaryTarget(name: "BitCollections", path: "./BitCollections.xcframework")'
+        in out,
+        f"BitCollections binaryTarget missing in:\n{out}",
+    )
+    _assert(
+        "let _SPM2XC_OVERLAY_TARGETS: [Target] = [" in out,
+        "overlay targets declaration missing",
+    )
+    _assert(
+        "let _SPM2XC_OVERLAY_NAMES: Set<String> = Set(_SPM2XC_OVERLAY_TARGETS.map { $0.name })"
+        in out,
+        "overlay names declaration missing",
+    )
+    _assert(
+        ").filter { !_SPM2XC_OVERLAY_NAMES.contains($0.name) } + _SPM2XC_OVERLAY_TARGETS"
+        in out,
+        f"targets: arg was not wrapped with the filter+append:\n{out}",
+    )
+    # Original wrapper expressions untouched.
+    _assert(
+        '.target(kind: .exported, name: "BitCollections")' in out,
+        "original CustomTarget call for BitCollections was clobbered",
+    )
+    _assert(
+        "targets.map { $0.toTarget() }" in out,
+        "wrapper-driven _targets expression was clobbered",
+    )
+    # Overlay block lands BEFORE the Package(...) line.
+    overlay_idx = out.find("let _SPM2XC_OVERLAY_TARGETS")
+    pkg_idx = out.find("let package = Package(")
+    _assert(
+        0 < overlay_idx < pkg_idx,
+        "overlay block must precede the `let package = Package(...)` statement",
+    )
+
+
+def _selftest_overlay_second_call_extends_block_no_rewrap() -> None:
+    """A subsequent overlay call must (a) find the existing sentinel
+    block and extend its array with new entries, (b) leave the
+    `targets:` wrap alone (one wrap, not two), and (c) preserve
+    earlier entries verbatim."""
+    text = SWIFT_COLLECTIONS_WRAPPER_FIXTURE
+    once = edit_inject_or_extend_overlay_binary_targets(
+        text,
+        [("BitCollections", "./BitCollections.xcframework")],
+    )
+    twice = edit_inject_or_extend_overlay_binary_targets(
+        once,
+        [("DequeModule", "./DequeModule.xcframework")],
+    )
+    # Both entries present in the overlay array.
+    _assert(
+        'Target.binaryTarget(name: "BitCollections", path: "./BitCollections.xcframework")'
+        in twice,
+        "first overlay entry (BitCollections) lost after extension",
+    )
+    _assert(
+        'Target.binaryTarget(name: "DequeModule", path: "./DequeModule.xcframework")'
+        in twice,
+        "second overlay entry (DequeModule) not added",
+    )
+    # Exactly one wrap (the filter+append must NOT be applied twice — a
+    # double wrap would mean nested `.filter { ... }.filter { ... }`).
+    wrap_count = twice.count(".filter { !_SPM2XC_OVERLAY_NAMES.contains($0.name) }")
+    _assert(
+        wrap_count == 1,
+        f"targets: argument was wrapped {wrap_count} times — expected exactly 1",
+    )
+    # Exactly one sentinel pair.
+    _assert(
+        twice.count("spm-to-xcframework dedup-overlap overlay — begin") == 1,
+        "more than one overlay begin sentinel in the manifest",
+    )
+    _assert(
+        twice.count("spm-to-xcframework dedup-overlap overlay — end") == 1,
+        "more than one overlay end sentinel in the manifest",
+    )
+
+
+def _selftest_overlay_idempotent_same_substitution() -> None:
+    """Re-applying the same substitution must be a no-op — the editor
+    parses the existing entries, finds the requested (name, path) pair
+    already present, and returns the manifest unchanged."""
+    text = SWIFT_COLLECTIONS_WRAPPER_FIXTURE
+    once = edit_inject_or_extend_overlay_binary_targets(
+        text,
+        [("BitCollections", "./BitCollections.xcframework")],
+    )
+    twice = edit_inject_or_extend_overlay_binary_targets(
+        once,
+        [("BitCollections", "./BitCollections.xcframework")],
+    )
+    _assert(once == twice, "idempotent re-apply changed the manifest")
+
+
+def _selftest_overlay_last_path_wins_on_collision() -> None:
+    """If the same target appears in successive overlay calls with
+    different paths, the LAST path wins (the dict merge semantics).
+    This shouldn't happen in production — the same xcframework is
+    referenced once per build — but the contract should be
+    deterministic."""
+    text = SWIFT_COLLECTIONS_WRAPPER_FIXTURE
+    once = edit_inject_or_extend_overlay_binary_targets(
+        text, [("BitCollections", "./old.xcframework")]
+    )
+    twice = edit_inject_or_extend_overlay_binary_targets(
+        once, [("BitCollections", "./new.xcframework")]
+    )
+    _assert(
+        'Target.binaryTarget(name: "BitCollections", path: "./new.xcframework")'
+        in twice,
+        "later path didn't replace earlier path on collision",
+    )
+    _assert(
+        "./old.xcframework" not in twice,
+        f"old path survived the collision:\n{twice}",
+    )
+
+
+def _selftest_overlay_sorted_output_is_deterministic() -> None:
+    """The overlay block's entries must render in stable (sorted) order
+    so the audit log and `.original-Package.swift` diff is the same
+    across runs regardless of substitution order."""
+    text = SWIFT_COLLECTIONS_WRAPPER_FIXTURE
+    a_then_b = edit_inject_or_extend_overlay_binary_targets(
+        text,
+        [
+            ("DequeModule", "./Deque.xcframework"),
+            ("BitCollections", "./Bit.xcframework"),
+        ],
+    )
+    b_then_a = edit_inject_or_extend_overlay_binary_targets(
+        text,
+        [
+            ("BitCollections", "./Bit.xcframework"),
+            ("DequeModule", "./Deque.xcframework"),
+        ],
+    )
+    _assert(a_then_b == b_then_a, "overlay output depends on substitution order")
+    # BitCollections sorts before DequeModule.
+    bit_idx = a_then_b.find('name: "BitCollections"')
+    deque_idx = a_then_b.find('name: "DequeModule"')
+    _assert(
+        0 < bit_idx < deque_idx,
+        "overlay entries are not sorted alphabetically by name",
+    )
+
+
+def _selftest_overlay_escapes_path_correctly() -> None:
+    """A path containing characters that break a Swift string literal
+    (backslash, double-quote) must be escaped in the overlay entry —
+    same contract as `edit_replace_with_binary_target`."""
+    text = SWIFT_COLLECTIONS_WRAPPER_FIXTURE
+    nasty = '/tmp/with"quote"/and\\backslash/T.xcframework'
+    out = edit_inject_or_extend_overlay_binary_targets(text, [("BitCollections", nasty)])
+    expected = (
+        r'Target.binaryTarget(name: "BitCollections", '
+        r'path: "/tmp/with\"quote\"/and\\backslash/T.xcframework")'
+    )
+    _assert(
+        expected in out,
+        f"overlay path escaping wrong.\nWanted: {expected}\nGot:\n{out}",
+    )
+
+
+def _selftest_overlay_no_substitutions_no_overlay_is_noop() -> None:
+    """Calling with an empty substitution list AND no existing overlay
+    must return the manifest unchanged — there's nothing to do."""
+    text = SWIFT_COLLECTIONS_WRAPPER_FIXTURE
+    out = edit_inject_or_extend_overlay_binary_targets(text, [])
+    _assert(out == text, "empty-substitution call mutated the manifest")
+
+
+def _selftest_overlay_missing_targets_arg_raises() -> None:
+    """A manifest without a top-level `targets:` argument can't be
+    overlay-edited — raise loudly so the caller knows the fallback
+    path doesn't apply."""
+    src = '''import PackageDescription
+let package = Package(name: "x", products: [], dependencies: [])
+'''
+    raised = False
+    try:
+        edit_inject_or_extend_overlay_binary_targets(
+            src, [("Foo", "./Foo.xcframework")]
+        )
+    except PrepareUserError:
+        raised = True
+    _assert(raised, "expected PrepareUserError when targets: arg is absent")
+
+
+def _selftest_overlay_resulting_manifest_only_one_set_decl() -> None:
+    """The overlay block's `let _SPM2XC_OVERLAY_NAMES = Set(...)`
+    declaration must appear exactly once even after several extension
+    calls. (Double declaration would be a Swift compile error.)"""
+    text = SWIFT_COLLECTIONS_WRAPPER_FIXTURE
+    out = text
+    for i, name in enumerate(["A", "B", "C", "D", "E"]):
+        out = edit_inject_or_extend_overlay_binary_targets(
+            out, [(name, f"./{name}.xcframework")]
+        )
+    _assert(
+        out.count("let _SPM2XC_OVERLAY_NAMES: Set<String> = Set(") == 1,
+        f"overlay names declaration appeared more than once across 5 calls:\n{out}",
+    )
+    _assert(
+        out.count("let _SPM2XC_OVERLAY_TARGETS: [Target] = [") == 1,
+        f"overlay targets declaration appeared more than once:\n{out}",
+    )
+
+
+def _selftest_dedup_routes_wrapper_manifest_through_overlay(tmp_root: Path) -> None:
+    """End-to-end through `_apply_dedup_overlap_substitutions`: when
+    the manifest matches `_manifest_uses_custom_target_wrapper_text`,
+    the dedup applier must NOT call `edit_replace_with_binary_target`
+    (which would try and fail to rewrite `CustomTarget.target(...)`
+    calls) and instead route through the overlay edit. Verifies the
+    Execute-level dispatch."""
+    staged = tmp_root / "dedup-routes-wrapper"
+    staged.mkdir(parents=True, exist_ok=True)
+    manifest = staged / "Package.swift"
+    manifest.write_text(SWIFT_COLLECTIONS_WRAPPER_FIXTURE)
+    # Concoct a fake xcframework path the relpath logic can resolve.
+    xcfw = tmp_root / "BitCollections.xcframework"
+    xcfw.mkdir(parents=True, exist_ok=True)
+    _apply_dedup_overlap_substitutions(
+        staged_dir=staged,
+        substitutions=[("BitCollections", xcfw)],
+        unit_name="BitCollections",
+        verbose=False,
+    )
+    out = manifest.read_text()
+    _assert(
+        "spm-to-xcframework dedup-overlap overlay — begin" in out,
+        f"wrapper manifest was not routed through the overlay edit:\n{out}",
+    )
+    _assert(
+        "let _SPM2XC_OVERLAY_TARGETS" in out,
+        "overlay var was not injected by the dedup router",
+    )
+    _assert(
+        '.target(kind: .exported, name: "BitCollections")' in out,
+        "wrapper call for BitCollections was unexpectedly rewritten",
+    )
+
+
+# --- Phantom-helper dep augmentation (swift-collections InternalCollectionsUtilities)
+
+
+def _selftest_augment_target_deps_appends_to_nonempty_array() -> None:
+    """[swift-collections phantom-helper] Happy path: the umbrella's
+    `dependencies:` array already lists some direct deps, and the
+    augmentation appends new string-literal entries with the leading
+    comma supplied. The existing entries must remain verbatim and the
+    appended entry lands inside the same `[...]`."""
+    src = '''// swift-tools-version:5.7
+import PackageDescription
+
+let package = Package(
+    name: "swift-collections",
+    products: [.library(name: "Collections", targets: ["Collections"])],
+    targets: [
+        .target(name: "BitCollections"),
+        .target(name: "DequeModule"),
+        .target(
+            name: "Collections",
+            dependencies: ["BitCollections", "DequeModule"]
+        ),
+    ]
+)
+'''
+    out = edit_augment_target_dependencies(
+        src, "Collections", ["InternalCollectionsUtilities"]
+    )
+    _assert(
+        '"BitCollections", "DequeModule", "InternalCollectionsUtilities"' in out,
+        f"augmented deps array missing the new entry:\n{out}",
+    )
+    # No new array introduced, the call body otherwise unchanged.
+    _assert(out.count("dependencies:") == 1,
+            "augmentation added a second dependencies: label")
+    _assert(out.count('.target(\n            name: "Collections",') == 1,
+            "Collections target call was duplicated")
+
+
+def _selftest_augment_target_deps_idempotent() -> None:
+    """[swift-collections phantom-helper] Re-running the augmentation
+    with the same `extra_dep_names` must be a no-op once the entries
+    are already present as quoted string literals."""
+    src = '''// swift-tools-version:5.7
+import PackageDescription
+let package = Package(
+    name: "p",
+    targets: [
+        .target(name: "Umbrella", dependencies: ["Helper"]),
+    ]
+)
+'''
+    once = edit_augment_target_dependencies(src, "Umbrella", ["Helper"])
+    _assert(once == src, "augmentation should be a no-op when entry exists")
+
+    twice = edit_augment_target_dependencies(src, "Umbrella", ["NewDep"])
+    thrice = edit_augment_target_dependencies(twice, "Umbrella", ["NewDep"])
+    _assert(twice == thrice,
+            f"second run with same entry should be a no-op\nonce:\n{twice}\ntwice:\n{thrice}")
+    _assert('"Helper", "NewDep"' in twice,
+            f"new entry not appended to single-entry array:\n{twice}")
+
+
+def _selftest_augment_target_deps_empty_array() -> None:
+    """[swift-collections phantom-helper] If the existing `dependencies:`
+    array is empty (`[]`), the entries get spliced in without a leading
+    comma — Swift would reject `[, "X"]`."""
+    src = '''// swift-tools-version:5.7
+let package = Package(
+    name: "p",
+    targets: [
+        .target(name: "Umbrella", dependencies: []),
+    ]
+)
+'''
+    out = edit_augment_target_dependencies(src, "Umbrella", ["A", "B"])
+    _assert(
+        'dependencies: ["A", "B"]' in out,
+        f"empty-array splice produced wrong shape:\n{out}",
+    )
+
+
+def _selftest_augment_target_deps_trailing_comma_array() -> None:
+    """[swift-collections phantom-helper] If the existing array ends with
+    a trailing comma (`["A",]`), the augmentation preserves the comma
+    structure (`["A", B,"]`-style is wrong; should be `["A", "B",]`).
+    Swift accepts the second trailing comma; what matters is no double-
+    comma and no missing separator."""
+    src = '''// swift-tools-version:5.7
+let package = Package(
+    name: "p",
+    targets: [
+        .target(
+            name: "Umbrella",
+            dependencies: [
+                "A",
+            ]
+        ),
+    ]
+)
+'''
+    out = edit_augment_target_dependencies(src, "Umbrella", ["B"])
+    # The splice should produce `"A", "B",` — separator commas correct,
+    # no double-comma, the trailing comma preserved.
+    _assert('"A", "B",' in out,
+            f"trailing-comma splice produced wrong shape:\n{out}")
+    _assert(",," not in out.replace(",,)", ""),  # ignore unrelated patterns
+            f"double comma in augmented manifest:\n{out}")
+
+
+def _selftest_augment_target_deps_trailing_line_comment() -> None:
+    """[Codex/Grok r1 HIGH] Regression: when a `//` line comment sits
+    between the last element and `]`, the splice MUST NOT land inside
+    the comment. Without the comment-stripped tail scan, the inserted
+    literal ends up as dead code inside the comment (`// note, "B"`).
+    """
+    src = '''// swift-tools-version:5.7
+let package = Package(
+    name: "p",
+    targets: [
+        .target(name: "Umbrella", dependencies: [
+            "A", // important note
+        ]),
+    ]
+)
+'''
+    out = edit_augment_target_dependencies(src, "Umbrella", ["B"])
+    # Phantom landed BEFORE the comment, not inside it.
+    _assert('"A", "B",' in out,
+            f"splice didn't land before the trailing line comment:\n{out}")
+    _assert('// important note, "B"' not in out,
+            f"splice landed INSIDE the // comment:\n{out}")
+    _assert('// important note, "B",' not in out,
+            f"splice landed INSIDE the // comment:\n{out}")
+    # Original comment text is preserved verbatim.
+    _assert('// important note' in out,
+            f"original line comment was clobbered:\n{out}")
+
+
+def _selftest_augment_target_deps_trailing_block_comment() -> None:
+    """[Codex/Grok r1 HIGH] Regression: a `/* */` block comment between
+    the last element and `]` similarly fooled the splice. Without the
+    fix, `["A", /* note */]` would become `["A", /* note */, "B"]` —
+    Swift sees `["A", , "B"]` after comment stripping, which is
+    invalid (empty array element)."""
+    src = '''// swift-tools-version:5.7
+let package = Package(
+    name: "p",
+    targets: [
+        .target(name: "Umbrella", dependencies: [
+            "A", /* keep A */
+        ]),
+    ]
+)
+'''
+    out = edit_augment_target_dependencies(src, "Umbrella", ["B"])
+    # Splice lands BEFORE the block comment.
+    _assert('"A", "B",' in out,
+            f"splice didn't land before the trailing block comment:\n{out}")
+    # No double-comma anywhere (no `,/* keep A */, "B"` shape).
+    _assert(', /* keep A */, "B"' not in out,
+            f"splice produced an empty array element via double comma:\n{out}")
+    # Original block comment is preserved.
+    _assert('/* keep A */' in out,
+            f"original block comment was clobbered:\n{out}")
+
+
+def _selftest_augment_target_deps_comment_only_interior() -> None:
+    """[Codex/Grok r1] Defensive: an array whose only content is a
+    comment is, semantically, an empty array. Splicing should treat
+    it as such — produce a clean array literal with just the new
+    entries (no spurious leading comma before the comment)."""
+    src = '''// swift-tools-version:5.7
+let package = Package(
+    name: "p",
+    targets: [
+        .target(name: "Umbrella", dependencies: [/* nothing yet */]),
+    ]
+)
+'''
+    out = edit_augment_target_dependencies(src, "Umbrella", ["B"])
+    # The comment is preserved; the splice landed after `[` (empty-array
+    # shape) so the result is well-formed Swift.
+    _assert('/* nothing yet */' in out,
+            f"original comment was clobbered:\n{out}")
+    _assert('"B"' in out,
+            f"phantom dep not appended:\n{out}")
+    # No leading comma before our entry — Swift rejects [, "B"].
+    _assert('[, "B"' not in out and '[ , "B"' not in out,
+            f"splice produced a leading-comma shape:\n{out}")
+
+
+def _selftest_augment_target_deps_empty_extras_is_noop() -> None:
+    """[swift-collections phantom-helper] `extra_dep_names=[]` returns
+    the manifest unchanged without even locating the target call —
+    cheapest possible path on the common case where this unit has no
+    phantom helpers to inject."""
+    src = '''// swift-tools-version:5.7
+let package = Package(name: "p", targets: [.target(name: "T")])
+'''
+    out = edit_augment_target_dependencies(src, "T", [])
+    _assert(out == src, "empty extras should return unchanged manifest")
+
+
+def _selftest_augment_target_deps_missing_target_raises() -> None:
+    """[swift-collections phantom-helper] A target name that doesn't
+    match any `.target(name: ...)` decl raises PrepareUserError — the
+    caller's planner-vs-manifest view is out of sync, and silently
+    skipping would leave the consumer's build broken."""
+    src = '''// swift-tools-version:5.7
+let package = Package(
+    name: "p",
+    targets: [.target(name: "Real", dependencies: [])]
+)
+'''
+    try:
+        edit_augment_target_dependencies(src, "Missing", ["Phantom"])
+    except PrepareUserError as exc:
+        _assert("no `.target(name: 'Missing'" in str(exc),
+                f"unexpected error message: {exc!r}")
+        return
+    raise AssertionError("expected PrepareUserError for missing target")
+
+
+def _selftest_augment_target_deps_no_deps_arg_raises() -> None:
+    """[swift-collections phantom-helper] A target with no
+    `dependencies:` arg at all raises — the augmentation needs an
+    existing array to splice into; synthesizing the whole argument is
+    a different (and currently unimplemented) operation."""
+    src = '''// swift-tools-version:5.7
+let package = Package(
+    name: "p",
+    targets: [.target(name: "Bare", path: "Sources/Bare")]
+)
+'''
+    try:
+        edit_augment_target_dependencies(src, "Bare", ["X"])
+    except PrepareUserError as exc:
+        _assert("no top-level `dependencies:`" in str(exc),
+                f"unexpected error message: {exc!r}")
+        return
+    raise AssertionError("expected PrepareUserError for missing dependencies: arg")
+
+
+def _selftest_augment_target_deps_non_array_raises() -> None:
+    """[swift-collections phantom-helper] If `dependencies:` is bound
+    to an identifier (`dependencies: helperList`) rather than a literal
+    array, the augmentation refuses to mutate it. Splicing into a
+    name-bound expression would require synthesizing a new top-level
+    binding, which is out of scope for this edit."""
+    src = '''// swift-tools-version:5.7
+let helperList: [Target.Dependency] = ["A"]
+let package = Package(
+    name: "p",
+    targets: [.target(name: "T", dependencies: helperList)]
+)
+'''
+    try:
+        edit_augment_target_dependencies(src, "T", ["B"])
+    except PrepareUserError as exc:
+        _assert("not an array literal" in str(exc),
+                f"unexpected error message: {exc!r}")
+        return
+    raise AssertionError("expected PrepareUserError for non-array deps expression")
+
+
+def _selftest_augment_target_deps_wrapper_style_manifest() -> None:
+    """[swift-collections phantom-helper] On the wrapper-style manifest
+    (`CustomTarget.target(name:, dependencies:, ...)`), the regex
+    `\\.(target|executableTarget|testTarget)\\s*\\(` matches the
+    wrapper call too. The augmentation must splice the phantom into
+    the wrapper's `dependencies:` array — Apple's swift-collections
+    canonical case. The wrapper field is `[Target.Dependency]`-typed
+    and forwards verbatim to `Target.target(dependencies:)` via
+    `.toTarget()`."""
+    out = edit_augment_target_dependencies(
+        SWIFT_COLLECTIONS_WRAPPER_FIXTURE,
+        "Collections",
+        ["InternalCollectionsUtilities"],
+    )
+    _assert(
+        '"BitCollections", "DequeModule", "InternalCollectionsUtilities"' in out,
+        f"wrapper-style augmentation didn't land:\n{out}",
+    )
+    # Sibling wrapper calls (BitCollections / DequeModule) must remain
+    # untouched — the finder targeted exactly the Collections call.
+    _assert(
+        '.target(kind: .exported, name: "BitCollections")' in out,
+        "BitCollections wrapper call was unexpectedly mutated",
+    )
+    _assert(
+        '.target(kind: .exported, name: "DequeModule")' in out,
+        "DequeModule wrapper call was unexpectedly mutated",
+    )
+
+
+def _selftest_compute_phantom_helper_deps_basic() -> None:
+    """[swift-collections phantom-helper] The classic case: umbrella
+    `Collections` directly depends on `[BitCollections, DequeModule]`;
+    both transitively depend on `InternalCollectionsUtilities`; the
+    helper is being binary-substituted (it's in `substituted_target_names`);
+    the helper is NOT in `Collections`'s direct deps. Result:
+    `{Collections: [InternalCollectionsUtilities]}`.
+    """
+    BU = tool.BuildUnit
+    umbrella = BU(name="Collections", scheme="Collections",
+                  framework_name="Collections", language="Swift",
+                  archive_strategy="archive", source_targets=["Collections"])
+    raw = {
+        "targets": [
+            {"name": "Collections", "type": "regular",
+             "dependencies": [{"byName": ["BitCollections", None]},
+                              {"byName": ["DequeModule", None]}]},
+            {"name": "BitCollections", "type": "regular",
+             "dependencies": [{"byName": ["InternalCollectionsUtilities", None]}]},
+            {"name": "DequeModule", "type": "regular",
+             "dependencies": [{"byName": ["InternalCollectionsUtilities", None]}]},
+            {"name": "InternalCollectionsUtilities", "type": "regular",
+             "dependencies": []},
+        ]
+    }
+    pkg = tool.Package(
+        name="swift-collections", tools_version="5.7",
+        platforms=[], products=[], targets=[], schemes=[],
+        raw_dump=raw, staged_dir=Path("/tmp/fake"),
+    )
+    target_deps = {
+        "Collections": {"BitCollections", "DequeModule",
+                        "InternalCollectionsUtilities"},
+        "BitCollections": {"InternalCollectionsUtilities"},
+        "DequeModule": {"InternalCollectionsUtilities"},
+        "InternalCollectionsUtilities": set(),
+    }
+    result = _compute_phantom_helper_deps(
+        unit=umbrella, package=pkg,
+        substituted_target_names={"BitCollections", "DequeModule",
+                                  "InternalCollectionsUtilities"},
+        target_deps=target_deps,
+    )
+    _assert(
+        result == {"Collections": ["InternalCollectionsUtilities"]},
+        f"expected phantom InternalCollectionsUtilities only, got {result!r}",
+    )
+
+
+def _selftest_compute_phantom_helper_deps_skips_direct() -> None:
+    """[swift-collections phantom-helper] If the would-be phantom is
+    already in the umbrella's DIRECT deps, the augmentation is
+    unnecessary — SPM already adds the slice dir through the normal
+    binary-target dep walk. The phantom list comes back empty for that
+    unit (and the result dict is empty)."""
+    BU = tool.BuildUnit
+    umbrella = BU(name="Top", scheme="Top",
+                  framework_name="Top", language="Swift",
+                  archive_strategy="archive", source_targets=["Top"])
+    raw = {
+        "targets": [
+            {"name": "Top", "type": "regular",
+             "dependencies": [{"byName": ["Helper", None]}]},
+            {"name": "Helper", "type": "regular", "dependencies": []},
+        ]
+    }
+    pkg = tool.Package(
+        name="p", tools_version="5.7",
+        platforms=[], products=[], targets=[], schemes=[],
+        raw_dump=raw, staged_dir=Path("/tmp/fake"),
+    )
+    target_deps = {"Top": {"Helper"}, "Helper": set()}
+    result = _compute_phantom_helper_deps(
+        unit=umbrella, package=pkg,
+        substituted_target_names={"Helper"},
+        target_deps=target_deps,
+    )
+    _assert(result == {},
+            f"helper that's already a direct dep must not be a phantom, got {result!r}")
+
+
+def _selftest_compute_phantom_helper_deps_only_substituted_count() -> None:
+    """[swift-collections phantom-helper] A transitive dep that isn't
+    being substituted (not in `substituted_target_names`) doesn't
+    become a phantom — SPM's source-level dep walker handles those
+    natively. Only substituted siblings need the explicit re-listing."""
+    BU = tool.BuildUnit
+    umbrella = BU(name="Umb", scheme="Umb",
+                  framework_name="Umb", language="Swift",
+                  archive_strategy="archive", source_targets=["Umb"])
+    raw = {
+        "targets": [
+            {"name": "Umb", "type": "regular",
+             "dependencies": [{"byName": ["A", None]}]},
+            {"name": "A", "type": "regular",
+             "dependencies": [{"byName": ["B", None]}]},
+            {"name": "B", "type": "regular", "dependencies": []},
+        ]
+    }
+    pkg = tool.Package(
+        name="p", tools_version="5.7",
+        platforms=[], products=[], targets=[], schemes=[],
+        raw_dump=raw, staged_dir=Path("/tmp/fake"),
+    )
+    target_deps = {"Umb": {"A", "B"}, "A": {"B"}, "B": set()}
+    # Only A is substituted; B is reachable but stays source-built.
+    result = _compute_phantom_helper_deps(
+        unit=umbrella, package=pkg,
+        substituted_target_names={"A"},
+        target_deps=target_deps,
+    )
+    _assert(result == {},
+            f"non-substituted transitive must not be a phantom, got {result!r}")
+
+
+def _selftest_compute_phantom_helper_deps_skips_self() -> None:
+    """[swift-collections phantom-helper] Defensive: a target's name in
+    its own transitive closure (would only happen if `target_deps`
+    were ever to include `T → T`) must never be returned as a phantom
+    — splicing T into its own dep array would create a cycle SPM
+    rejects at resolve time."""
+    BU = tool.BuildUnit
+    umbrella = BU(name="Self", scheme="Self",
+                  framework_name="Self", language="Swift",
+                  archive_strategy="archive", source_targets=["Self"])
+    raw = {
+        "targets": [
+            {"name": "Self", "type": "regular", "dependencies": []},
+        ]
+    }
+    pkg = tool.Package(
+        name="p", tools_version="5.7",
+        platforms=[], products=[], targets=[], schemes=[],
+        raw_dump=raw, staged_dir=Path("/tmp/fake"),
+    )
+    # Pathological: Self appears as a transitive dep of itself.
+    target_deps = {"Self": {"Self"}}
+    result = _compute_phantom_helper_deps(
+        unit=umbrella, package=pkg,
+        substituted_target_names={"Self"},
+        target_deps=target_deps,
+    )
+    _assert(result == {},
+            f"self-dep must never be returned as a phantom, got {result!r}")
+
+
+def _selftest_apply_phantom_helper_dep_augmentation_e2e(tmp_root: Path) -> None:
+    """[swift-collections phantom-helper] End-to-end through
+    `_apply_phantom_helper_dep_augmentation`: write the wrapper-style
+    fixture to a staged manifest, call the applier with
+    `{Collections: ['InternalCollectionsUtilities']}`, and verify the
+    on-disk manifest now has the phantom in Collections's deps array."""
+    staged = tmp_root / "phantom-helper-e2e"
+    staged.mkdir(parents=True, exist_ok=True)
+    manifest = staged / "Package.swift"
+    manifest.write_text(SWIFT_COLLECTIONS_WRAPPER_FIXTURE)
+    _apply_phantom_helper_dep_augmentation(
+        staged_dir=staged,
+        phantom_helpers={"Collections": ["InternalCollectionsUtilities"]},
+        unit_name="Collections",
+        verbose=False,
+    )
+    out = manifest.read_text()
+    _assert(
+        '"BitCollections", "DequeModule", "InternalCollectionsUtilities"' in out,
+        f"phantom helper wasn't appended to Collections deps array:\n{out}",
+    )
+
+    # Idempotent: re-applying must not double-append.
+    _apply_phantom_helper_dep_augmentation(
+        staged_dir=staged,
+        phantom_helpers={"Collections": ["InternalCollectionsUtilities"]},
+        unit_name="Collections",
+        verbose=False,
+    )
+    out2 = manifest.read_text()
+    _assert(out == out2,
+            f"second call should be a no-op\nfirst:\n{out}\nsecond:\n{out2}")
+
+
+def _selftest_apply_phantom_helper_dep_augmentation_empty_is_noop(tmp_root: Path) -> None:
+    """[swift-collections phantom-helper] An empty `phantom_helpers`
+    dict short-circuits before any manifest I/O — the applier never
+    touches the staged_dir. The fixture file's mtime is the canary."""
+    staged = tmp_root / "phantom-helper-empty"
+    staged.mkdir(parents=True, exist_ok=True)
+    # Deliberately leave the dir empty — no Package.swift. If the applier
+    # tried to read one, it would raise ExecuteError; passing here proves
+    # the empty-input branch never touched the filesystem.
+    _apply_phantom_helper_dep_augmentation(
+        staged_dir=staged,
+        phantom_helpers={},
+        unit_name="N/A",
+        verbose=False,
+    )
+
+
+# --- _auto_synth_sibling_units language gate (WCDB regression) -------------
+
+
+def _auto_synth_pkg(
+    *,
+    umbrella_target: str,
+    sibling_target: str,
+    sibling_language: str,
+    sibling_settings: Optional[List[dict]] = None,
+) -> "tool.Package":
+    """Construct a minimal tool.Package that exercises
+    `_auto_synth_sibling_units`'s internal-helper branch: one umbrella
+    target with a public `.library` product, plus one internal sibling
+    helper that the umbrella depends on. The sibling has no product
+    wrapper, so the auto-synth logic decides whether to promote it.
+    """
+    raw = {
+        "name": "p",
+        "toolsVersion": {"_version": "5.7"},
+        "platforms": [],
+        "products": [
+            {"name": umbrella_target,
+             "type": {"library": ["automatic"]},
+             "targets": [umbrella_target]},
+        ],
+        "targets": [
+            {"name": umbrella_target, "type": "regular", "path": None,
+             "publicHeadersPath": None,
+             "dependencies": [{"byName": [sibling_target, None]}]},
+            {"name": sibling_target, "type": "regular", "path": None,
+             "publicHeadersPath": None,
+             "dependencies": [],
+             "settings": sibling_settings or []},
+        ],
+    }
+    raw_, products, targets, platforms, name, tv = _parse_dump(raw)
+    # `_parse_dump` doesn't fill the language field (that's a separate
+    # disk scan pass). Stamp the sibling's language to whatever the
+    # test wants so the auto-synth gate sees the right value.
+    for t in targets:
+        if t.name == sibling_target:
+            t.language = sibling_language
+    return tool.Package(
+        name=name, tools_version=tv, platforms=platforms,
+        products=products, targets=targets, schemes=[],
+        raw_dump=raw_, staged_dir=Path("/tmp/auto-synth-fixture"),
+    )
+
+
+def _auto_synth_seed_plan(umbrella_target: str) -> "tool.Plan":
+    """Seed a Plan with one BuildUnit for the umbrella target — the
+    same shape the regular planner produces before
+    `_auto_synth_sibling_units` runs."""
+    plan = tool.Plan()
+    plan.build_units.append(
+        tool.BuildUnit(
+            name=umbrella_target, scheme=umbrella_target,
+            framework_name=umbrella_target, language="Swift",
+            archive_strategy="archive",
+            source_targets=[umbrella_target],
+        )
+    )
+    return plan
+
+
+def _selftest_auto_synth_promotes_swift_internal_helper() -> None:
+    """[swift-collections regression] A Swift-language internal helper
+    with no public product and no linker settings of its own MUST be
+    auto-promoted to its own xcframework. Without promotion, the
+    helper's symbols stay locked inside the umbrella binary, and any
+    sibling that emits `import <Helper>` in its `.swiftinterface`
+    fails to resolve the module at consumer build time.
+    """
+    pkg = _auto_synth_pkg(
+        umbrella_target="Collections",
+        sibling_target="InternalCollectionsUtilities",
+        sibling_language=tool.Language.SWIFT,
+    )
+    plan = _auto_synth_seed_plan("Collections")
+    tool._auto_synth_sibling_units(plan, pkg, taken_product_names=set())
+    names = [bu.name for bu in plan.build_units]
+    _assert("InternalCollectionsUtilities" in names,
+            f"Swift helper should be auto-promoted; build_units={names!r}")
+    # An accompanying synth_library edit must be queued too — without
+    # it, the planner produces a unit Execute can't resolve.
+    kinds = [(e.kind, e.product_name) for e in plan.package_swift_edits]
+    _assert(("synth_library", "InternalCollectionsUtilities") in kinds,
+            f"missing synth_library edit for the helper; edits={kinds!r}")
+
+
+def _selftest_auto_synth_skips_objc_internal_helper() -> None:
+    """[WCDB regression — primary] An ObjC-language internal helper
+    with no public product and no linker settings of its own must NOT
+    be auto-promoted. ObjC siblings (canonical: WCDB's `bridge`,
+    `common`, `objc-core`) call into CoreFoundation but the
+    `.linkedFramework("CoreFoundation")` lives on the UMBRELLA target's
+    settings. Building standalone as a `.library(type: .dynamic)`
+    fails at link with `Undefined symbol: _CFAllocatorGetDefault`.
+    The umbrella keeps statically embedding it (pre-auto-synth
+    default), and `--target bridge` remains the explicit opt-in.
+    """
+    pkg = _auto_synth_pkg(
+        umbrella_target="WCDBSwift",
+        sibling_target="bridge",
+        sibling_language=tool.Language.OBJC,
+    )
+    plan = _auto_synth_seed_plan("WCDBSwift")
+    tool._auto_synth_sibling_units(plan, pkg, taken_product_names=set())
+    names = [bu.name for bu in plan.build_units]
+    _assert("bridge" not in names,
+            f"ObjC helper must NOT be auto-promoted; build_units={names!r}")
+    kinds = [(e.kind, e.product_name) for e in plan.package_swift_edits]
+    _assert(("synth_library", "bridge") not in kinds,
+            f"ObjC helper edit leaked into plan; edits={kinds!r}")
+
+
+def _selftest_auto_synth_skips_mixed_internal_helper() -> None:
+    """[WCDB regression — defense in depth] A Mixed-language (Swift +
+    ObjC) internal helper is treated as ObjC for safety: the ObjC
+    parts almost certainly rely on the umbrella's link context the
+    same way pure-ObjC helpers do. Skip — only PURE Swift gets the
+    auto-promote benefit."""
+    pkg = _auto_synth_pkg(
+        umbrella_target="Top",
+        sibling_target="MixedHelper",
+        sibling_language=tool.Language.MIXED,
+    )
+    plan = _auto_synth_seed_plan("Top")
+    tool._auto_synth_sibling_units(plan, pkg, taken_product_names=set())
+    names = [bu.name for bu in plan.build_units]
+    _assert("MixedHelper" not in names,
+            f"Mixed helper must NOT be auto-promoted; build_units={names!r}")
+
+
+def _selftest_auto_synth_skips_swift_with_explicit_linker_settings() -> None:
+    """[WCDB regression — secondary] Even a Swift helper that declares
+    its own `.linkedFramework(...)` is suspect — the declaration is
+    a signal the target needs link-time context that may or may not
+    be self-contained. Skip on the side of correctness; the user can
+    still pass `--target T` for explicit opt-in."""
+    pkg = _auto_synth_pkg(
+        umbrella_target="Top",
+        sibling_target="SwiftWithLink",
+        sibling_language=tool.Language.SWIFT,
+        sibling_settings=[
+            {"tool": "linker",
+             "kind": {"linkedFramework": ["Security"]}},
+        ],
+    )
+    plan = _auto_synth_seed_plan("Top")
+    tool._auto_synth_sibling_units(plan, pkg, taken_product_names=set())
+    names = [bu.name for bu in plan.build_units]
+    _assert("SwiftWithLink" not in names,
+            "Swift helper with explicit linker settings must NOT be "
+            f"auto-promoted; build_units={names!r}")
 
 
 def _selftest_find_target_call_for_name_ignores_commented_calls() -> None:
@@ -8302,6 +9247,70 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          _selftest_find_target_call_for_name_ignores_dependency_target_refs, False),
         ("dedup-overlap [Codex P1]: edit_replace doesn't clobber sibling that references the target in deps",
          _selftest_edit_replace_with_binary_target_dep_ref_does_not_clobber_sibling, False),
+        ("dedup-overlap overlay [swift-collections]: first call injects block + wraps targets: arg",
+         _selftest_overlay_first_call_injects_block_and_wraps_targets_arg, False),
+        ("dedup-overlap overlay [swift-collections]: second call extends block, no re-wrap",
+         _selftest_overlay_second_call_extends_block_no_rewrap, False),
+        ("dedup-overlap overlay: idempotent for repeated substitution",
+         _selftest_overlay_idempotent_same_substitution, False),
+        ("dedup-overlap overlay: last path wins on name collision",
+         _selftest_overlay_last_path_wins_on_collision, False),
+        ("dedup-overlap overlay: sorted output is deterministic across substitution orders",
+         _selftest_overlay_sorted_output_is_deterministic, False),
+        ("dedup-overlap overlay: path-literal escaping (backslash + quote)",
+         _selftest_overlay_escapes_path_correctly, False),
+        ("dedup-overlap overlay: empty substitutions + no overlay is a no-op",
+         _selftest_overlay_no_substitutions_no_overlay_is_noop, False),
+        ("dedup-overlap overlay: missing top-level targets: argument raises",
+         _selftest_overlay_missing_targets_arg_raises, False),
+        ("dedup-overlap overlay: only ONE Set/array decl after 5 extension calls",
+         _selftest_overlay_resulting_manifest_only_one_set_decl, False),
+        ("dedup-overlap routing: wrapper-style manifest routed through overlay edit",
+         lambda: _selftest_dedup_routes_wrapper_manifest_through_overlay(tmp_root), False),
+        ("phantom-helper: edit_augment_target_dependencies appends to nonempty array",
+         _selftest_augment_target_deps_appends_to_nonempty_array, False),
+        ("phantom-helper: edit_augment_target_dependencies is idempotent",
+         _selftest_augment_target_deps_idempotent, False),
+        ("phantom-helper: edit_augment_target_dependencies splices into empty array",
+         _selftest_augment_target_deps_empty_array, False),
+        ("phantom-helper: edit_augment_target_dependencies preserves trailing comma",
+         _selftest_augment_target_deps_trailing_comma_array, False),
+        ("phantom-helper [Codex/Grok r1 HIGH]: splice lands before trailing // line comment",
+         _selftest_augment_target_deps_trailing_line_comment, False),
+        ("phantom-helper [Codex/Grok r1 HIGH]: splice lands before trailing /* */ block comment",
+         _selftest_augment_target_deps_trailing_block_comment, False),
+        ("phantom-helper [Codex/Grok r1]: splice on comment-only interior treats as empty array",
+         _selftest_augment_target_deps_comment_only_interior, False),
+        ("phantom-helper: edit_augment_target_dependencies empty extras is a no-op",
+         _selftest_augment_target_deps_empty_extras_is_noop, False),
+        ("phantom-helper: edit_augment_target_dependencies raises on missing target",
+         _selftest_augment_target_deps_missing_target_raises, False),
+        ("phantom-helper: edit_augment_target_dependencies raises on missing deps arg",
+         _selftest_augment_target_deps_no_deps_arg_raises, False),
+        ("phantom-helper: edit_augment_target_dependencies raises on non-array deps",
+         _selftest_augment_target_deps_non_array_raises, False),
+        ("phantom-helper: edit_augment_target_dependencies handles wrapper-style manifest",
+         _selftest_augment_target_deps_wrapper_style_manifest, False),
+        ("phantom-helper: _compute_phantom_helper_deps finds basic InternalCollectionsUtilities case",
+         _selftest_compute_phantom_helper_deps_basic, False),
+        ("phantom-helper: _compute_phantom_helper_deps skips already-direct deps",
+         _selftest_compute_phantom_helper_deps_skips_direct, False),
+        ("phantom-helper: _compute_phantom_helper_deps requires substitution",
+         _selftest_compute_phantom_helper_deps_only_substituted_count, False),
+        ("phantom-helper: _compute_phantom_helper_deps never returns self",
+         _selftest_compute_phantom_helper_deps_skips_self, False),
+        ("phantom-helper: _apply_phantom_helper_dep_augmentation end-to-end on staged manifest",
+         lambda: _selftest_apply_phantom_helper_dep_augmentation_e2e(tmp_root), False),
+        ("phantom-helper: _apply_phantom_helper_dep_augmentation empty input is no-op (no FS access)",
+         lambda: _selftest_apply_phantom_helper_dep_augmentation_empty_is_noop(tmp_root), False),
+        ("auto-synth-sibling-units: promotes Swift internal helper (swift-collections)",
+         _selftest_auto_synth_promotes_swift_internal_helper, False),
+        ("auto-synth-sibling-units: skips ObjC internal helper (WCDB regression)",
+         _selftest_auto_synth_skips_objc_internal_helper, False),
+        ("auto-synth-sibling-units: skips Mixed-language internal helper",
+         _selftest_auto_synth_skips_mixed_internal_helper, False),
+        ("auto-synth-sibling-units: skips Swift helper with explicit linker settings",
+         _selftest_auto_synth_skips_swift_with_explicit_linker_settings, False),
         ("dedup-overlap [Codex P2 r2]: _find_target_call_for_name skips commented-out target decls",
          _selftest_find_target_call_for_name_ignores_commented_calls, False),
         ("dedup-overlap [Codex P2 r2]: _has_binary_target_with_name skips commented-out binary target decls",

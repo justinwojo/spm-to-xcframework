@@ -23,7 +23,7 @@ from __future__ import annotations
 import re
 import subprocess
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from .errors import InspectError, PrepareBug, PrepareUserError
 from .inspect import dump_package
@@ -573,6 +573,19 @@ def _has_binary_target_with_name(text: str, target_name: str) -> bool:
 
 _PACKAGE_CALL_RE = re.compile(r"\bPackage\s*\(")
 _PRODUCTS_LABEL_RE = re.compile(r"\bproducts\s*:")
+_TARGETS_LABEL_RE = re.compile(r"\btargets\s*:")
+_OVERLAY_BINARY_TARGET_RE = re.compile(r"\bTarget\s*\.\s*binaryTarget\s*\(")
+
+# Sentinel comments wrap the auto-generated overlay block so a later
+# dedup-overlap pass can find, parse, and extend its own previous
+# output without trying to re-parse free-form Swift.
+_OVERLAY_SENTINEL_BEGIN = (
+    "// spm-to-xcframework dedup-overlap overlay — begin "
+    "(auto-generated, do not edit)"
+)
+_OVERLAY_SENTINEL_END = "// spm-to-xcframework dedup-overlap overlay — end"
+_OVERLAY_TARGETS_VAR = "_SPM2XC_OVERLAY_TARGETS"
+_OVERLAY_NAMES_VAR = "_SPM2XC_OVERLAY_NAMES"
 
 
 def edit_append_synth_product_to_package(
@@ -724,6 +737,548 @@ def edit_replace_with_binary_target(
     path_literal = _swift_string_literal(xcframework_path)
     replacement = f".binaryTarget(name: {name_literal}, path: {path_literal})"
     return manifest_text[:kind_start] + replacement + manifest_text[close_idx + 1 :]
+
+
+def _parse_overlay_entries(block_text: str) -> Dict[str, str]:
+    """Parse `Target.binaryTarget(name: "N", path: "P")` entries out of
+    an overlay block's array literal. Returns name → path. Strict by
+    design — the block is sentinel-bounded auto-generated text whose
+    shape we fully control, so any parse failure indicates corruption.
+    """
+    entries: Dict[str, str] = {}
+    pos = 0
+    while True:
+        m = _OVERLAY_BINARY_TARGET_RE.search(block_text, pos)
+        if not m:
+            return entries
+        open_idx = m.end() - 1
+        close_idx = _balanced_close(block_text, open_idx)
+        if close_idx == -1:
+            raise PrepareUserError(
+                "overlay edit: malformed Target.binaryTarget(...) call in "
+                "the existing overlay block (unbalanced parens)."
+            )
+        span = block_text[open_idx + 1 : close_idx]
+        flat = _flatten_to_top_level(span)
+        name_m = re.search(
+            r'\bname\s*:\s*"((?:[^"\\\n]|\\.)*)"', flat
+        )
+        path_m = re.search(
+            r'\bpath\s*:\s*"((?:[^"\\\n]|\\.)*)"', flat
+        )
+        if not name_m or not path_m:
+            raise PrepareUserError(
+                "overlay edit: Target.binaryTarget entry inside the overlay "
+                "block is missing `name:` or `path:`."
+            )
+        entries[name_m.group(1)] = path_m.group(1)
+        pos = close_idx + 1
+
+
+def _render_overlay_block(entries: Dict[str, str]) -> str:
+    """Render an overlay block from `entries` (name → path), with stable
+    sort order (by name). Sentinel-wrapped so subsequent calls can find
+    and rewrite it. Trailing newline ensures the block sits on its own
+    lines.
+    """
+    lines = [_OVERLAY_SENTINEL_BEGIN]
+    lines.append(f"let {_OVERLAY_TARGETS_VAR}: [Target] = [")
+    for name in sorted(entries):
+        lines.append(
+            f"  Target.binaryTarget("
+            f"name: {_swift_string_literal(name)}, "
+            f"path: {_swift_string_literal(entries[name])}),"
+        )
+    lines.append("]")
+    lines.append(
+        f"let {_OVERLAY_NAMES_VAR}: Set<String> = "
+        f"Set({_OVERLAY_TARGETS_VAR}.map {{ $0.name }})"
+    )
+    lines.append(_OVERLAY_SENTINEL_END)
+    return "\n".join(lines) + "\n"
+
+
+def edit_inject_or_extend_overlay_binary_targets(
+    manifest_text: str, substitutions: Sequence[Tuple[str, str]]
+) -> str:
+    """Dedup-overlap edit for wrapper-style manifests.
+
+    Used in place of `edit_replace_with_binary_target` when the
+    manifest's target list is built through a user-defined wrapper
+    (e.g. swift-collections' `CustomTarget` + `.toTarget()`), where the
+    textual `.target(name: T, ...)` finder would match wrapper calls
+    that have no `.binaryTarget` static method.
+
+    The overlay intervenes one level higher: at the top-level
+    `Package(targets: <expr>)` boundary. The wrapper's output is always
+    a `[Target]`, so we filter same-named entries out of it and
+    concatenate our own `Target.binaryTarget(...)` entries — producing
+    a well-typed `[Target]` that SPM accepts.
+
+    Two-state idempotency:
+      1. First call (no sentinel block present): injects the overlay
+         block immediately before the top-level `Package(...)` call AND
+         wraps the `targets:` argument expression as
+         `targets: (<orig>).filter { !_SPM2XC_OVERLAY_NAMES.contains($0.name) } + _SPM2XC_OVERLAY_TARGETS`.
+      2. Subsequent calls (sentinel block present): parses the existing
+         entries, merges with `substitutions` (last-wins by target
+         name), and re-renders the block in place. The `targets:`
+         wrap is left alone since it already references the overlay
+         vars.
+
+    `substitutions` is `[(target_name, xcframework_rel_path), ...]`.
+    Paths must be relative to the package root — SPM rejects absolute
+    paths in `.binaryTarget(path:)`. Caller is responsible for the
+    relpath computation (same as the literal-list path in
+    `_apply_dedup_overlap_substitutions`).
+
+    Returns the edited manifest text. A call with zero substitutions
+    AND no pre-existing overlay block is a no-op. A call that produces
+    no net change (every substitution already in the existing block
+    with the same path) returns `manifest_text` unchanged.
+
+    Raises `PrepareUserError` if the manifest has no `Package(...)`
+    call, no top-level `targets:` argument, or a malformed existing
+    overlay block.
+    """
+    code_view = _make_code_token_view(manifest_text)
+
+    # Locate any existing sentinel-bounded overlay block. We scan the
+    # raw text rather than the code view: comments are blanked out in
+    # the code view, so a sentinel COMMENT wouldn't appear there. Use
+    # the raw text directly.
+    block_start = manifest_text.find(_OVERLAY_SENTINEL_BEGIN)
+    overlay_present = block_start != -1
+    existing: Dict[str, str] = {}
+    block_end = -1
+    if overlay_present:
+        sentinel_end = manifest_text.find(_OVERLAY_SENTINEL_END, block_start)
+        if sentinel_end == -1:
+            raise PrepareUserError(
+                "overlay edit: found overlay begin sentinel without a "
+                "matching end sentinel; the manifest is in a half-edited "
+                "state."
+            )
+        block_end = sentinel_end + len(_OVERLAY_SENTINEL_END)
+        if block_end < len(manifest_text) and manifest_text[block_end] == "\n":
+            block_end += 1
+        existing = _parse_overlay_entries(manifest_text[block_start:block_end])
+
+    merged = dict(existing)
+    for name, rel_path in substitutions:
+        merged[name] = rel_path
+
+    if not merged:
+        # Nothing to do: no existing entries AND no new substitutions.
+        return manifest_text
+
+    if overlay_present:
+        if merged == existing:
+            return manifest_text
+        new_block = _render_overlay_block(merged)
+        return manifest_text[:block_start] + new_block + manifest_text[block_end:]
+
+    # First-time injection: build the block, find the Package(...) call,
+    # wrap its `targets:` argument expression, and splice the block in
+    # immediately before the line containing `Package(`.
+    new_block = _render_overlay_block(merged)
+
+    m = _PACKAGE_CALL_RE.search(code_view)
+    if not m:
+        raise PrepareUserError(
+            "overlay edit: no top-level `Package(` call found in the "
+            "manifest."
+        )
+    pkg_open = m.end() - 1
+    pkg_close = _balanced_close(manifest_text, pkg_open)
+    if pkg_close == -1:
+        raise PrepareUserError(
+            "overlay edit: unmatched `(` for `Package(`; the manifest "
+            "may be malformed."
+        )
+    body_start = pkg_open + 1
+    body_end = pkg_close
+    body = manifest_text[body_start:body_end]
+    body_dz = _depth_zero_view(body)
+    lm = _TARGETS_LABEL_RE.search(body_dz)
+    if not lm:
+        raise PrepareUserError(
+            "overlay edit: no top-level `targets:` argument inside the "
+            "Package(...) call. The manifest shape is not supported by "
+            "the overlay edit."
+        )
+    expr_start_in_body = lm.end()
+    while (
+        expr_start_in_body < len(body)
+        and body[expr_start_in_body] in " \t"
+    ):
+        expr_start_in_body += 1
+    comma_idx = body_dz.find(",", expr_start_in_body)
+    expr_end_in_body = comma_idx if comma_idx != -1 else len(body)
+    while (
+        expr_end_in_body > expr_start_in_body
+        and body[expr_end_in_body - 1] in " \t\n"
+    ):
+        expr_end_in_body -= 1
+    expr_start_offset = body_start + expr_start_in_body
+    expr_end_offset = body_start + expr_end_in_body
+
+    # Find the insertion point for the overlay block — the start of the
+    # statement that opens the Package(...) call. Walk back from
+    # pkg_open to the most recent newline + 1 (or BOF).
+    line_start = manifest_text.rfind("\n", 0, pkg_open) + 1
+
+    wrap_prefix = "("
+    wrap_suffix = (
+        f").filter {{ !{_OVERLAY_NAMES_VAR}.contains($0.name) }} "
+        f"+ {_OVERLAY_TARGETS_VAR}"
+    )
+
+    # Splice three regions in order from the end of the text so earlier
+    # offsets stay valid:
+    #   1. wrap_suffix immediately AFTER the targets-arg expression
+    #   2. wrap_prefix immediately BEFORE it
+    #   3. new_block immediately BEFORE the Package(...) statement
+    # Done as a single concatenation to avoid offset drift.
+    return (
+        manifest_text[:line_start]
+        + new_block
+        + manifest_text[line_start:expr_start_offset]
+        + wrap_prefix
+        + manifest_text[expr_start_offset:expr_end_offset]
+        + wrap_suffix
+        + manifest_text[expr_end_offset:]
+    )
+
+
+_DEPENDENCIES_LABEL_RE = re.compile(r"\bdependencies\s*:")
+
+
+def _strip_comments_to_spaces(span: str) -> str:
+    """Return a string the same length as `span` with line and block
+    comment characters (delimiters + body) replaced by spaces. Strings
+    and other code are preserved verbatim; newlines are preserved both
+    inside and outside comments so per-line offsets stay aligned.
+
+    Comment detection is string-aware: a `//` or `/*` that sits inside
+    a string literal isn't treated as a comment start. Block comments
+    nest, matching Swift's grammar.
+
+    Used as the stripped view for the backwards tail-shape scan in
+    `edit_augment_target_dependencies` so a trailing comment after the
+    last element doesn't cause the splice to land inside the comment.
+    """
+    out = list(span)
+    n = len(span)
+    i = 0
+    while i < n:
+        c = span[i]
+        if c == "/" and i + 1 < n and span[i + 1] == "/":
+            nl = span.find("\n", i + 2)
+            end = nl if nl != -1 else n
+            for j in range(i, end):
+                out[j] = " "
+            i = end
+            continue
+        if c == "/" and i + 1 < n and span[i + 1] == "*":
+            block_depth = 1
+            j = i + 2
+            while j < n and block_depth > 0:
+                if j + 1 < n and span[j] == "/" and span[j + 1] == "*":
+                    block_depth += 1
+                    j += 2
+                    continue
+                if j + 1 < n and span[j] == "*" and span[j + 1] == "/":
+                    block_depth -= 1
+                    j += 2
+                    continue
+                j += 1
+            for k in range(i, j):
+                if out[k] != "\n":
+                    out[k] = " "
+            i = j
+            continue
+        if c == '"':
+            # Skip past string literals so a // or /* inside a string
+            # isn't blanked. The string body itself stays in `out`.
+            j = i + 1
+            while j < n:
+                cc = span[j]
+                if cc == "\\" and j + 1 < n:
+                    if span[j + 1] == "(":
+                        close_idx = _balanced_close(span, j + 1)
+                        if close_idx == -1:
+                            break
+                        j = close_idx + 1
+                        continue
+                    j += 2
+                    continue
+                if cc == '"':
+                    j += 1
+                    break
+                if cc == "\n":
+                    break
+                j += 1
+            i = j
+            continue
+        i += 1
+    return "".join(out)
+
+
+def _collect_depth_zero_string_literals(span: str) -> set:
+    """Return the set of RAW string-literal source spans found at depth
+    0 of `span`. Walks character-by-character tracking nesting depth
+    and string/comment state; only string literals encountered while
+    `depth == 0` are collected.
+
+    "Raw source spans" means the value preserves backslash escapes and
+    interpolation segments verbatim — no Swift-level unescaping. For
+    `"prefix \\(x) suffix"` the collected element is the literal
+    string `prefix \\(x) suffix`. Callers are comparing against
+    proposed dep names that they construct as plain identifiers
+    (e.g. "InternalCollectionsUtilities"), so the comparison just
+    needs both sides to agree on representation. The escape-preserving
+    behaviour matches `_swift_string_literal`'s output, which is what
+    we'd emit if we ever spliced the same name in.
+
+    Used by `edit_augment_target_dependencies` to test whether a
+    proposed dep name is already a member of the array. A naive
+    `re.finditer(r'"..."', array_interior)` would falsely match a
+    string nested inside `.target(name: "X")` or `.product(name: "Y")`;
+    the dependency item there is the WHOLE call, and "X"/"Y" appear at
+    depth 1, so they should not count as direct dep names.
+
+    Escape handling: `\\n`, `\\"`, and string-interpolation `\\(...)` are
+    consumed as part of the string. Newlines inside an unterminated
+    `"..."` end the literal (matches Swift's grammar). Block comments
+    nest in Swift; line comments end at `\\n`.
+    """
+    out: set = set()
+    n = len(span)
+    i = 0
+    depth = 0
+    while i < n:
+        c = span[i]
+        if c == "/" and i + 1 < n and span[i + 1] == "/":
+            nl = span.find("\n", i + 2)
+            i = nl if nl != -1 else n
+            continue
+        if c == "/" and i + 1 < n and span[i + 1] == "*":
+            block_depth = 1
+            j = i + 2
+            while j < n and block_depth > 0:
+                if j + 1 < n and span[j] == "/" and span[j + 1] == "*":
+                    block_depth += 1
+                    j += 2
+                    continue
+                if j + 1 < n and span[j] == "*" and span[j + 1] == "/":
+                    block_depth -= 1
+                    j += 2
+                    continue
+                j += 1
+            i = j
+            continue
+        if c == '"':
+            j = i + 1
+            buf = []
+            while j < n:
+                cc = span[j]
+                if cc == "\\" and j + 1 < n:
+                    nxt = span[j + 1]
+                    if nxt == "(":
+                        close_idx = _balanced_close(span, j + 1)
+                        if close_idx == -1:
+                            break
+                        # Interpolation: opaque to the literal value.
+                        buf.append(span[j : close_idx + 1])
+                        j = close_idx + 1
+                        continue
+                    # Other escape sequences: keep them verbatim — the
+                    # caller is comparing raw source text against the
+                    # dep names it wants to inject, and would have
+                    # constructed any escapes the same way.
+                    buf.append(span[j : j + 2])
+                    j += 2
+                    continue
+                if cc == '"':
+                    j += 1
+                    if depth == 0:
+                        out.add("".join(buf))
+                    break
+                if cc == "\n":
+                    break
+                buf.append(cc)
+                j += 1
+            i = j
+            continue
+        if c in "([{":
+            depth += 1
+            i += 1
+            continue
+        if c in ")]}":
+            if depth > 0:
+                depth -= 1
+            i += 1
+            continue
+        i += 1
+    return out
+
+
+def edit_augment_target_dependencies(
+    manifest_text: str,
+    target_name: str,
+    extra_dep_names: Sequence[str],
+) -> str:
+    """Append string-literal entries to the `dependencies:` array of the
+    `.target(name: target_name, ...)` (or `.executableTarget` /
+    `.testTarget`) call.
+
+    Used by Execute's dedup-overlap pass to inject "phantom helper"
+    deps — internal sibling targets that are in an umbrella's
+    transitive dep closure but absent from its direct `dependencies:`
+    list. Without the injection, SPM doesn't add the helper's binary
+    target slice to the umbrella's `FRAMEWORK_SEARCH_PATHS`, and the
+    consumer's compile fails to resolve `import <Helper>` calls
+    embedded in another sibling's emitted `.swiftinterface`.
+
+    Canonical case: Apple swift-collections 1.1.4. `Collections` directly
+    depends on `[BitCollections, DequeModule, ...]` but each of those
+    transitively depends on `InternalCollectionsUtilities` (`kind:
+    .hidden`). After dedup-overlap, the siblings become `.binaryTarget`s
+    and their `.swiftinterface` files retain `import
+    InternalCollectionsUtilities`; SPM only adds slice dirs for binary
+    targets in the direct dep list, so `Collections`'s compile can't
+    find the helper. Augmenting `Collections`'s `dependencies:` with
+    `"InternalCollectionsUtilities"` fixes the search-path gap without
+    touching the helper module's own xcframework.
+
+    Idempotent: an entry already present in the array as a quoted
+    string literal at depth 0 is skipped. The "depth 0" qualifier matters
+    because nested `.target(name: "X")` / `.product(name: "X", ...)`
+    forms can mention any name as their own `name:` argument; those
+    don't count as members of the outer array. Other forms (a sibling
+    referenced as `.target(name: "X")` rather than `"X"`) are NOT
+    treated as duplicates — the augmentation appends a plain string
+    literal in that case, which SPM accepts alongside the existing
+    decorated form.
+
+    Raises `PrepareUserError` if:
+      - No `.target(name: target_name, ...)` (or `.executableTarget` /
+        `.testTarget`) call exists in the manifest.
+      - The target's call has no top-level `dependencies:` argument.
+      - The `dependencies:` expression is not an array literal (e.g.
+        `dependencies: someComputedArray`) — we don't attempt to
+        splice into a name-bound expression.
+
+    Wrapper-style manifests (swift-collections' `CustomTarget.target(
+    name:, dependencies:, ...)`) are supported because the regex
+    `\.(target|executableTarget|testTarget)\s*\(` matches both
+    `CustomTarget.target(` and bare `.target(` calls. The wrapper's
+    `dependencies` field is `[Target.Dependency]`-typed, which accepts
+    `ExpressibleByStringLiteral` entries the same as a real
+    `Target.target` call. The wrapper's `.toTarget()` forwards the list
+    verbatim to `Target.target(dependencies:)`, so the injection
+    propagates through to SPM's model.
+    """
+    if not extra_dep_names:
+        return manifest_text
+
+    kind_start, close_idx, _kind = _find_target_call_for_name(
+        manifest_text, target_name
+    )
+    if kind_start == -1:
+        raise PrepareUserError(
+            f"augment_target_dependencies: no `.target(name: {target_name!r}, "
+            f"...)` (or .executableTarget/.testTarget) found in the manifest."
+        )
+
+    # The call body spans (open_paren+1, close_idx).
+    open_idx = manifest_text.index("(", kind_start)
+    body_start = open_idx + 1
+    body_end = close_idx
+    body = manifest_text[body_start:body_end]
+    # `_depth_zero_view` blanks string/comment bodies AND nested-scope
+    # content while preserving offsets. So a `dependencies:` label
+    # nested inside another arg (rare but defensible) cannot false-
+    # match, and a label inside a string literal is invisible.
+    body_dz = _depth_zero_view(body)
+
+    lm = _DEPENDENCIES_LABEL_RE.search(body_dz)
+    if not lm:
+        raise PrepareUserError(
+            f"augment_target_dependencies: no top-level `dependencies:` "
+            f"argument in `.target(name: {target_name!r}, ...)` call."
+        )
+
+    # Find the `[` that opens the array literal. Skip whitespace.
+    i = lm.end()
+    while i < len(body) and body[i] in " \t\n":
+        i += 1
+    if i >= len(body) or body[i] != "[":
+        raise PrepareUserError(
+            f"augment_target_dependencies: `dependencies:` expression in "
+            f"`.target(name: {target_name!r}, ...)` is not an array literal "
+            f"(spotted `{body[i:i+10]!r}` at the position). The injection "
+            f"requires a literal `[...]` so it can splice new entries."
+        )
+    deps_open = i  # relative to body
+    deps_close = _balanced_close(body, deps_open)
+    if deps_close == -1:
+        raise PrepareUserError(
+            f"augment_target_dependencies: unmatched `[` for `dependencies:` "
+            f"array of `.target(name: {target_name!r}, ...)`."
+        )
+
+    # Idempotency: skip entries already present as depth-0 quoted strings.
+    # We can't use `_depth_zero_view` here — it blanks string-literal
+    # bodies as part of its comment-aware sanitisation, which would
+    # leave the regex matching empty strings instead of the actual
+    # names. Walk the array interior manually, tracking depth + string/
+    # comment state, and capture string literals only at depth 0.
+    array_interior = body[deps_open + 1 : deps_close]
+    existing_strings = _collect_depth_zero_string_literals(array_interior)
+
+    to_add = [d for d in extra_dep_names if d not in existing_strings]
+    if not to_add:
+        return manifest_text  # idempotent — all entries already present
+
+    # Pick the right splice shape based on what character sits at the
+    # array's logical "tail" (the last non-blank, non-comment char
+    # before `]`).
+    #   - `[` → empty array; insert `<entries>` (no leading comma needed)
+    #   - `,` → trailing comma; insert `<entries>,` (Swift accepts the
+    #     extra trailing comma; the existing one provides the separator)
+    #   - anything else → content with no trailing comma; insert `,
+    #     <entries>` (leading comma supplies the separator)
+    #
+    # We walk a comment-stripped view of `body` so a trailing line/
+    # block comment after the last element doesn't fool the decision.
+    # Without the strip, `["A", // note\n]` would land `tail_char='e'`,
+    # taking the "anything else" branch — and the inserted ", "B""
+    # would land INSIDE the line comment, becoming dead code. Strings
+    # stay in the view (a string's closing `"` is a legitimate tail).
+    body_for_tail = _strip_comments_to_spaces(body)
+    j = deps_close - 1
+    while j > deps_open and body_for_tail[j] in " \t\n":
+        j -= 1
+    tail_char = body_for_tail[j]
+    insertion_abs = body_start + j + 1  # right after the last non-blank char
+
+    entries_chunk = ", ".join(
+        _swift_string_literal(d) for d in to_add
+    )
+    if tail_char == "[":
+        insertion = entries_chunk
+    elif tail_char == ",":
+        insertion = " " + entries_chunk + ","
+    else:
+        insertion = ", " + entries_chunk
+
+    return (
+        manifest_text[:insertion_abs]
+        + insertion
+        + manifest_text[insertion_abs:]
+    )
 
 
 def _find_library_call_for_name(

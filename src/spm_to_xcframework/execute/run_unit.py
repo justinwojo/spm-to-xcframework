@@ -21,7 +21,7 @@ sequencing units in topological order over internal target deps so
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Set
 
 from ..errors import ExecuteError
 from ..log import bold, info, success, verbose_log, warn
@@ -41,7 +41,9 @@ from .create_xcframework import (
 )
 from .dedup import (
     _apply_dedup_overlap_substitutions,
+    _apply_phantom_helper_dep_augmentation,
     _compute_dedup_substitutions,
+    _compute_phantom_helper_deps,
     _demote_synth_product_in_manifest,
     _synth_dynamic_protected_targets,
 )
@@ -300,6 +302,15 @@ def execute_source_plan(
     results: List[ExecutedUnit] = []
     built_by_unit: Dict[str, ExecutedUnit] = {}
     staged_dir = prepared.package.staged_dir
+    # Set of every sibling target name that has been binary-substituted on
+    # any prior unit's dedup-overlap pass. Used by the phantom-helper
+    # augmentation: a helper that was promoted to a sibling xcframework
+    # by an earlier unit needs to be added to the current unit's umbrella
+    # deps even if it isn't part of THIS pass's substitutions list (the
+    # pass dedupes same-name re-substitutions, so an InternalCollections-
+    # Utilities that became a binary target two units ago doesn't show up
+    # again — but it's still a sibling whose slice the umbrella needs).
+    substituted_target_names: Set[str] = set()
 
     for unit in ordered_units:
         if not config.no_dedup_overlap:
@@ -314,6 +325,32 @@ def execute_source_plan(
                 _apply_dedup_overlap_substitutions(
                     staged_dir=staged_dir,
                     substitutions=substitutions,
+                    unit_name=unit.name,
+                    verbose=config.verbose,
+                )
+                for name, _path in substitutions:
+                    substituted_target_names.add(name)
+            # Inject "phantom helper" deps on the umbrella's source
+            # target — substituted sibling targets that are in the
+            # transitive but not the direct dep closure. Without this,
+            # SPM doesn't add the helper's binary-target slice to the
+            # umbrella's `FRAMEWORK_SEARCH_PATHS`, and the umbrella
+            # compile fails to resolve `import <Helper>` calls embedded
+            # in sibling `.swiftinterface` files. Runs unconditionally
+            # (even when this unit had zero new substitutions): the
+            # umbrella may still need helpers that were registered on
+            # earlier units' passes. See
+            # `_compute_phantom_helper_deps` for the predicate.
+            phantom_helpers = _compute_phantom_helper_deps(
+                unit=unit,
+                package=prepared.package,
+                substituted_target_names=substituted_target_names,
+                target_deps=target_deps,
+            )
+            if phantom_helpers:
+                _apply_phantom_helper_dep_augmentation(
+                    staged_dir=staged_dir,
+                    phantom_helpers=phantom_helpers,
                     unit_name=unit.name,
                     verbose=config.verbose,
                 )
