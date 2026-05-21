@@ -234,24 +234,23 @@ notes = "Multi-product + internal .target sibling deps. Triggers the dedup-overl
 # (internal-only) so auto-synth promotes them. SwiftSyntax HAS a library
 # product, so it stays as a regular .target dep.
 #
-# Requires `--no-dedup-overlap` because SwiftParser does exhaustive switches
-# over enums from SwiftSyntax (e.g., `Keyword`, `RawSameTypeRequirementSyntax.LeftType`).
-# With dedup-overlap ON, SwiftSyntax gets rewritten to `.binaryTarget` for
-# SwiftParser's build → SwiftParser sees SwiftSyntax as an externally-resilient
-# module → exhaustive switches without `@unknown default` become hard errors
-# at .swiftinterface emit time. With dedup-overlap OFF, SwiftSyntax stays a
-# .target dep and SPM's normal cross-product framework search paths handle
-# the dynamic linkage correctly.
-#
-# This is a real architectural limitation of dedup-overlap, not a swift-syntax
-# bug. Documented as P1 in ROADMAP.md (auto-detect resilience-incompatible
-# packages and selectively disable dedup-overlap).
+# SwiftParser does exhaustive switches over enums from SwiftSyntax (e.g.,
+# `Keyword`, `RawSameTypeRequirementSyntax.LeftType`). With dedup-overlap ON,
+# SwiftSyntax gets rewritten to `.binaryTarget` for SwiftParser's build →
+# SwiftParser sees SwiftSyntax as an externally-resilient module → exhaustive
+# switches without `@unknown default` become hard errors at .swiftinterface
+# emit time. The execute-phase try-and-fallback (run_unit.py
+# `_is_resilience_diagnostic`) catches this exact diagnostic, restores the
+# pre-substitution manifest, and re-archives SwiftParser as a same-package
+# `.target` so the resilience boundary is dropped — at the cost of
+# statically embedding the sibling code into SwiftParser.framework. This
+# matrix entry exercises the fallback path end-to-end with no extra flags.
 [[package]]
 name = "swift-syntax"
 url = "https://github.com/swiftlang/swift-syntax"
 version = "603.0.1"
 min_versions = { ios = "13.0" }
-args = ["--product", "SwiftParser", "--no-dedup-overlap"]
+args = ["--product", "SwiftParser"]
 expected_products = [
     "SwiftParser",
     "SwiftSyntax",
@@ -266,9 +265,9 @@ exercises = [
     "large-internal-target-graph",  # ~31 targets in package
     "auto-synth-sibling-xcframeworks",  # 6 compat layers (no product) promoted
     "auto-synth-respects-existing-product",  # SwiftSyntax has product, not auto-promoted
-    "no-dedup-overlap-flag",
+    "dedup-overlap-resilience-fallback",  # try-and-fallback on Swift switch-exhaustiveness diagnostic
     "non-literal-products-surgery-fallback",  # let products: [Product] with conditional
     "mixed-c-swift-internal-target",  # _SwiftSyntaxCShims (C) embedded into SwiftSyntax framework
     "cross-product-framework-search-path-linkage",  # SwiftParser dyn-links SwiftSyntax via SPM
 ]
-notes = "Surfaced the dedup-overlap-vs-library-evolution incompatibility on 2026-05-21. Workaround is the existing --no-dedup-overlap flag. SwiftSyntax.xcframework reports as [Mixed] because of the _SwiftSyntaxCShims C target embedded into it; SwiftParser and the six SwiftSyntax5XX-603 compat layers are pure [Swift]."
+notes = "Canonical try-and-fallback exerciser (2026-05-21). SwiftParser umbrella archive fails on Swift's `may have additional unknown values` diagnostic with dedup-overlap ON; run_unit.py's fallback restores the manifest and re-archives without substitution, producing SwiftParser.xcframework with siblings statically embedded. SwiftSyntax.xcframework reports as [Mixed] because of the _SwiftSyntaxCShims C target embedded into it; SwiftParser and the six SwiftSyntax5XX-603 compat layers are pure [Swift]."

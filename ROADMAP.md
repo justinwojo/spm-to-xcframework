@@ -56,7 +56,7 @@ Risk: moderate. Touches many code paths but each touch is small. Iterative.
 
 Add packages that exercise paths the current 10-entry matrix doesn't reach. Candidates ordered by ROI:
 
-1. **`apple/swift-syntax`** — ~31 internal targets. **Added 2026-05-21**; passes with `--no-dedup-overlap`, surfaced the resilience boundary issue below.
+1. **`apple/swift-syntax`** — ~31 internal targets. **Added 2026-05-21**; surfaced the resilience boundary issue and now passes flag-free via the try-and-fallback shipped below.
 2. **`apple/swift-async-algorithms`** — depends on swift-collections, validates `--include-deps` chain into the recent fix transitively.
 3. **`onevcat/Kingfisher`** — popular pure-Swift image library; broadens "common consumer packages" coverage.
 4. **`apple/swift-argument-parser`** — small, common, fast smoke test that pure-Swift baseline still works.
@@ -65,22 +65,13 @@ Each follows the policy in INTEGRATION_TESTING.md: earns a slot only if it exerc
 
 Risk: low — additions are cheap to try and reveal information either way.
 
-### Auto-detect dedup-overlap incompatibility
+### ~~Auto-detect dedup-overlap incompatibility~~ — Shipped 2026-05-21
 
-**Surfaced by swift-syntax 2026-05-21.** Dedup-overlap's `.target → .binaryTarget` rewrite creates a library-evolution resilience boundary: from the umbrella's perspective, the rewritten sibling becomes an externally-resilient module. When the umbrella does exhaustive switches over the sibling's enums (without `@unknown default`), Swift emits hard errors at `.swiftinterface` emit time — switches that were exhaustive in the original package become non-exhaustive in the rewritten one. swift-syntax's SwiftParser → SwiftSyntax relationship is the canonical case (e.g., `switch firstArgument` over `RawSameTypeRequirementSyntax.LeftType`, switches over `Keyword`).
+**Surfaced by swift-syntax 2026-05-21.** Dedup-overlap's `.target → .binaryTarget` rewrite creates a library-evolution resilience boundary: from the umbrella's perspective, the rewritten sibling becomes an externally-resilient module. When the umbrella does exhaustive switches over the sibling's enums (without `@unknown default`), Swift emits hard errors at `.swiftinterface` emit time. swift-syntax's SwiftParser → SwiftSyntax relationship is the canonical case (e.g., `switch firstArgument` over `RawSameTypeRequirementSyntax.LeftType`, switches over `Keyword`).
 
-Workaround today: `--no-dedup-overlap` already exists, statically embeds the sibling, lets SPM's normal cross-product framework search paths handle dynamic linkage. swift-syntax uses this in the matrix.
+**Resolution**: try-and-fallback, implemented in `execute/run_unit.py`. Per-unit, before the archive runs, we snapshot the active manifest. On `ExecuteError` we check for the canonical "may have additional unknown values" diagnostic — if it matches AND this unit applied at least one dedup substitution, we restore the snapshot, drop the unit's substitutions from `substituted_target_names`, and re-archive once. Unrelated failures surface unchanged. Trade-off when the fallback fires: the umbrella statically embeds the sibling's symbols, so a downstream consumer linking both that umbrella xcframework AND the sibling xcframework will see duplicate symbols (matches the behavior of `--no-dedup-overlap` globally, which was the prior workaround).
 
-The improvement: detect this pre-build (or recover post-failure) so the user doesn't need to know about the flag.
-
-Approaches, easiest first:
-- **Try-and-fallback**: on build failure, scan the xcresult for the specific "may have additional unknown values" diagnostic + a rewritten-binary-target sibling; retry that unit with dedup-overlap off. Cheap, accurate, only costs a rebuild when the pattern hits.
-- **Static heuristic**: at Plan time, look for `switch` statements in umbrella source files referencing sibling-target enums without `@unknown default`. Cheaper than rebuild, but needs source-level Swift parsing; brittle.
-- **Conservative default**: switch dedup-overlap to opt-in via `--dedup-overlap`. Loses the auto-resolution Stripe currently gets without an explicit flag. Probably wrong default.
-
-Recommend try-and-fallback. ~150 lines including the xcresult sniff + a retry path in `run_unit.py`.
-
-Risk: moderate. Requires careful state cleanup between attempts (the manifest was rewritten for attempt 1; attempt 2 needs the original).
+The flag still exists as the explicit opt-out and silences the per-unit warning.
 
 ### Serializable Plan + `--dry-run`
 

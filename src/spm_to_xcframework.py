@@ -8342,6 +8342,31 @@ from typing import Dict, List, Set
 
 
 
+# Swift's "Switch covers known cases, but X may have additional unknown values"
+# diagnostic. Fires at module-emit time when an umbrella does an exhaustive
+# switch (no `@unknown default`) over an enum imported from a now-resilient
+# binary sibling. Library-evolution mode treats the rewritten `.binaryTarget`
+# as a fully resilient external module, so cases that were exhaustive while
+# the sibling was a same-package `.target` become non-exhaustive once
+# dedup-overlap has rewritten it. The diagnostic text is stable across the
+# Swift versions we currently target (5.9..6.2); update here if Apple ever
+# rewords it.
+_RESILIENCE_DIAGNOSTIC_PATTERN = "may have additional unknown values"
+
+
+def _is_resilience_diagnostic(error_message: str) -> bool:
+    """Return True iff the formatted ExecuteError text contains the Swift
+    library-evolution switch-exhaustiveness diagnostic that dedup-overlap's
+    `.target → .binaryTarget` rewrite can introduce.
+
+    Pure string match against `_format_execute_error`'s rendered errors[]
+    block. Cheap, defensive (only triggers the auto-rollback when the
+    failure signature actually matches), and easy to extend with additional
+    patterns if more dedup-induced failure modes are discovered.
+    """
+    return _RESILIENCE_DIAGNOSTIC_PATTERN in error_message
+
+
 def _run_one_unit(
     unit: BuildUnit,
     *,
@@ -8599,7 +8624,48 @@ def execute_source_plan(
     # again — but it's still a sibling whose slice the umbrella needs).
     substituted_target_names: Set[str] = set()
 
+    # Lazy import: keep `prepare` out of the top-of-module import graph
+    # (the dedup helpers already do this same lazy pattern for symmetric
+    # reasons — see `_apply_dedup_overlap_substitutions`).
+
     for unit in ordered_units:
+        # Snapshot the per-unit fallback state. On a successful first
+        # archive these snapshots are discarded; on the Swift
+        # library-evolution switch-exhaustiveness diagnostic they're
+        # used to put both the on-disk manifest AND the in-memory
+        # `substituted_target_names` set back to their exact pre-unit
+        # values before a single retry. The rollback only fires when:
+        #   1. dedup-overlap is enabled globally,
+        #   2. this unit's archive actually failed,
+        #   3. this unit applied at least one NEW substitution (no-op
+        #      re-proposals of names already substituted by an earlier
+        #      unit don't count — the manifest text is unchanged and
+        #      rolling back would be misleading), AND
+        #   4. the formatted error message contains the resilience
+        #      diagnostic — narrow gate so unrelated build failures
+        #      still surface promptly with the original error.
+        # See `_is_resilience_diagnostic` for the canonical Swift text.
+        manifest_path = _select_active_manifest(staged_dir)
+        pre_unit_manifest_text = (
+            manifest_path.read_text() if manifest_path.is_file() else None
+        )
+        # Snapshot the set wholesale rather than tracking "this unit
+        # added X" — `_compute_dedup_substitutions` re-emits names
+        # already substituted by prior units (the apply helper is
+        # idempotent at the manifest-text level), so a per-tuple
+        # `.discard` would corrupt the set when a name was in it
+        # before this unit's pass started. (Codex r1 P1 #1.)
+        pre_unit_substituted_target_names = set(substituted_target_names)
+        # True iff THIS unit's substitution pass actually mutated the
+        # manifest (i.e. produced at least one novel `.target` →
+        # `.binaryTarget` rewrite). Re-proposing a name that was
+        # already substituted by a prior unit leaves the manifest
+        # text untouched; in that case there's nothing for the
+        # fallback to undo for this unit, so the warning would be
+        # misleading and the retry would fail identically.
+        unit_applied_new_substitution = False
+        unit_applied_substitution_names: List[str] = []
+
         if not config.no_dedup_overlap:
             substitutions = _compute_dedup_substitutions(
                 unit=unit,
@@ -8609,12 +8675,32 @@ def execute_source_plan(
                 synth_dynamic_protected=synth_dynamic_protected,
             )
             if substitutions:
+                # The apply helper writes only when at least one
+                # `.target` was actually rewritten — detect the same
+                # condition by comparing manifest text before/after.
+                pre_apply_text = (
+                    manifest_path.read_text() if manifest_path.is_file() else ""
+                )
                 _apply_dedup_overlap_substitutions(
                     staged_dir=staged_dir,
                     substitutions=substitutions,
                     unit_name=unit.name,
                     verbose=config.verbose,
                 )
+                post_apply_text = (
+                    manifest_path.read_text() if manifest_path.is_file() else ""
+                )
+                if post_apply_text != pre_apply_text:
+                    unit_applied_new_substitution = True
+                    # Only the names that weren't already substituted by
+                    # a prior unit are novel this pass — listing the
+                    # idempotent no-op re-proposals in the fallback
+                    # warning would overstate the rollback scope and
+                    # mislead operators. (Codex r2 P3.)
+                    unit_applied_substitution_names = [
+                        name for name, _ in substitutions
+                        if name not in pre_unit_substituted_target_names
+                    ]
                 for name, _path in substitutions:
                     substituted_target_names.add(name)
             # Inject "phantom helper" deps on the umbrella's source
@@ -8642,7 +8728,85 @@ def execute_source_plan(
                     verbose=config.verbose,
                 )
 
-        executed = _run_one_unit(unit, prepared=prepared, config=config)
+        try:
+            executed = _run_one_unit(unit, prepared=prepared, config=config)
+        except ExecuteError as exc:
+            # Only retry when dedup-overlap is the plausible cause: this
+            # unit applied at least one NEW substitution this pass AND
+            # the error text matches the canonical Swift resilience
+            # diagnostic. Otherwise the original error surfaces
+            # unchanged — unrelated build failures must not be masked
+            # by a second silent rebuild.
+            if (
+                not config.no_dedup_overlap
+                and unit_applied_new_substitution
+                and pre_unit_manifest_text is not None
+                and _is_resilience_diagnostic(str(exc))
+            ):
+                substituted_names = ", ".join(unit_applied_substitution_names)
+                warn(
+                    f"  {unit.name}: dedup-overlap fallback — Swift "
+                    f"library-evolution flagged exhaustive switch over "
+                    f"resilient enum(s) from substituted sibling(s) "
+                    f"({substituted_names}). Restoring the manifest and "
+                    f"re-archiving without the substitution for this unit. "
+                    f"Trade-off: {unit.name}'s framework will statically "
+                    f"embed those sibling target(s) — a consumer linking "
+                    f"both this xcframework AND the sibling xcframework "
+                    f"will see duplicate symbols. Pass --no-dedup-overlap "
+                    f"globally to silence this auto-recovery."
+                )
+                manifest_path.write_text(pre_unit_manifest_text)
+                # Restore the in-memory set wholesale rather than
+                # discarding the unit's names — a re-proposal that was
+                # idempotent on the manifest must remain present in the
+                # set so later units' phantom-helper computation stays
+                # consistent with the still-substituted manifest text.
+                # (Codex r1 P1 #1.)
+                substituted_target_names.clear()
+                substituted_target_names.update(pre_unit_substituted_target_names)
+                # The manifest restore also reverted this unit's
+                # phantom-helper augmentation. Recompute against the
+                # restored set (which captures every still-substituted
+                # sibling from prior units) and re-apply so the retry's
+                # umbrella sees the correct `dependencies:` edges for
+                # any persistent `.binaryTarget` siblings. Augmentation
+                # is idempotent (the underlying edit skips already-
+                # present entries), so this is safe even when nothing
+                # changed. (Codex r1 P1 #2.)
+                phantom_helpers_retry = _compute_phantom_helper_deps(
+                    unit=unit,
+                    package=prepared.package,
+                    substituted_target_names=substituted_target_names,
+                    target_deps=target_deps,
+                )
+                if phantom_helpers_retry:
+                    _apply_phantom_helper_dep_augmentation(
+                        staged_dir=staged_dir,
+                        phantom_helpers=phantom_helpers_retry,
+                        unit_name=unit.name,
+                        verbose=config.verbose,
+                    )
+                try:
+                    executed = _run_one_unit(
+                        unit, prepared=prepared, config=config
+                    )
+                except ExecuteError as retry_exc:
+                    # Preserve the original resilience-diagnostic
+                    # failure alongside the retry failure — masking
+                    # the first error makes triage harder when both
+                    # attempts fail for different reasons.
+                    # (Codex r1 P2 #4.)
+                    raise ExecuteError(
+                        f"{retry_exc}\n\n"
+                        f"(dedup-overlap fallback retry also failed for "
+                        f"unit {unit.name!r}; the original library-"
+                        f"evolution diagnostic that triggered the "
+                        f"fallback was:\n{exc})"
+                    ) from retry_exc
+            else:
+                raise
+
         results.append(executed)
         built_by_unit[unit.name] = executed
 
