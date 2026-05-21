@@ -342,6 +342,64 @@ Symptoms below show the leading prefix of the actual error message — the real 
 - `--revision` requires the full 40-character commit SHA; short SHAs are rejected.
 - The planner's static-construct check (raw strings, triple-quoted strings, string interpolation in `Package.swift`) is a heuristic, not a full Swift parser; a manifest using these constructs is rejected with a clear `PrepareError` rather than silently mis-parsed.
 
+## Testing
+
+Two complementary suites live in this repo:
+
+- `src/spm_to_xcframework_tests.py` — ~8,000-line snapshot suite. Parses fixture JSON and asserts on the planner's decisions. Fast (under 10 seconds), runs on every commit, catches Plan / Inspect logic regressions. Run with `python3 src/spm_to_xcframework_tests.py`.
+- `tests/integration/` — real-package integration suite. Each entry in `tests/integration/packages.toml` is built end-to-end with `xcodebuild`. Catches what the snapshot suite cannot: Xcode/Swift toolchain regressions, real-world `Package.swift` shapes, the injection passes, and structural xcframework failures (dynamic Mach-O, `.swiftinterface` emission, packaged clang-module shims) that the tool's own Verify phase doesn't independently re-check.
+
+### Running the integration suite
+
+```bash
+# Smoke subset — the cheap fast canaries (pre-commit / per-PR)
+python3 tests/integration/run_integration.py --smoke
+
+# Full matrix — before tagging a release
+python3 tests/integration/run_integration.py
+
+# Single package
+python3 tests/integration/run_integration.py --only grdb
+
+# Run multiple packages concurrently (each xcodebuild also parallelises inside)
+python3 tests/integration/run_integration.py --parallel 3
+
+# Keep produced xcframeworks under reports/<run>/<package>/work/ for inspection
+python3 tests/integration/run_integration.py --only wcdb --keep-output
+```
+
+Each run writes a Markdown + JSON report to `tests/integration/reports/<UTC timestamp>/`. Exit code is non-zero if any package fails. Packages marked `known_broken = true` are highlighted in the report but don't gate the run — each must pair with a `broken_signature` substring the runner checks against the log, so a *new* failure mode in a previously-known-broken package still trips the suite and forces fresh triage.
+
+The harness pins each entry to explicit `--min-<platform>` flags rather than auto-detect, so the same matrix produces the same slice set on any machine. Currently iOS-only — multi-platform stress is gated on every contributor having watchOS and visionOS simulator runtimes installed.
+
+### Matrix
+
+Ten packages, picked for code-path diversity over popularity. Entries marked ★ are in the smoke subset; entries marked ⚠ are tracked `known_broken` against the current Xcode/Swift and do not gate the run.
+
+| Package | Tag | Exercises | Smoke |
+|---|---|---|---|
+| [SnapKit/SnapKit](https://github.com/SnapKit/SnapKit) | 5.7.1 | Pre-existing `.library(type: .dynamic)`, linkerSettings, `.copy` resource | ★ |
+| [jdg/MBProgressHUD](https://github.com/jdg/MBProgressHUD) | 1.2.0 | ObjC-only → synth dynamic library + modulemap generation, tools-version bump | |
+| [groue/GRDB.swift](https://github.com/groue/GRDB.swift) | v6.29.3 | `systemLibrary` + `inject_system_clang_modules` + resources | ★ |
+| [kean/Nuke](https://github.com/kean/Nuke) | 12.8.0 | Multi-product Swift, sibling target deps, version-specific manifest, `package` strip | |
+| [apple/swift-collections](https://github.com/apple/swift-collections) ⚠ | 1.1.4 | Library-evolution, string-interpolation walker, non-literal-products surgery | |
+| [airbnb/lottie-spm](https://github.com/airbnb/lottie-spm) | 4.5.0 | `--binary` mode + binary discovery | |
+| [getsentry/sentry-cocoa](https://github.com/getsentry/sentry-cocoa) | 8.57.0 | Static vendor xcframework → dynamic promotion, requested-platform slice filter | |
+| [pointfreeco/swift-dependencies](https://github.com/pointfreeco/swift-dependencies) | 1.6.3 | `--include-deps` transitive builds, version-specific manifest | |
+| [Tencent/wcdb](https://github.com/Tencent/wcdb) | v2.1.10 | Bridge clang modules (`WCDB_Private` case) | |
+| [stripe/stripe-ios](https://github.com/stripe/stripe-ios) | 24.0.0 | dedup-overlap rewrite + multi-target builds | |
+
+⚠ entries hit a remaining limitation each entry's `broken_reason:` in `packages.toml` documents — they're useful as regression markers for further fix work.
+
+### Adding a package
+
+A new entry earns a slot only if it exercises a code path no existing entry does — diversity over popularity. When triaging a real downstream bug, the package that triggered it gets added with a `notes:` line pointing to the bug; that is the durable feedback loop.
+
+1. Add a `[[package]]` block to `tests/integration/packages.toml`. The `exercises` field documents the unique coverage — that's the contract for keeping the entry.
+2. Run `python3 tests/integration/run_integration.py --only <name>` to confirm it builds.
+3. Tag `smoke = true` only if the build is under ~1 minute and catches a unique fast-failure mode.
+4. If the verify check flags `.swiftinterface` imports the matrix entry intentionally doesn't package (e.g. an internal sibling target excluded to keep build time bounded), list them under `allowed_unresolved = [...]` with an inline comment explaining why.
+
 ## License
 
 MIT

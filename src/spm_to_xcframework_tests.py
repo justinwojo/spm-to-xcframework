@@ -748,9 +748,12 @@ def _selftest_planner_alamofire() -> None:
 
 
 def _selftest_planner_stripe_synthetic_libraries() -> None:
-    """Stripe: --product Stripe narrows the product set to one, --target
-    StripeCore / --target StripeUICore add two synthetic libraries, for
-    three build units total.
+    """Stripe: --product Stripe narrows the product set to one and
+    --target StripeCore / --target StripeUICore add two synthetic
+    libraries (the original 3-unit set this test pinned). On top of
+    that, the auto-synth-sibling-units pass picks up StripePayments
+    (Stripe statically depends on it AND it has a public product
+    wrapper), so the final plan has four build units total.
     """
     pkg = _mk_package_from_snapshot(STRIPE_DUMP_SNAPSHOT, schemes=[])
     config = Config(
@@ -764,12 +767,12 @@ def _selftest_planner_stripe_synthetic_libraries() -> None:
 
     names = {bu.name for bu in plan.build_units}
     _assert(
-        names == {"Stripe", "StripeCore", "StripeUICore"},
-        f"expected 3 build units {{Stripe, StripeCore, StripeUICore}}, got {names}",
+        names == {"Stripe", "StripeCore", "StripeUICore", "StripePayments"},
+        f"expected 4 build units {{Stripe, StripeCore, StripeUICore, StripePayments}}, got {names}",
     )
     _assert(
-        len(plan.build_units) == 3,
-        f"expected exactly 3 units, got {len(plan.build_units)}",
+        len(plan.build_units) == 4,
+        f"expected exactly 4 units, got {len(plan.build_units)}",
     )
 
     by_name = {bu.name: bu for bu in plan.build_units}
@@ -779,10 +782,18 @@ def _selftest_planner_stripe_synthetic_libraries() -> None:
         not by_name["Stripe"].synthetic,
         "Stripe is a real product, not synthetic",
     )
+    # StripePayments is a real public product — the auto-synth pass
+    # reuses the product wrapper rather than synthesising one, so the
+    # unit must NOT be flagged synthetic.
+    _assert(
+        not by_name["StripePayments"].synthetic,
+        "StripePayments is a real product, not synthetic",
+    )
 
     # synth_library: --target on a target that has no matching product
     # synthesizes a fresh dynamic library with the target's name as the
-    # product name (no collision risk by construction).
+    # product name (no collision risk by construction). StripePayments
+    # has a matching product so it never goes through this branch.
     synth_lib_names = {
         e.product_name for e in plan.package_swift_edits
         if e.kind == "synth_library"
@@ -792,22 +803,36 @@ def _selftest_planner_stripe_synthetic_libraries() -> None:
         f"synth_library edits should be {{StripeCore, StripeUICore}}, got {synth_lib_names}",
     )
 
-    # synth_dynamic_library: the existing 'Stripe' product is non-dynamic,
+    # synth_dynamic_library: the existing 'Stripe' product is automatic,
     # so the planner adds a parallel dynamic product (allocator-chosen
     # name) and the build unit renames the bundle back to 'Stripe' after
-    # the archive. Exactly one such edit, targeting Stripe's backing
-    # targets.
+    # the archive. The auto-synth pass does the same for StripePayments
+    # (also automatic linkage). Two such edits total.
     synth_dyn_edits = [
         e for e in plan.package_swift_edits if e.kind == "synth_dynamic_library"
     ]
     _assert(
-        len(synth_dyn_edits) == 1,
-        f"expected exactly one synth_dynamic_library edit; got {synth_dyn_edits}",
+        len(synth_dyn_edits) == 2,
+        f"expected exactly two synth_dynamic_library edits; got {synth_dyn_edits}",
     )
-    stripe_edit = synth_dyn_edits[0]
+    edits_by_target = {tuple(e.targets): e for e in synth_dyn_edits}
+    stripe_edit = edits_by_target.get(("Stripe",))
+    _assert(
+        stripe_edit is not None,
+        f"missing synth_dynamic_library edit targeting Stripe; got {synth_dyn_edits}",
+    )
+    payments_edit = edits_by_target.get(("StripePayments",))
+    _assert(
+        payments_edit is not None,
+        f"missing synth_dynamic_library edit targeting StripePayments; got {synth_dyn_edits}",
+    )
     _assert(
         stripe_edit.product_name != "Stripe",
         f"synthetic name must differ from the existing Stripe product; got {stripe_edit.product_name!r}",
+    )
+    _assert(
+        payments_edit.product_name != "StripePayments",
+        f"synthetic name must differ from the existing StripePayments product; got {payments_edit.product_name!r}",
     )
     stripe_bu = by_name["Stripe"]
     _assert(
@@ -817,6 +842,15 @@ def _selftest_planner_stripe_synthetic_libraries() -> None:
     _assert(
         stripe_bu.scheme == stripe_edit.product_name,
         f"Stripe build unit scheme should match the synthetic name; got '{stripe_bu.scheme}'",
+    )
+    payments_bu = by_name["StripePayments"]
+    _assert(
+        payments_bu.framework_name == "StripePayments",
+        f"StripePayments build unit framework_name should be 'StripePayments'; got '{payments_bu.framework_name}'",
+    )
+    _assert(
+        payments_bu.scheme == payments_edit.product_name,
+        f"StripePayments build unit scheme should match the synthetic name; got '{payments_bu.scheme}'",
     )
 
 
@@ -2741,15 +2775,17 @@ def _selftest_apply_dedup_overlap_substitutions_guards_unsupported_constructs(tm
     skipped — and with it the
     `_assert_no_unsupported_swift_constructs` guard. Execute-time
     dedup substitutions must therefore re-assert the guard themselves;
-    otherwise a manifest containing a triple-quoted string, `#"..."#`
-    raw string, or `\\(...)` interpolation that happens to mention
-    `.target(name: "Foo", ...)` would be silently mis-parsed by
-    `_make_code_token_view` (which only tracks `"..."` strings) and
-    the dedup edit would land inside the string body.
+    otherwise a manifest containing a triple-quoted string or `#"..."#`
+    raw string that happens to mention `.target(name: "Foo", ...)`
+    would be silently mis-parsed by `_make_code_token_view` (which only
+    tracks `"..."` strings) and the dedup edit would land inside the
+    string body.
 
-    Three fixtures: triple-quoted string, raw string, and
-    interpolation. Each must raise ExecuteError before any disk write
-    happens.
+    Two fixtures: triple-quoted string and raw string. Each must raise
+    ExecuteError before any disk write happens. (`\\(...)` interpolation
+    is now handled by the walker via recursion, so it's no longer a
+    guarded construct — `_make_code_token_view`'s own unit test covers
+    the positive case.)
     """
     base = tmp_root / "p2_r4_dedup_guard"
     base.mkdir(parents=True, exist_ok=True)
@@ -2778,23 +2814,6 @@ let p = Package(
 import PackageDescription
 
 let docs = #".target(name: "Foo", path: "OldFoo")"#
-
-let p = Package(
-    name: "x",
-    targets: [
-        .target(
-            name: "Foo",
-            path: "RealFoo"
-        ),
-    ]
-)
-'''),
-        # String interpolation in plausibly-legal manifest code.
-        ('interpolation', '''// swift-tools-version:5.7
-import PackageDescription
-
-let suffix = "Foo"
-let docs = ".target(name: \\(suffix), path: \\"OldFoo\\")"
 
 let p = Package(
     name: "x",
@@ -2998,15 +3017,24 @@ def _selftest_parse_xcresult_build_results() -> None:
 
 def _selftest_unsupported_swift_constructs() -> None:
     """The Prepare safety net rejects Package.swift files containing Swift
-    constructs the balanced-paren walker can't reason about: raw strings,
-    triple-quoted strings, and string interpolation. Each variant should
-    raise PrepareUserError (clean message path — the user's manifest, not
-    a tool bug) with a targeted message rather than allowing the walker
-    to silently mis-parse.
+    constructs the balanced-paren walker can't reason about: raw strings
+    and triple-quoted strings. Each variant should raise PrepareUserError
+    (clean message path — the user's manifest, not a tool bug) with a
+    targeted message rather than allowing the walker to silently
+    mis-parse.
+
+    `\\(...)` string interpolation is intentionally NOT rejected — the
+    walker handles it via recursion through itself in the string-skip
+    path (real manifests like swift-collections use it heavily).
     """
     # Plain manifests pass through.
     _assert_no_unsupported_swift_constructs(
         '// swift-tools-version:5.7\nlet x = "ok"\n'
+    )
+    # Interpolation pass-through: walker recurses to find the matching
+    # close paren of the embedded expression and resumes string mode.
+    _assert_no_unsupported_swift_constructs(
+        '// swift-tools-version:5.7\nlet x = "name=\\(foo)"\n'
     )
 
     def _expect_raise(text: str, hint: str) -> None:
@@ -3023,7 +3051,6 @@ def _selftest_unsupported_swift_constructs() -> None:
 
     _expect_raise('let x = #"hi"#\n', "raw string")
     _expect_raise('let x = """\nhi\n"""\n', "triple-quoted")
-    _expect_raise('let x = "name=\\(foo)"\n', "interpolation")
 
 
 def _selftest_unsupported_swift_constructs_comment_aware() -> None:
@@ -3086,10 +3113,12 @@ def _selftest_unsupported_swift_constructs_comment_aware() -> None:
         'let x = """\nreal triple\n"""\n',
         "triple-quoted",
     )
-    _expect_reject(
+    # `\(...)` interpolation is no longer a guarded construct: the walker
+    # handles it via recursion. Verify the safety net leaves it alone
+    # even after a comment-aware strip.
+    _assert_no_unsupported_swift_constructs(
         '/// safe doc\n'
-        'let x = "hi=\\(real)"\n',
-        "interpolation",
+        'let x = "hi=\\(real)"\n'
     )
     # An unterminated block comment plus a real raw-string AFTER the
     # unterminated marker must still be rejected — the conservative

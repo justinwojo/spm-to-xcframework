@@ -624,6 +624,27 @@ def plan_source_build(config: Config, package: Package) -> Plan:
                 f"Available products: {available}"
             )
 
+    # Third pass: auto-discover statically-linked sibling targets. For
+    # each planned unit, compute the transitive internal-target-dep
+    # closure; any target in that closure that isn't already owned by a
+    # planned unit gets its own build unit (and Package.swift edit).
+    # Dedup-overlap (Execute) then rewrites the umbrella's manifest to
+    # consume the siblings as `.binaryTarget`s, so the umbrella's
+    # framework dynamically links to them instead of statically embedding
+    # them. Without this, an umbrella that `@_exported import`s siblings
+    # (swift-collections: Collections re-exports BitCollections,
+    # DequeModule, ...) emits an xcframework whose `.swiftinterface`
+    # references siblings whose `.swiftmodule` isn't anywhere on the
+    # consumer's module search path, so `import Collections` fails to
+    # type-check.
+    #
+    # Skipped when the manifest wraps targets in a user-defined helper
+    # type (the textual dedup-overlap rewriter can't disambiguate
+    # `.target(name: T, ...)` between `Target.target` and
+    # `CustomTarget.target` — swift-collections is the canonical case).
+    if not _manifest_uses_custom_target_wrapper(package):
+        _auto_synth_sibling_units(plan, package, taken_product_names)
+
     if not plan.build_units:
         raise PlanError(
             "Plan produced zero build units. Did --product filter out "
@@ -631,7 +652,165 @@ def plan_source_build(config: Config, package: Package) -> Plan:
             "products?"
         )
 
+    # Transitive `.product(name:, package:)` references that need their own
+    # sibling xcframework are handled by the top-level orchestrator
+    # `_run_source_mode_with_transitives`: each `TransitivePackageInfo`
+    # turns into a fresh `_run_source_mode` call against the resolved
+    # checkout. Plan stays single-package and subprocess-free.
+
     return plan
+
+
+_CUSTOM_TARGET_WRAPPER_SIGNALS = (
+    "func toTarget(",   # canonical: swift-collections' CustomTarget.toTarget
+    ": [CustomTarget]",  # typed array of a non-Target helper
+)
+
+
+def _manifest_uses_custom_target_wrapper(package: Package) -> bool:
+    """True iff the package's Package.swift defines its targets through
+    a user-supplied helper type whose own `.target(...)` static method
+    shadows `Target.target`.
+
+    The textual dedup-overlap rewriter (`edit_replace_with_binary_target`)
+    can't distinguish between `Target.target(name: T, ...)` and
+    `CustomTarget.target(name: T, ...)` at the call site, since both
+    appear as `.target(name: T, ...)` in source. When the manifest's
+    targets array contains custom-wrapper calls, the rewriter ends up
+    replacing the wrapper call with `.binaryTarget(...)` — which fails
+    because the wrapper type has no `binaryTarget` static method.
+
+    We refuse to auto-synth sibling build units for such packages: the
+    umbrella product reverts to statically embedding its siblings (the
+    pre-auto-discovery default), and the package stays correctly
+    classified as KNOWN_BROKEN by the integration matrix instead of
+    failing hard mid-Execute.
+
+    Detection scans the active manifest text for either of the two
+    canonical signals listed in `_CUSTOM_TARGET_WRAPPER_SIGNALS`.
+    Missing-file / unreadable-manifest cases conservatively return
+    False so well-formed packages don't lose the optimisation.
+    """
+    if package.staged_dir is None:
+        return False
+    candidates = (
+        package.staged_dir / "Package.swift",
+        package.staged_dir / f"Package@swift-{package.tools_version}.swift",
+    )
+    for manifest_path in candidates:
+        if not manifest_path.is_file():
+            continue
+        try:
+            text = manifest_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if any(sig in text for sig in _CUSTOM_TARGET_WRAPPER_SIGNALS):
+            return True
+    return False
+
+
+def _auto_synth_sibling_units(
+    plan: Plan, package: Package, taken_product_names: Set[str]
+) -> None:
+    """Walk planned build units, find statically-linked internal sibling
+    targets not yet owned by any unit, and add a unit + manifest edit
+    for each so they ship as their own xcframeworks.
+
+    Behaviour per discovered sibling T:
+
+      - T matches an existing `.library(name: T, ...)` product → reuse
+        the product. If currently non-dynamic, emit a
+        `synth_dynamic_library` edit (planner re-exports it as a dynamic
+        sibling product). The build unit's name is the original product
+        name so consumers depend on it by the same identifier.
+      - T is internal-only (no matching product) → SKIP. Pure helper
+        targets often rely on the umbrella's `linkerSettings` /
+        framework dependencies (e.g. WCDB's `bridge`, `common`, and
+        `objc-core` targets link against CoreFoundation via the
+        umbrella WCDBSwift's settings). Standalone-built as a dynamic
+        `.library` they'd fail at the link step with `Undefined symbol:
+        _CFAllocatorGetDefault` and friends. The `--target T` escape
+        hatch still works as the explicit opt-in for this case.
+
+    Skipped (won't produce a unit):
+      - Non-regular targets (system / binary / executable / test /
+        plugin / macro): system targets are bundled by
+        `inject_system_clang_modules`; binary targets are already
+        xcframeworks via SPM resolve; the rest can't be built as
+        xcframeworks.
+      - Existing products that are system-only or binary-only.
+    """
+    if not plan.build_units:
+        return
+
+    deps_map = compute_internal_target_deps(package)
+
+    # Snapshot of targets already covered by SOME planned unit. Targets
+    # added by this pass go into `covered` too so we don't double-emit
+    # within one invocation.
+    covered: Set[str] = set()
+    for bu in plan.build_units:
+        for t in bu.source_targets:
+            covered.add(t)
+
+    # Walk planned units in stable order and collect uncovered siblings,
+    # preserving order so the resulting build_units list is deterministic.
+    siblings_to_add: List[str] = []
+    for bu in list(plan.build_units):
+        for src_t in bu.source_targets:
+            for sibling in sorted(deps_map.get(src_t, set())):
+                if sibling in covered:
+                    continue
+                tgt = package.target_by_name(sibling)
+                if tgt is None or tgt.kind != TargetKind.REGULAR:
+                    continue
+                covered.add(sibling)
+                siblings_to_add.append(sibling)
+
+    if not siblings_to_add:
+        return
+
+    existing_product_names = {p.name for p in package.products}
+    existing_planned_names = {bu.name for bu in plan.build_units}
+
+    for sibling in siblings_to_add:
+        if sibling not in existing_product_names:
+            # Internal helper target with no public product wrapper.
+            # Don't auto-promote — see docstring rationale (WCDB-style
+            # CoreFoundation link failure).
+            continue
+        existing = next(p for p in package.products if p.name == sibling)
+        if _is_system_only_product(existing, package):
+            continue
+        if _is_binary_only_product(existing, package):
+            continue
+        language = _derive_product_language(existing, package)
+        if existing.linkage != Linkage.DYNAMIC:
+            synthetic_name = _allocate_synthetic_product_name(
+                existing.name, taken_product_names
+            )
+            plan.package_swift_edits.append(
+                PackageSwiftEdit(
+                    kind="synth_dynamic_library",
+                    product_name=synthetic_name,
+                    targets=list(existing.targets),
+                )
+            )
+            scheme = synthetic_name
+        else:
+            scheme = resolve_scheme(existing.name, package.schemes)
+        plan.build_units.append(
+            BuildUnit(
+                name=existing.name,
+                scheme=scheme,
+                framework_name=existing.name,
+                language=language,
+                archive_strategy="archive",
+                source_targets=list(existing.targets),
+                synthetic=False,
+            )
+        )
+        existing_planned_names.add(existing.name)
 
 
 def plan_binary_build(config: Config, artifacts: Sequence[BinaryArtifact]) -> Plan:

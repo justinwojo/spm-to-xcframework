@@ -29,6 +29,7 @@ from ..model import ExecutedUnit, Language, Plan
 from ..platforms import (
     PlatformSlice,
     _PLATFORM_SLICES,
+    _enabled_platforms,
     _expected_slice_classes,
     _platform_from_library_identifier,
     _variant_for_platform_slice,
@@ -93,6 +94,99 @@ def _platform_slice_for_library_identifier(lid: str) -> Optional[PlatformSlice]:
         if _variant_for_platform_slice(s) == variant:
             return s
     return None
+
+
+def _filter_xcframework_slices_to_requested_platforms(
+    xcframework_path: Path,
+    requested_platforms: List[str],
+    *,
+    verbose: bool = False,
+) -> List[str]:
+    """Drop slices whose platform the user didn't request via `--min-*`.
+
+    Vendor xcframeworks routinely ship more platforms than any one
+    consumer asks for — Sentry 8.x ships ios+ios-simulator+ios-maccatalyst
+    +macos+tvos+tvos-simulator+watchos+visionos. If the user only asked
+    for `--min-ios`, the unrequested slices contribute nothing to their
+    build, and worse: a static maccatalyst slice triggers a
+    `-mtargetos=ios<ver>-macabi` clang invocation in
+    `promote_binary_xcframework_static_to_dynamic` that not every
+    installed clang accepts.
+
+    Mutates the xcframework in place: deletes each unrequested slice
+    directory and rewrites `Info.plist`'s `AvailableLibraries` to match.
+    Returns the list of identifiers removed (empty list when the vendor
+    xcframework already matches the requested set, including binary-only
+    auto-detect where the requested set was derived from the slices
+    themselves).
+
+    Errors:
+      - If requested_platforms is empty (defensive — caller should have
+        validated this before binary execute starts), no filtering runs.
+      - If the filter would leave zero slices, raise ExecuteError with
+        the requested-vs-available breakdown so the user knows the vendor
+        xcframework doesn't cover what they asked for.
+    """
+    if not requested_platforms:
+        return []
+    info_plist = xcframework_path / "Info.plist"
+    if not info_plist.is_file():
+        return []
+    try:
+        with info_plist.open("rb") as fh:
+            data = plistlib.load(fh)
+    except (plistlib.InvalidFileException, OSError, ValueError):
+        return []
+    available = data.get("AvailableLibraries")
+    if not isinstance(available, list):
+        return []
+
+    requested = set(requested_platforms)
+    kept: List[dict] = []
+    removed: List[str] = []
+    seen_platforms: set[str] = set()
+    for entry in available:
+        if not isinstance(entry, dict):
+            kept.append(entry)
+            continue
+        identifier = entry.get("LibraryIdentifier")
+        if not isinstance(identifier, str):
+            kept.append(entry)
+            continue
+        platform = _platform_from_library_identifier(identifier)
+        if platform is None:
+            # Unrecognised — keep, let Verify surface the oddity rather
+            # than silently dropping something we don't understand.
+            kept.append(entry)
+            continue
+        seen_platforms.add(platform)
+        if platform in requested:
+            kept.append(entry)
+        else:
+            removed.append(identifier)
+            slice_dir = xcframework_path / identifier
+            if slice_dir.is_dir():
+                shutil.rmtree(slice_dir, ignore_errors=True)
+
+    if not kept:
+        avail = ", ".join(sorted(seen_platforms)) or "(none recognisable)"
+        req = ", ".join(sorted(requested))
+        raise ExecuteError(
+            f"Filtering {xcframework_path.name} to requested platforms "
+            f"left zero slices. Requested: {req}. Vendor xcframework ships: "
+            f"{avail}."
+        )
+
+    if removed:
+        data["AvailableLibraries"] = kept
+        with info_plist.open("wb") as fh:
+            plistlib.dump(data, fh)
+        verbose_log(
+            verbose,
+            f"  Dropped {len(removed)} unrequested slice(s) from "
+            f"{xcframework_path.name}: {', '.join(removed)}",
+        )
+    return removed
 
 
 def promote_binary_xcframework_static_to_dynamic(
@@ -354,6 +448,21 @@ def execute_binary_plan(
             shutil.rmtree(dest)
         info(f"  Copying {src.name}...")
         shutil.copytree(src, dest, symlinks=True)
+        # Filter to user-requested platforms first. Two reasons: (a) the
+        # source-mode contract is "you got what you asked for via
+        # --min-*"; binary mode should behave the same, (b) keeping an
+        # unrequested slice can crash the promotion pass below (Sentry's
+        # maccatalyst slice → an unsupported `-mtargetos=ios<ver>-macabi`
+        # clang invocation on some installed toolchains).
+        requested_platforms = _enabled_platforms(config)
+        dropped = _filter_xcframework_slices_to_requested_platforms(
+            dest, requested_platforms, verbose=config.verbose,
+        )
+        if dropped:
+            info(
+                f"  Dropped {len(dropped)} unrequested slice(s) from "
+                f"{dest.name}: {', '.join(dropped)}"
+            )
         # Promote any static-archive slices to dynamic in place. No-op
         # for the common case of vendor xcframeworks that already ship
         # dynamic binaries — `_check_binary_dynamic` short-circuits the

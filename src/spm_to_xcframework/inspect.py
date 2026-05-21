@@ -25,6 +25,7 @@ from .model import (
     Product,
     Target,
     TargetKind,
+    TransitivePackageInfo,
 )
 
 
@@ -336,6 +337,209 @@ def discover_schemes(staged_dir: Path, verbose: bool = False) -> List[str]:
     return [str(s) for s in schemes if isinstance(s, str)]
 
 
+def _collect_referenced_package_products(
+    raw_dump: dict, targets: List[Target]
+) -> "dict[str, dict]":
+    """Enumerate the `.product(name:, package:)` references that any
+    REGULAR target in the root package makes against external packages,
+    keyed by SPM identity.
+
+    Filtering to REGULAR targets matches what the planner ultimately builds
+    — test/macro/plugin targets are never built as xcframeworks, so we
+    don't want their transitive product deps to drive patching of foreign
+    checkouts. The dump-package shape we look for is:
+
+        {"product": ["ProductName", "package-identity", null, null]}
+
+    Returns an ordered dict keyed by identity. Each value is a dict with:
+      - "products": ordered list of distinct product names the root
+        referenced from this identity (used to scope the child build via
+        `Config.product_filters` and to drive prune_child's needed-
+        identity closure).
+      - "root_targets": ordered list of distinct root REGULAR target
+        names that reference this identity (used by the orchestrator to
+        drop transitives reachable only from helper/example targets
+        outside the user's selected-target closure).
+      - "product_to_root_targets": dict from product name to ordered
+        list of root REGULAR target names that reference that specific
+        product. Preserves the fine-grained edge attribution the two
+        aggregate lists above lose, so the orchestrator can trim
+        `referenced_products` down to only the products imported by
+        in-closure root targets.
+    """
+    target_kind_by_name = {t.name: t.kind for t in targets}
+    by_identity: "dict[str, dict]" = {}
+    for t in raw_dump.get("targets", []) or []:
+        if not isinstance(t, dict):
+            continue
+        name = t.get("name")
+        if not isinstance(name, str):
+            continue
+        if target_kind_by_name.get(name) != TargetKind.REGULAR:
+            continue
+        for dep in t.get("dependencies", []) or []:
+            if not isinstance(dep, dict):
+                continue
+            prod = dep.get("product")
+            if not isinstance(prod, list) or len(prod) < 2:
+                continue
+            product_name = prod[0]
+            identity = prod[1]
+            if not isinstance(identity, str) or not isinstance(product_name, str):
+                continue
+            entry = by_identity.setdefault(
+                identity,
+                {"products": [], "root_targets": [], "product_to_root_targets": {}},
+            )
+            if product_name not in entry["products"]:
+                entry["products"].append(product_name)
+            if name not in entry["root_targets"]:
+                entry["root_targets"].append(name)
+            per_product = entry["product_to_root_targets"].setdefault(
+                product_name, []
+            )
+            if name not in per_product:
+                per_product.append(name)
+    return by_identity
+
+
+def _show_dependencies(staged_dir: Path, verbose: bool) -> Optional[dict]:
+    """Run `swift package show-dependencies --format json` to get the
+    resolved dependency tree (each entry has identity, version, and the
+    on-disk `path` to the checkout). Returns the parsed JSON or None on
+    failure (treated as "no transitive packages" — Plan/Prepare gracefully
+    no-op).
+    """
+    cp = subprocess.run(
+        ["swift", "package", "show-dependencies", "--format", "json"],
+        cwd=str(staged_dir),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if cp.returncode != 0:
+        verbose_log(
+            verbose,
+            f"  swift package show-dependencies failed: "
+            f"{(cp.stderr or '').rstrip().splitlines()[-3:]}",
+        )
+        return None
+    try:
+        return json.loads(cp.stdout)
+    except json.JSONDecodeError as exc:
+        verbose_log(verbose, f"  show-dependencies JSON parse failed: {exc}")
+        return None
+
+
+def _flatten_dependency_tree(tree: dict) -> dict:
+    """Walk the `show-dependencies` JSON (which is recursive) and return a
+    flat dict mapping identity → checkout path string for every node
+    reachable from the root. The root itself is excluded — only its
+    transitive deps appear.
+    """
+    flat: dict = {}
+
+    def walk(node: dict) -> None:
+        deps = node.get("dependencies") or []
+        for dep in deps:
+            if not isinstance(dep, dict):
+                continue
+            identity = dep.get("identity")
+            path = dep.get("path")
+            if isinstance(identity, str) and isinstance(path, str):
+                if identity not in flat:
+                    flat[identity] = path
+            walk(dep)
+
+    walk(tree)
+    return flat
+
+
+def _discover_transitive_packages(
+    staged_dir: Path,
+    raw_dump: dict,
+    targets: List[Target],
+    verbose: bool,
+) -> List[TransitivePackageInfo]:
+    """Enumerate the direct external-package deps of the root's REGULAR
+    targets, look up each one's resolved checkout, and dump-package the
+    checkout to get its products list. Returns one
+    `TransitivePackageInfo` per directly-referenced identity; packages
+    pulled in only by test/macro/plugin paths are skipped at the source.
+
+    Failure modes (each results in skipping the affected identity, never
+    a hard error):
+      - show-dependencies returns no entry for the identity (e.g. the
+        package wasn't fully resolved)
+      - the checkout's `dump-package` fails (rare — would mean the
+        package author shipped a broken manifest)
+    """
+    referenced_by_identity = _collect_referenced_package_products(raw_dump, targets)
+    if not referenced_by_identity:
+        return []
+
+    tree = _show_dependencies(staged_dir, verbose=verbose)
+    if tree is None:
+        return []
+    flat = _flatten_dependency_tree(tree)
+    if not flat:
+        return []
+
+    # Case-insensitive identity lookup so root manifests that write
+    # `package: "Swift-Clocks"` still match the SPM-normalised
+    # "swift-clocks" identity.
+    flat_ci = {k.lower(): (k, v) for k, v in flat.items()}
+
+    out: List[TransitivePackageInfo] = []
+    for ref, ref_entry in referenced_by_identity.items():
+        ref_products = ref_entry["products"]
+        ref_root_targets = ref_entry["root_targets"]
+        ref_p2rt = ref_entry["product_to_root_targets"]
+        match = flat_ci.get(ref.lower())
+        if match is None:
+            verbose_log(
+                verbose,
+                f"  transitive: identity {ref!r} referenced by root but "
+                f"not present in show-dependencies output (skipping)",
+            )
+            continue
+        identity, checkout_str = match
+        checkout_path = Path(checkout_str)
+        if not (checkout_path / "Package.swift").is_file() and not any(
+            checkout_path.glob("Package@swift-*.swift")
+        ):
+            verbose_log(
+                verbose,
+                f"  transitive: {identity!r} at {checkout_path} has no "
+                f"Package.swift (skipping)",
+            )
+            continue
+        try:
+            t_raw, t_products, _t_targets, _t_platforms, _t_name, t_tools = (
+                dump_package(checkout_path)
+            )
+        except Exception as exc:  # noqa: BLE001 — Inspect must not crash
+            verbose_log(
+                verbose,
+                f"  transitive: dump-package failed for {identity!r}: {exc}",
+            )
+            continue
+        out.append(
+            TransitivePackageInfo(
+                identity=identity,
+                checkout_path=checkout_path,
+                products=t_products,
+                tools_version=t_tools,
+                referenced_products=list(ref_products),
+                referencing_root_targets=list(ref_root_targets),
+                product_to_root_targets={
+                    p: list(rts) for p, rts in ref_p2rt.items()
+                },
+            )
+        )
+    return out
+
+
 def inspect_package(config: Config, staged_dir: Path) -> Package:
     """Top-level Inspect entry point. Reads only — no filesystem mutations
     on the staged tree. Wires together dump_package + scan + scheme list."""
@@ -343,6 +547,9 @@ def inspect_package(config: Config, staged_dir: Path) -> Package:
     raw, products, targets, platforms, name, tools_version = dump_package(staged_dir)
     scan_target_languages(staged_dir, targets)
     schemes = discover_schemes(staged_dir, verbose=config.verbose)
+    transitive = _discover_transitive_packages(
+        staged_dir, raw, targets, verbose=config.verbose
+    )
     return Package(
         name=name,
         tools_version=tools_version,
@@ -352,6 +559,7 @@ def inspect_package(config: Config, staged_dir: Path) -> Package:
         schemes=schemes,
         raw_dump=raw,
         staged_dir=staged_dir,
+        transitive_packages=transitive,
     )
 
 

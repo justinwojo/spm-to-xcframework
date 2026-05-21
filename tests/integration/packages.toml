@@ -1,0 +1,216 @@
+# Integration test matrix for spm-to-xcframework.
+#
+# Each entry produces one invocation of the tool. The runner subprocess-calls
+# `spm-to-xcframework <url> -v <version> -o <tmp> --min-<plat> <ver>... [args...]`,
+# then asserts every `expected_products` entry exists in the output and every
+# slice's binary is dynamic Mach-O with the expected ABI surface.
+#
+# The matrix prioritises code-path diversity over package popularity. Every
+# entry's `exercises` field documents which tool function(s) it covers — that
+# field is the contract that justifies the entry being on the list. If two
+# packages exercise the same paths, only the smaller/faster one belongs here.
+#
+# `min_versions` is both the build constraint (becomes --min-<platform> flags)
+# AND the slice-set assertion ("these platform variants must appear in the
+# output xcframework"). The initial matrix is iOS-only for portability —
+# multi-platform stress can be layered on once every developer running this
+# has watchOS/visionOS simulator runtimes installed.
+#
+# `smoke = true` flags the cheap pre-commit / per-PR subset (the fast canaries
+# for common Plan/Prepare/Execute regressions). The rest of the matrix runs
+# nightly / pre-release. See `README.md` for the rationale per entry.
+#
+# `known_broken = true` entries pair with `broken_signature` — a substring the
+# runner asserts must appear in the build log for the failure to count as
+# "known". If a known-broken package starts failing in a *new* way, the
+# signature stops matching and the entry fails the run, forcing fresh triage.
+# The `exercises` list on a `known_broken` entry is aspirational — those code
+# paths will be covered once the documented bug is fixed; today they aren't.
+
+# 1 — Pure-Swift sanity baseline. Pre-existing .library(type: .dynamic) +
+# .copy resource bundle (PrivacyInfo) + linkerSettings. Doubles as the
+# small/fast canary: if this fails, the toolchain is the suspect.
+[[package]]
+name = "snapkit"
+url = "https://github.com/SnapKit/SnapKit"
+version = "5.7.1"
+min_versions = { ios = "13.0" }
+expected_products = ["SnapKit"]
+exercises = [
+    "pure-swift-single-product",
+    "preexisting-dynamic-product",
+    "linker_settings",
+    "inject_resource_bundles",
+    "inject_swiftmodule",
+]
+smoke = true
+notes = "Pre-existing .library(type: .dynamic) — planner should NOT add a synthetic dynamic sibling. PrivacyInfo bundle exercises the resource path."
+
+# 2 — ObjC-only product. Forces the synthetic dynamic-library plan (the
+# post-spike replacement for source-mode promote_static_to_framework).
+[[package]]
+name = "mbprogresshud"
+url = "https://github.com/jdg/MBProgressHUD"
+version = "1.2.0"
+min_versions = { ios = "11.0" }
+expected_products = ["MBProgressHUD"]
+exercises = [
+    "objc-only",
+    "synth_dynamic_library",
+    "inject_objc_headers",
+    "modulemap-generation",
+    "tools-version-bump",
+]
+
+# 4 — systemLibrary + resource bundles. The highest-ROI single-package
+# coverage for Phase-4 injection passes against C-shimmed Swift.
+[[package]]
+name = "grdb"
+url = "https://github.com/groue/GRDB.swift"
+version = "v6.29.3"
+min_versions = { ios = "13.0" }
+expected_products = ["GRDB"]
+exercises = [
+    "system_library_target",
+    "inject_system_clang_modules",
+    "inject_resource_bundles",
+    "cSettings",
+]
+smoke = true
+notes = "systemLibrary target CSQLite → inject_system_clang_modules. .copy resources + PrivacyInfo."
+
+# 5 — Multi-product Swift with sibling target deps. Exercises Plan's
+# multi-unit topology without the heavy dedup-overlap path Stripe covers.
+[[package]]
+name = "nuke"
+url = "https://github.com/kean/Nuke"
+version = "12.8.0"
+min_versions = { ios = "13.0" }
+expected_products = ["Nuke", "NukeUI", "NukeVideo", "NukeExtensions"]
+exercises = [
+    "pure-swift-multi-product",
+    "internal-target-deps",
+    "version-specific-manifest-add-product",  # Package@swift-5.9.swift active
+    "package-name-strip",  # Nuke + NukeUI share `package staged`
+]
+
+# 6 — Apple library-evolution stress. Filtered to the umbrella product to
+# keep build time bounded — the .swiftinterface emission path is the same.
+[[package]]
+name = "swift-collections"
+url = "https://github.com/apple/swift-collections"
+version = "1.1.4"
+min_versions = { ios = "13.0" }
+args = ["--product", "Collections"]
+expected_products = ["Collections"]
+exercises = [
+    "library-evolution",
+    "inject_swiftmodule-swiftinterface",
+    "string-interpolation-walker",
+    "non-literal-products-surgery-fallback",  # `products: _products` (variable)
+]
+known_broken = true
+broken_signature = "['BitCollections', 'DequeModule', 'HashTreeCollections', 'HeapModule', 'OrderedCollections']"
+broken_reason = "Prepare + Execute now succeed (string-interpolation walker + non-literal-products surgery fallback both landed 2026-05-21). Remaining: the Collections umbrella product depends on sibling internal targets (BitCollections, DequeModule, HashTreeCollections, HeapModule, OrderedCollections) which are statically linked into Collections.framework's binary, but their .swiftmodule directories aren't bundled into the xcframework — so a Swift consumer can't import Collections (the .swiftinterface references the siblings). Fix would require either bundling sibling .swiftmodules into the umbrella framework's Modules/ or shipping each sibling as its own xcframework. Surfaced 2026-05-21 by this harness."
+
+# 7 — Binary mode + binary discovery. Pre-vendored Lottie.xcframework
+# via SPM binary target. Cheap canary for the --binary code path.
+[[package]]
+name = "lottie-spm"
+url = "https://github.com/airbnb/lottie-spm"
+version = "4.5.0"
+min_versions = { ios = "13.0" }
+args = ["--binary"]
+expected_products = ["Lottie"]
+exercises = [
+    "binary-mode",
+    "discover_binary_artifacts",
+]
+notes = "Pre-vendored binary target. Stub _LottieStub target also present — exercises binary + non-library-target filtering."
+
+# 8 — Static-slice vendor xcframework → dynamic promotion. The path that
+# only fires when a vendor ships an already-static .xcframework binary.
+[[package]]
+name = "sentry-cocoa"
+url = "https://github.com/getsentry/sentry-cocoa"
+version = "8.57.0"
+min_versions = { ios = "13.0" }
+args = ["--binary", "--product", "Sentry"]
+expected_products = ["Sentry"]
+exercises = [
+    "binary-mode",
+    "promote_binary_xcframework_static_to_dynamic",
+    "requested-platform-slice-filter",
+]
+
+# 9 — --include-deps transitive build. Pulls swift-clocks,
+# swift-concurrency-extras, xctest-dynamic-overlay, combine-schedulers.
+[[package]]
+name = "swift-dependencies"
+url = "https://github.com/pointfreeco/swift-dependencies"
+version = "1.6.3"
+min_versions = { ios = "13.0" }
+args = ["--include-deps", "--product", "Dependencies"]
+expected_products = [
+    "Dependencies",
+    "Clocks",
+    "CombineSchedulers",
+    "ConcurrencyExtras",
+    "IssueReporting",
+    "XCTestDynamicOverlay",
+]
+exercises = [
+    "include-deps-transitive",
+    "executable-target-filtering",
+    "version-specific-manifest-add-product",  # Package@swift-5.9.swift active
+    "transitive-sibling-xcframeworks",  # `.package(url:...)` deps → sibling xcframeworks
+    "prune-child-manifest-for-products",  # carton-class dev deps stripped before child resolve
+]
+notes = "Each transitive `.package(url:...)` dep listed in `expected_products` ships as its own xcframework so the umbrella's `.swiftinterface @_exported import`s resolve. The child runs prune their Package.swift to drop `#if`-gated dev-only dependencies (carton, swift-docc-plugin, …) before `swift package resolve` ever sees them."
+
+# 10 — Bridge clang modules. The canonical WCDB_Private case — the
+# hardest injection path in the tool. Heavy C/C++ sources + project-shipped
+# module.modulemap that must be materialised inside the framework.
+[[package]]
+name = "wcdb"
+url = "https://github.com/Tencent/wcdb"
+version = "v2.1.10"
+min_versions = { ios = "13.0" }
+args = ["--product", "WCDBSwift"]
+expected_products = ["WCDBSwift"]
+exercises = [
+    "bridge_clang_modules",
+    "inject_bridge_clang_modules",
+    "mixed-c-cxx-objc-sources",
+    "external-sqlcipher-dep",
+]
+notes = "The hard one. Bridge clang module shim walking — keep in the matrix even if expensive."
+
+# 11 — Dedup-overlap rewrite path. Stripe's umbrella product depends on
+# StripeCore and StripeUICore (.target, not .library), forcing the planner
+# to rewrite the umbrella's Package.swift to consume the siblings as
+# .binaryTarget before its own archive runs.
+[[package]]
+name = "stripe-ios"
+url = "https://github.com/stripe/stripe-ios"
+version = "24.0.0"
+min_versions = { ios = "15.0" }
+args = [
+    "--product", "Stripe",
+    "--target", "StripeCore", "--target", "StripeUICore",
+    "--target", "StripeApplePay", "--target", "StripePayments", "--target", "StripePaymentsUI",
+]
+expected_products = ["Stripe", "StripeCore", "StripeUICore", "StripeApplePay", "StripePayments", "StripePaymentsUI"]
+# StripePayments.swiftinterface imports Stripe3DS2 (a separately-distributed
+# Stripe internal target). The matrix intentionally doesn't build it — adding
+# it would balloon build time without exercising any new code path. Real
+# Stripe consumers ship Stripe3DS2 alongside via SwiftPM. Documented opt-out
+# so the verify's clang-import check passes on this entry.
+allowed_unresolved = ["Stripe3DS2"]
+exercises = [
+    "dedup-overlap",
+    "_compute_dedup_substitutions",
+    "edit_replace_with_binary_target",
+    "internal-target-deps",
+]
+notes = "Multi-product + internal .target sibling deps. Triggers the dedup-overlap rewrite — Stripe.xcframework would otherwise statically embed StripeCore. All five sibling .targets the Stripe umbrella `.swiftinterface` imports are listed so the produced bundle is consumer-complete (a partial build leaves unresolved `import StripeApplePay`/`StripePayments`/`StripePaymentsUI`)."

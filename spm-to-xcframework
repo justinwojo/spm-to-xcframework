@@ -257,6 +257,33 @@ class Config:
     # to opt out (e.g. to reproduce legacy single-shot behavior for
     # debugging). See REWRITE_DESIGN.md §5.4 dedup-overlap.
     no_dedup_overlap: bool = False
+    # When False (default), the top-level orchestrator
+    # `_run_source_mode_with_transitives` recurses one level into each
+    # external `.product(name:, package:)` dependency of the root's
+    # REGULAR targets, building each transitive checkout as its own
+    # sibling xcframework. Pass --no-transitive-products to skip the
+    # recursion (the umbrella may then ship with dangling .swiftinterface
+    # imports — useful only for legacy workflows where the consumer
+    # ignores the dropped modules).
+    no_transitive_products: bool = False
+    # When False (default), a transitive sibling that fails plan/build/
+    # verify aborts the whole run — shipping the umbrella with a missing
+    # sibling that its .swiftinterface imports would dangle at consume
+    # time. Pass --best-effort-transitives to continue with whatever
+    # transitives succeeded; the umbrella runs anyway and the failed
+    # transitives are skipped with a warning.
+    best_effort_transitives: bool = False
+    # Internal: set True for child invocations spawned by
+    # `_run_source_mode_with_transitives` to suppress shared-output-
+    # manifest reads/writes/cleanup (the orchestrator owns those for the
+    # whole tree) and to prefix banners with `[transitive: <identity>]`.
+    # Never set this from the CLI.
+    child_run: bool = False
+    # Output sink populated by `_finalize_with_verify` when child_run is
+    # True: the orchestrator drains each child's list, merges them with
+    # the umbrella's entries, and writes one manifest at the end.
+    # Always empty on parent Configs.
+    collected_entries: List["ManifestEntry"] = field(default_factory=list)
     work_dir: Optional[Path] = None  # set in main() before fetch/inspect run
 
     @property
@@ -277,7 +304,7 @@ class Config:
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 class Linkage:
@@ -343,6 +370,50 @@ class Target:
 
 
 @dataclass
+class TransitivePackageInfo:
+    """A directly-referenced external dependency package: its SPM identity
+    (as used in `.product(name: X, package: identity)` from the root's
+    targets), the resolved checkout path under `<staged>/.build/checkouts/`,
+    and its dumped library products.
+
+    Populated by Inspect for every package identity that any REGULAR target
+    in the root package references via `.product(name:, package:)`. The
+    planner reads from this pre-computed data so it stays subprocess-free
+    (Plan purity contract).
+    """
+
+    identity: str                    # SPM identity, e.g. "swift-clocks"
+    checkout_path: Path              # absolute, under .build/checkouts/
+    products: List["Product"]        # parsed via _parse_dump on the checkout
+    tools_version: str               # for active-manifest selection in Prepare
+    # The exact product names the root's REGULAR targets imported from this
+    # identity via `.product(name: X, package: <identity>)`. Order preserved;
+    # duplicates removed. The orchestrator passes these to the child run as
+    # `Config.product_filters` so the child only builds what the umbrella
+    # actually consumes, and the child's manifest pruner uses them to
+    # compute the closure of external `.package(url:)` deps that must be
+    # kept in the pre-staged Package.swift. The orchestrator may further
+    # trim this list to only those products imported by IN-CLOSURE root
+    # targets before handing it to the child.
+    referenced_products: List[str] = field(default_factory=list)
+    # Root-package target names that reference this transitive identity via
+    # `.product(name:, package:)`. The orchestrator intersects this set with
+    # the user's selected-target closure (product_filters + target_filters,
+    # expanded by internal dep edges) to drop transitives reached only from
+    # unrelated regular helper/example targets — avoiding fail-fast aborts on
+    # external dependencies that the umbrella product would never link.
+    referencing_root_targets: List[str] = field(default_factory=list)
+    # Per-product attribution: product name -> ordered list of root REGULAR
+    # target names that reference that specific product. Populated by Inspect
+    # so the orchestrator can trim `referenced_products` down to only those
+    # products an IN-CLOSURE root target actually imports — without this, a
+    # package referenced by two different root targets via two different
+    # products would force the child to build BOTH products even if only one
+    # caller is in the user's selection.
+    product_to_root_targets: Dict[str, List[str]] = field(default_factory=dict)
+
+
+@dataclass
 class Package:
     """Typed snapshot of `swift package dump-package` for the staged
     package. Read-only after Inspect; the planner consumes it."""
@@ -355,11 +426,33 @@ class Package:
     schemes: List[str]              # from xcodebuild -list -json against staged
     raw_dump: dict                  # untouched dump-package JSON, for debugging
     staged_dir: Path
+    # Direct (1st-level) external dependency packages whose products the
+    # root's REGULAR targets reference via `.product(name:, package:)`.
+    # Populated by Inspect when the root has external product deps, empty
+    # for self-contained packages. Consumed by the top-level orchestrator
+    # `_run_source_mode_with_transitives` to drive in-process recursion —
+    # one child `_run_source_mode` call per identity, building each
+    # transitive checkout as its own xcframework alongside the umbrella.
+    transitive_packages: List["TransitivePackageInfo"] = field(default_factory=list)
 
     def target_by_name(self, name: str) -> Optional[Target]:
         for t in self.targets:
             if t.name == name:
                 return t
+        return None
+
+    def transitive_package_by_identity(
+        self, identity: str
+    ) -> Optional["TransitivePackageInfo"]:
+        """Case-insensitive lookup: SPM normalises identities to lowercase
+        in `dump-package`'s `.product` shape, but the value the manifest
+        passes to `package:` is whatever the author wrote in their
+        `.package(...)` declaration.
+        """
+        target_lower = identity.lower()
+        for tp in self.transitive_packages:
+            if tp.identity.lower() == target_lower:
+                return tp
         return None
 
 
@@ -1737,6 +1830,209 @@ def discover_schemes(staged_dir: Path, verbose: bool = False) -> List[str]:
     return [str(s) for s in schemes if isinstance(s, str)]
 
 
+def _collect_referenced_package_products(
+    raw_dump: dict, targets: List[Target]
+) -> "dict[str, dict]":
+    """Enumerate the `.product(name:, package:)` references that any
+    REGULAR target in the root package makes against external packages,
+    keyed by SPM identity.
+
+    Filtering to REGULAR targets matches what the planner ultimately builds
+    — test/macro/plugin targets are never built as xcframeworks, so we
+    don't want their transitive product deps to drive patching of foreign
+    checkouts. The dump-package shape we look for is:
+
+        {"product": ["ProductName", "package-identity", null, null]}
+
+    Returns an ordered dict keyed by identity. Each value is a dict with:
+      - "products": ordered list of distinct product names the root
+        referenced from this identity (used to scope the child build via
+        `Config.product_filters` and to drive prune_child's needed-
+        identity closure).
+      - "root_targets": ordered list of distinct root REGULAR target
+        names that reference this identity (used by the orchestrator to
+        drop transitives reachable only from helper/example targets
+        outside the user's selected-target closure).
+      - "product_to_root_targets": dict from product name to ordered
+        list of root REGULAR target names that reference that specific
+        product. Preserves the fine-grained edge attribution the two
+        aggregate lists above lose, so the orchestrator can trim
+        `referenced_products` down to only the products imported by
+        in-closure root targets.
+    """
+    target_kind_by_name = {t.name: t.kind for t in targets}
+    by_identity: "dict[str, dict]" = {}
+    for t in raw_dump.get("targets", []) or []:
+        if not isinstance(t, dict):
+            continue
+        name = t.get("name")
+        if not isinstance(name, str):
+            continue
+        if target_kind_by_name.get(name) != TargetKind.REGULAR:
+            continue
+        for dep in t.get("dependencies", []) or []:
+            if not isinstance(dep, dict):
+                continue
+            prod = dep.get("product")
+            if not isinstance(prod, list) or len(prod) < 2:
+                continue
+            product_name = prod[0]
+            identity = prod[1]
+            if not isinstance(identity, str) or not isinstance(product_name, str):
+                continue
+            entry = by_identity.setdefault(
+                identity,
+                {"products": [], "root_targets": [], "product_to_root_targets": {}},
+            )
+            if product_name not in entry["products"]:
+                entry["products"].append(product_name)
+            if name not in entry["root_targets"]:
+                entry["root_targets"].append(name)
+            per_product = entry["product_to_root_targets"].setdefault(
+                product_name, []
+            )
+            if name not in per_product:
+                per_product.append(name)
+    return by_identity
+
+
+def _show_dependencies(staged_dir: Path, verbose: bool) -> Optional[dict]:
+    """Run `swift package show-dependencies --format json` to get the
+    resolved dependency tree (each entry has identity, version, and the
+    on-disk `path` to the checkout). Returns the parsed JSON or None on
+    failure (treated as "no transitive packages" — Plan/Prepare gracefully
+    no-op).
+    """
+    cp = subprocess.run(
+        ["swift", "package", "show-dependencies", "--format", "json"],
+        cwd=str(staged_dir),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if cp.returncode != 0:
+        verbose_log(
+            verbose,
+            f"  swift package show-dependencies failed: "
+            f"{(cp.stderr or '').rstrip().splitlines()[-3:]}",
+        )
+        return None
+    try:
+        return json.loads(cp.stdout)
+    except json.JSONDecodeError as exc:
+        verbose_log(verbose, f"  show-dependencies JSON parse failed: {exc}")
+        return None
+
+
+def _flatten_dependency_tree(tree: dict) -> dict:
+    """Walk the `show-dependencies` JSON (which is recursive) and return a
+    flat dict mapping identity → checkout path string for every node
+    reachable from the root. The root itself is excluded — only its
+    transitive deps appear.
+    """
+    flat: dict = {}
+
+    def walk(node: dict) -> None:
+        deps = node.get("dependencies") or []
+        for dep in deps:
+            if not isinstance(dep, dict):
+                continue
+            identity = dep.get("identity")
+            path = dep.get("path")
+            if isinstance(identity, str) and isinstance(path, str):
+                if identity not in flat:
+                    flat[identity] = path
+            walk(dep)
+
+    walk(tree)
+    return flat
+
+
+def _discover_transitive_packages(
+    staged_dir: Path,
+    raw_dump: dict,
+    targets: List[Target],
+    verbose: bool,
+) -> List[TransitivePackageInfo]:
+    """Enumerate the direct external-package deps of the root's REGULAR
+    targets, look up each one's resolved checkout, and dump-package the
+    checkout to get its products list. Returns one
+    `TransitivePackageInfo` per directly-referenced identity; packages
+    pulled in only by test/macro/plugin paths are skipped at the source.
+
+    Failure modes (each results in skipping the affected identity, never
+    a hard error):
+      - show-dependencies returns no entry for the identity (e.g. the
+        package wasn't fully resolved)
+      - the checkout's `dump-package` fails (rare — would mean the
+        package author shipped a broken manifest)
+    """
+    referenced_by_identity = _collect_referenced_package_products(raw_dump, targets)
+    if not referenced_by_identity:
+        return []
+
+    tree = _show_dependencies(staged_dir, verbose=verbose)
+    if tree is None:
+        return []
+    flat = _flatten_dependency_tree(tree)
+    if not flat:
+        return []
+
+    # Case-insensitive identity lookup so root manifests that write
+    # `package: "Swift-Clocks"` still match the SPM-normalised
+    # "swift-clocks" identity.
+    flat_ci = {k.lower(): (k, v) for k, v in flat.items()}
+
+    out: List[TransitivePackageInfo] = []
+    for ref, ref_entry in referenced_by_identity.items():
+        ref_products = ref_entry["products"]
+        ref_root_targets = ref_entry["root_targets"]
+        ref_p2rt = ref_entry["product_to_root_targets"]
+        match = flat_ci.get(ref.lower())
+        if match is None:
+            verbose_log(
+                verbose,
+                f"  transitive: identity {ref!r} referenced by root but "
+                f"not present in show-dependencies output (skipping)",
+            )
+            continue
+        identity, checkout_str = match
+        checkout_path = Path(checkout_str)
+        if not (checkout_path / "Package.swift").is_file() and not any(
+            checkout_path.glob("Package@swift-*.swift")
+        ):
+            verbose_log(
+                verbose,
+                f"  transitive: {identity!r} at {checkout_path} has no "
+                f"Package.swift (skipping)",
+            )
+            continue
+        try:
+            t_raw, t_products, _t_targets, _t_platforms, _t_name, t_tools = (
+                dump_package(checkout_path)
+            )
+        except Exception as exc:  # noqa: BLE001 — Inspect must not crash
+            verbose_log(
+                verbose,
+                f"  transitive: dump-package failed for {identity!r}: {exc}",
+            )
+            continue
+        out.append(
+            TransitivePackageInfo(
+                identity=identity,
+                checkout_path=checkout_path,
+                products=t_products,
+                tools_version=t_tools,
+                referenced_products=list(ref_products),
+                referencing_root_targets=list(ref_root_targets),
+                product_to_root_targets={
+                    p: list(rts) for p, rts in ref_p2rt.items()
+                },
+            )
+        )
+    return out
+
+
 def inspect_package(config: Config, staged_dir: Path) -> Package:
     """Top-level Inspect entry point. Reads only — no filesystem mutations
     on the staged tree. Wires together dump_package + scan + scheme list."""
@@ -1744,6 +2040,9 @@ def inspect_package(config: Config, staged_dir: Path) -> Package:
     raw, products, targets, platforms, name, tools_version = dump_package(staged_dir)
     scan_target_languages(staged_dir, targets)
     schemes = discover_schemes(staged_dir, verbose=config.verbose)
+    transitive = _discover_transitive_packages(
+        staged_dir, raw, targets, verbose=config.verbose
+    )
     return Package(
         name=name,
         tools_version=tools_version,
@@ -1753,6 +2052,7 @@ def inspect_package(config: Config, staged_dir: Path) -> Package:
         schemes=schemes,
         raw_dump=raw,
         staged_dir=staged_dir,
+        transitive_packages=transitive,
     )
 
 
@@ -2398,6 +2698,27 @@ def plan_source_build(config: Config, package: Package) -> Plan:
                 f"Available products: {available}"
             )
 
+    # Third pass: auto-discover statically-linked sibling targets. For
+    # each planned unit, compute the transitive internal-target-dep
+    # closure; any target in that closure that isn't already owned by a
+    # planned unit gets its own build unit (and Package.swift edit).
+    # Dedup-overlap (Execute) then rewrites the umbrella's manifest to
+    # consume the siblings as `.binaryTarget`s, so the umbrella's
+    # framework dynamically links to them instead of statically embedding
+    # them. Without this, an umbrella that `@_exported import`s siblings
+    # (swift-collections: Collections re-exports BitCollections,
+    # DequeModule, ...) emits an xcframework whose `.swiftinterface`
+    # references siblings whose `.swiftmodule` isn't anywhere on the
+    # consumer's module search path, so `import Collections` fails to
+    # type-check.
+    #
+    # Skipped when the manifest wraps targets in a user-defined helper
+    # type (the textual dedup-overlap rewriter can't disambiguate
+    # `.target(name: T, ...)` between `Target.target` and
+    # `CustomTarget.target` — swift-collections is the canonical case).
+    if not _manifest_uses_custom_target_wrapper(package):
+        _auto_synth_sibling_units(plan, package, taken_product_names)
+
     if not plan.build_units:
         raise PlanError(
             "Plan produced zero build units. Did --product filter out "
@@ -2405,7 +2726,165 @@ def plan_source_build(config: Config, package: Package) -> Plan:
             "products?"
         )
 
+    # Transitive `.product(name:, package:)` references that need their own
+    # sibling xcframework are handled by the top-level orchestrator
+    # `_run_source_mode_with_transitives`: each `TransitivePackageInfo`
+    # turns into a fresh `_run_source_mode` call against the resolved
+    # checkout. Plan stays single-package and subprocess-free.
+
     return plan
+
+
+_CUSTOM_TARGET_WRAPPER_SIGNALS = (
+    "func toTarget(",   # canonical: swift-collections' CustomTarget.toTarget
+    ": [CustomTarget]",  # typed array of a non-Target helper
+)
+
+
+def _manifest_uses_custom_target_wrapper(package: Package) -> bool:
+    """True iff the package's Package.swift defines its targets through
+    a user-supplied helper type whose own `.target(...)` static method
+    shadows `Target.target`.
+
+    The textual dedup-overlap rewriter (`edit_replace_with_binary_target`)
+    can't distinguish between `Target.target(name: T, ...)` and
+    `CustomTarget.target(name: T, ...)` at the call site, since both
+    appear as `.target(name: T, ...)` in source. When the manifest's
+    targets array contains custom-wrapper calls, the rewriter ends up
+    replacing the wrapper call with `.binaryTarget(...)` — which fails
+    because the wrapper type has no `binaryTarget` static method.
+
+    We refuse to auto-synth sibling build units for such packages: the
+    umbrella product reverts to statically embedding its siblings (the
+    pre-auto-discovery default), and the package stays correctly
+    classified as KNOWN_BROKEN by the integration matrix instead of
+    failing hard mid-Execute.
+
+    Detection scans the active manifest text for either of the two
+    canonical signals listed in `_CUSTOM_TARGET_WRAPPER_SIGNALS`.
+    Missing-file / unreadable-manifest cases conservatively return
+    False so well-formed packages don't lose the optimisation.
+    """
+    if package.staged_dir is None:
+        return False
+    candidates = (
+        package.staged_dir / "Package.swift",
+        package.staged_dir / f"Package@swift-{package.tools_version}.swift",
+    )
+    for manifest_path in candidates:
+        if not manifest_path.is_file():
+            continue
+        try:
+            text = manifest_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if any(sig in text for sig in _CUSTOM_TARGET_WRAPPER_SIGNALS):
+            return True
+    return False
+
+
+def _auto_synth_sibling_units(
+    plan: Plan, package: Package, taken_product_names: Set[str]
+) -> None:
+    """Walk planned build units, find statically-linked internal sibling
+    targets not yet owned by any unit, and add a unit + manifest edit
+    for each so they ship as their own xcframeworks.
+
+    Behaviour per discovered sibling T:
+
+      - T matches an existing `.library(name: T, ...)` product → reuse
+        the product. If currently non-dynamic, emit a
+        `synth_dynamic_library` edit (planner re-exports it as a dynamic
+        sibling product). The build unit's name is the original product
+        name so consumers depend on it by the same identifier.
+      - T is internal-only (no matching product) → SKIP. Pure helper
+        targets often rely on the umbrella's `linkerSettings` /
+        framework dependencies (e.g. WCDB's `bridge`, `common`, and
+        `objc-core` targets link against CoreFoundation via the
+        umbrella WCDBSwift's settings). Standalone-built as a dynamic
+        `.library` they'd fail at the link step with `Undefined symbol:
+        _CFAllocatorGetDefault` and friends. The `--target T` escape
+        hatch still works as the explicit opt-in for this case.
+
+    Skipped (won't produce a unit):
+      - Non-regular targets (system / binary / executable / test /
+        plugin / macro): system targets are bundled by
+        `inject_system_clang_modules`; binary targets are already
+        xcframeworks via SPM resolve; the rest can't be built as
+        xcframeworks.
+      - Existing products that are system-only or binary-only.
+    """
+    if not plan.build_units:
+        return
+
+    deps_map = compute_internal_target_deps(package)
+
+    # Snapshot of targets already covered by SOME planned unit. Targets
+    # added by this pass go into `covered` too so we don't double-emit
+    # within one invocation.
+    covered: Set[str] = set()
+    for bu in plan.build_units:
+        for t in bu.source_targets:
+            covered.add(t)
+
+    # Walk planned units in stable order and collect uncovered siblings,
+    # preserving order so the resulting build_units list is deterministic.
+    siblings_to_add: List[str] = []
+    for bu in list(plan.build_units):
+        for src_t in bu.source_targets:
+            for sibling in sorted(deps_map.get(src_t, set())):
+                if sibling in covered:
+                    continue
+                tgt = package.target_by_name(sibling)
+                if tgt is None or tgt.kind != TargetKind.REGULAR:
+                    continue
+                covered.add(sibling)
+                siblings_to_add.append(sibling)
+
+    if not siblings_to_add:
+        return
+
+    existing_product_names = {p.name for p in package.products}
+    existing_planned_names = {bu.name for bu in plan.build_units}
+
+    for sibling in siblings_to_add:
+        if sibling not in existing_product_names:
+            # Internal helper target with no public product wrapper.
+            # Don't auto-promote — see docstring rationale (WCDB-style
+            # CoreFoundation link failure).
+            continue
+        existing = next(p for p in package.products if p.name == sibling)
+        if _is_system_only_product(existing, package):
+            continue
+        if _is_binary_only_product(existing, package):
+            continue
+        language = _derive_product_language(existing, package)
+        if existing.linkage != Linkage.DYNAMIC:
+            synthetic_name = _allocate_synthetic_product_name(
+                existing.name, taken_product_names
+            )
+            plan.package_swift_edits.append(
+                PackageSwiftEdit(
+                    kind="synth_dynamic_library",
+                    product_name=synthetic_name,
+                    targets=list(existing.targets),
+                )
+            )
+            scheme = synthetic_name
+        else:
+            scheme = resolve_scheme(existing.name, package.schemes)
+        plan.build_units.append(
+            BuildUnit(
+                name=existing.name,
+                scheme=scheme,
+                framework_name=existing.name,
+                language=language,
+                archive_strategy="archive",
+                source_targets=list(existing.targets),
+                synthetic=False,
+            )
+        )
+        existing_planned_names.add(existing.name)
 
 
 def plan_binary_build(config: Config, artifacts: Sequence[BinaryArtifact]) -> Plan:
@@ -2703,11 +3182,14 @@ def _make_code_token_view(text: str) -> str:
     well-formed manifest.
 
     Limitations match `_strip_swift_comments`: only `"..."` strings are
-    tracked. `#\"...\"#` raw strings, `\"\"\"...\"\"\"` multi-line
-    strings, and `\\(...)` interpolation aren't supported here — they
-    would be rejected upstream by
+    tracked. `#\"...\"#` raw strings and `\"\"\"...\"\"\"` multi-line
+    strings aren't supported here — they would be rejected upstream by
     `_assert_no_unsupported_swift_constructs` before any prepare-time
-    edit runs.
+    edit runs. `\\(...)` string interpolation IS handled by recursing
+    through `_balanced_close` to find the closing `)` of the embedded
+    expression, then resuming string mode — matching what
+    `_balanced_close` itself does, so the two views agree on where
+    strings end.
 
     On an unterminated string or block comment, falls through
     conservatively: copies the suspicious tail verbatim. The trigger
@@ -2721,12 +3203,22 @@ def _make_code_token_view(text: str) -> str:
     while i < n:
         c = text[i]
         # Double-quoted string: blank delimiters + body with spaces, keep newlines.
+        # Honors `\(...)` interpolation via recursion through `_balanced_close`,
+        # so a string like `"Sources/\(name + "Tests")"` doesn't mis-terminate
+        # on the inner `"` of the interpolation expression.
         if c == '"':
             j = i + 1
             terminated = False
             while j < n:
                 cc = text[j]
                 if cc == "\\" and j + 1 < n:
+                    if text[j + 1] == "(":
+                        close_idx = _balanced_close(text, j + 1)
+                        if close_idx == -1:
+                            # Unterminated interpolation — bail conservatively.
+                            break
+                        j = close_idx + 1
+                        continue
                     j += 2
                     continue
                 if cc == '"':
@@ -2790,11 +3282,11 @@ def _assert_no_unsupported_swift_constructs(text: str) -> None:
     walker can't reason about.
 
     The walker handles double-quoted strings (with backslash escapes),
-    line comments (//) and block comments. It does NOT handle Swift raw
-    strings (#"..."#), multi-line triple-quoted strings, or string
-    interpolation: parens inside an interpolated expression would fool
-    the depth counter, and unescaped quotes inside a raw string would
-    confuse the string-skip state.
+    line comments (//), block comments, and string interpolation
+    (`\\(...)` via recursion through the walker). It does NOT handle
+    Swift raw strings (`#"..."#`) or multi-line triple-quoted strings:
+    unescaped quotes inside a raw string would confuse the string-skip
+    state, and triple-quotes use a different terminator.
 
     To avoid flagging false positives on doc comments that legitimately
     mention these constructs (e.g. `/// Uses #"..."# internally`), we
@@ -2824,12 +3316,11 @@ def _assert_no_unsupported_swift_constructs(text: str) -> None:
             "which the balanced-paren walker doesn't understand. "
             "File a bug if this needs to be supported."
         )
-    if '\\(' in scanned:
-        raise PrepareUserError(
-            "Package.swift uses Swift string interpolation (`\\(...)`), "
-            "which the balanced-paren walker doesn't understand. "
-            "File a bug if this needs to be supported."
-        )
+    # Swift string interpolation (`\\(...)`) used to be rejected here but
+    # the walker now handles it via recursion through itself in the
+    # string-skip path. Real-world manifests use it heavily (e.g.
+    # swift-collections' Package.swift builds path strings from target
+    # names via `"Sources/\\(name)"`).
 
 
 def _balanced_close(text: str, open_idx: int) -> int:
@@ -2838,11 +3329,13 @@ def _balanced_close(text: str, open_idx: int) -> int:
     string literals (`"..."` with `\\"` escapes), `// ...` line comments, and
     `/* ... */` block comments. Returns -1 if no matching close is found.
 
-    Does NOT handle Swift multi-line triple-quoted strings, raw strings,
-    or string interpolation. Callers should run
+    Does NOT handle Swift multi-line triple-quoted strings or raw
+    strings. `\\(...)` string interpolation IS handled by recursing
+    through this same walker to find the closing `)` of the interpolation
+    expression, then resuming string mode. Callers should still run
     `_assert_no_unsupported_swift_constructs` on the full manifest text
-    before invoking this walker so unsupported syntax fails loudly with a
-    targeted PrepareError instead of being silently mis-parsed.
+    so the unsupported constructs that remain fail loudly with a targeted
+    PrepareError instead of being silently mis-parsed.
     """
     if open_idx < 0 or open_idx >= len(text):
         return -1
@@ -2883,12 +3376,22 @@ def _balanced_close(text: str, open_idx: int) -> int:
             if block_depth > 0:
                 return -1
             continue
-        # String literal: skip to closing quote, honoring `\\"` escapes.
+        # String literal: skip to closing quote, honoring `\\"` escapes
+        # and `\(...)` interpolation. Interpolation embeds an arbitrary
+        # Swift expression (which itself can contain strings, comments,
+        # nested interpolation, and brackets) — we recurse through this
+        # same walker to find the closing `)`, then resume string mode.
         if c == '"':
             i += 1
             while i < n:
                 cc = text[i]
                 if cc == "\\" and i + 1 < n:
+                    if text[i + 1] == "(":
+                        close_idx = _balanced_close(text, i + 1)
+                        if close_idx == -1:
+                            return -1
+                        i = close_idx + 1
+                        continue
                     i += 2
                     continue
                 if cc == '"':
@@ -2974,6 +3477,12 @@ def _flatten_to_top_level(span: str) -> str:
             while j < n:
                 cc = span[j]
                 if cc == "\\" and j + 1 < n:
+                    if span[j + 1] == "(":
+                        close_idx = _balanced_close(span, j + 1)
+                        if close_idx == -1:
+                            break
+                        j = close_idx + 1
+                        continue
                     j += 2
                     continue
                 if cc == '"':
@@ -3104,6 +3613,101 @@ def _has_binary_target_with_name(text: str, target_name: str) -> bool:
         if _top_level_name_label(span) == target_name:
             return True
         pos = close_idx + 1
+
+
+_PACKAGE_CALL_RE = re.compile(r"\bPackage\s*\(")
+_PRODUCTS_LABEL_RE = re.compile(r"\bproducts\s*:")
+
+
+def edit_append_synth_product_to_package(
+    manifest_text: str, product_name: str, targets: Sequence[str]
+) -> str:
+    """Append `.library(name: <product_name>, type: .dynamic, targets:
+    [<targets>])` to the top-level `Package(...)` call's `products:`
+    argument by rewriting `products: <expr>` to `products: <expr> +
+    [<synth>]`.
+
+    Fallback for `swift package add-product` failures when the manifest's
+    `products:` argument is not a literal array. Real example:
+    swift-collections 1.1.4 builds its product list programmatically
+    (`products: _products`), which SPM rejects with "unable to find
+    array literal for 'products' argument".
+
+    The `(<expr>) + [<synth>]` rewrite is well-typed both for literal
+    arrays and for any `[Product]`-typed expression, so we don't need
+    to locate the closing `]` of an array — we just splice at the
+    expression's end (next top-level comma or the closing `)` of the
+    Package call). The original expression is wrapped in parens to defend
+    against precedence surprises: a manifest written as
+    `products: cond ? a : b` would, without the wrap, parse as
+    `products: cond ? a : (b + [<synth>])` because `+` binds tighter than
+    `?:`. The same hazard applies to `??`. The synthetic entry's type is
+    always `.dynamic` because that's the only kind of synthetic library
+    we currently emit via this path; `synth_library` (non-dynamic) goes
+    through add-product on packages whose manifest shape allows it.
+    """
+    code_view = _make_code_token_view(manifest_text)
+    m = _PACKAGE_CALL_RE.search(code_view)
+    if not m:
+        raise PrepareUserError(
+            "synth-product fallback: no top-level `Package(` call found "
+            "in the manifest."
+        )
+    pkg_open = m.end() - 1
+    pkg_close = _balanced_close(manifest_text, pkg_open)
+    if pkg_close == -1:
+        raise PrepareUserError(
+            "synth-product fallback: unmatched `(` for `Package(`; "
+            "manifest may be malformed."
+        )
+    body_start = pkg_open + 1
+    body_end = pkg_close
+    body = manifest_text[body_start:body_end]
+    body_dz = _depth_zero_view(body)
+    lm = _PRODUCTS_LABEL_RE.search(body_dz)
+    if not lm:
+        raise PrepareUserError(
+            "synth-product fallback: no top-level `products:` argument "
+            "inside the Package(...) call. The manifest shape is not "
+            "supported by this fallback."
+        )
+    # Bound the products expression: from just after `products:` (skipping
+    # any leading horizontal whitespace) to the next top-level comma or
+    # the end of the Package body. Walk back over trailing whitespace so
+    # the closing `)` lands flush against the expression instead of
+    # swallowing pre-comma indentation.
+    expr_start_in_body = lm.end()
+    while (
+        expr_start_in_body < len(body)
+        and body[expr_start_in_body] in " \t"
+    ):
+        expr_start_in_body += 1
+    comma_idx = body_dz.find(",", expr_start_in_body)
+    expr_end_in_body = comma_idx if comma_idx != -1 else len(body)
+    while (
+        expr_end_in_body > expr_start_in_body
+        and body[expr_end_in_body - 1] in " \t\n"
+    ):
+        expr_end_in_body -= 1
+
+    expr_start_offset = body_start + expr_start_in_body
+    expr_end_offset = body_start + expr_end_in_body
+
+    targets_list = ", ".join(_swift_string_literal(t) for t in targets)
+    synth_tail = (
+        f") + [.library(name: {_swift_string_literal(product_name)}, "
+        f"type: .dynamic, targets: [{targets_list}])]"
+    )
+    # Wrap the original expression in parens, then append `+ [<synth>]`.
+    # Done as a single splice so the two edits don't disturb each other's
+    # offsets.
+    return (
+        manifest_text[:expr_start_offset]
+        + "("
+        + manifest_text[expr_start_offset:expr_end_offset]
+        + synth_tail
+        + manifest_text[expr_end_offset:]
+    )
 
 
 def edit_replace_with_binary_target(
@@ -3256,6 +3860,12 @@ def _depth_zero_view(span: str) -> str:
             while j < n:
                 cc = span[j]
                 if cc == "\\" and j + 1 < n:
+                    if span[j + 1] == "(":
+                        close_idx = _balanced_close(span, j + 1)
+                        if close_idx == -1:
+                            break
+                        j = close_idx + 1
+                        continue
                     j += 2
                     continue
                 if cc == '"':
@@ -3435,6 +4045,38 @@ def _read_declared_tools_version(path: Path) -> Optional[Tuple[int, int, int]]:
     return None
 
 
+def _bump_tools_version_if_below(
+    manifest_path: Path, min_version: Tuple[int, int]
+) -> Optional[Tuple[int, int, int]]:
+    """Rewrite the manifest's `// swift-tools-version: X.Y` line to
+    `min_version` if currently below it. Returns the original parsed
+    version if a bump was applied, else None.
+
+    Why: `swift package add-product` requires tools-version >= 5.2; SPM's
+    own error message recommends bumping to 5.5+. Old packages like
+    MBProgressHUD (4.2) use only the manifest-format subset that's
+    backward-compatible with 5.5, so bumping doesn't break the build —
+    it just unblocks the synthetic-product edit.
+    """
+    declared = _read_declared_tools_version(manifest_path)
+    if declared is None:
+        return None
+    if declared[:2] >= min_version:
+        return None
+    try:
+        text = manifest_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    lines = text.splitlines(keepends=True)
+    replacement = f"// swift-tools-version: {min_version[0]}.{min_version[1]}\n"
+    for i, line in enumerate(lines[:8]):
+        if _TOOLS_VERSION_RE.search(line):
+            lines[i] = replacement
+            manifest_path.write_text("".join(lines), encoding="utf-8")
+            return declared
+    return None
+
+
 def _select_active_manifest(staged_dir: Path) -> Path:
     """Pick the Package.swift file SPM will actually read for this toolchain.
 
@@ -3487,6 +4129,91 @@ def _select_active_manifest(staged_dir: Path) -> Path:
         ):
             best = (declared, candidate)
     return best[1] if best is not None else base
+
+
+def _add_product_via_active_manifest_proxy(
+    staged_dir: Path,
+    active_manifest: Path,
+    product_name: str,
+    targets: Sequence[str],
+) -> None:
+    """Run `swift package add-product` so the edit lands in
+    `active_manifest`, even when SPM picks a version-specific manifest
+    (e.g. Package@swift-5.9.swift) over the base Package.swift.
+
+    Problem: `swift package add-product` is hard-coded to edit
+    `Package.swift`. When SPM selects a version-specific manifest as
+    active, the call returns 0, edits Package.swift, and leaves the
+    active manifest untouched — `dump-package` (which reads the active)
+    then shows no product and round-trip validation rejects the edit as
+    a silent no-op. Reproduced on Nuke 12.8.0 and swift-dependencies
+    1.6.3 (both ship Package.swift + Package@swift-5.9.swift).
+
+    Fix: temporarily put the active manifest's text into Package.swift,
+    run add-product (which edits Package.swift in place), then copy the
+    edited content back to the active manifest and restore the original
+    Package.swift.
+    """
+    base_manifest = staged_dir / "Package.swift"
+    if active_manifest == base_manifest:
+        _invoke_swift_add_product(staged_dir, product_name, targets)
+        return
+
+    base_existed = base_manifest.is_file()
+    base_text_before = base_manifest.read_text() if base_existed else None
+    active_text = active_manifest.read_text()
+    try:
+        base_manifest.write_text(active_text)
+        _invoke_swift_add_product(staged_dir, product_name, targets)
+        active_manifest.write_text(base_manifest.read_text())
+    finally:
+        # Restore the original state. If Package.swift didn't exist before
+        # (legal per SE-0152: a package may ship only version-specific
+        # manifests), unlink the temporary file we wrote so we don't leave
+        # a ghost manifest behind that the package never had. Skipping this
+        # would change the manifest set the package presents to SPM on the
+        # next invocation.
+        if base_text_before is not None:
+            base_manifest.write_text(base_text_before)
+        elif not base_existed and base_manifest.is_file():
+            base_manifest.unlink()
+
+
+def _apply_single_synth_edit(
+    staged_dir: Path,
+    active_manifest: Path,
+    product_name: str,
+    targets: Sequence[str],
+) -> None:
+    """Add one synthetic dynamic library via add-product, falling back to
+    manual text surgery if SPM rejects the manifest's `products:` shape.
+
+    SPM's add-product requires `products: [ ... ]` to be a literal array
+    expression in the source. swift-collections (and other packages that
+    build their product list programmatically) instead write something
+    like `products: _products`, which SPM rejects with "unable to find
+    array literal for 'products' argument". In that case we fall through
+    to `edit_append_synth_product_to_package`, which appends the
+    synthetic entry via a `+ [...]` expression that works for both
+    literal arrays and non-literal expressions.
+    """
+    try:
+        _add_product_via_active_manifest_proxy(
+            staged_dir, active_manifest, product_name, targets
+        )
+        return
+    except PrepareBug as exc:
+        if "unable to find array literal" not in str(exc).lower():
+            raise
+        info(
+            f"  swift add-product can't edit non-literal `products:`; "
+            f"falling back to manual surgery for {product_name}"
+        )
+
+    edited = edit_append_synth_product_to_package(
+        active_manifest.read_text(), product_name, targets
+    )
+    active_manifest.write_text(edited)
 
 
 def _invoke_swift_add_product(
@@ -3601,14 +4328,36 @@ def apply_package_swift_edits(staged_dir: Path, plan: Plan) -> str:
     if not snapshot_path.exists():
         snapshot_path.write_text(original_text)
 
+    # `swift package add-product` rejects manifests below tools-version
+    # 5.2 (SPM's own error message recommends 5.5). Old packages like
+    # MBProgressHUD (4.2) work fine under 5.5's manifest format — just
+    # bump the line before invoking add-product. Only relevant when the
+    # plan actually has synth edits.
+    has_synth = any(
+        edit.kind in ("synth_dynamic_library", "synth_library")
+        for edit in plan.package_swift_edits
+    )
+    if has_synth:
+        bumped_from = _bump_tools_version_if_below(manifest_path, (5, 5))
+        if bumped_from is not None:
+            info(
+                f"  Bumped swift-tools-version "
+                f"{bumped_from[0]}.{bumped_from[1]} → 5.5 "
+                f"in {manifest_path.name} (required for add-product)"
+            )
+
     # Apply edits in plan order so the post-edit products array reflects
     # planner sequencing. synth_dynamic_library and synth_library are both
     # implemented by the same `swift package add-product` call; the only
-    # difference is naming policy at plan time.
+    # difference is naming policy at plan time. Routed through a
+    # base-manifest proxy because add-product is hard-coded to edit
+    # Package.swift even when SPM is reading Package@swift-X.Y.swift,
+    # and through a surgery fallback when the manifest's `products:` is
+    # not a literal array.
     for edit in plan.package_swift_edits:
         if edit.kind in ("synth_dynamic_library", "synth_library"):
-            _invoke_swift_add_product(
-                staged_dir, edit.product_name, edit.targets
+            _apply_single_synth_edit(
+                staged_dir, manifest_path, edit.product_name, edit.targets
             )
 
     return original_text
@@ -3849,6 +4598,482 @@ def prepare(staged_dir: Path, plan: Plan, *, verbose: bool = False) -> PreparedP
             staged_dir=staged_dir,
         ),
     )
+
+
+# ============================================================================
+# --- prune_child.py --------------------------------------------------------
+# ============================================================================
+
+
+import json
+import os
+import re
+import stat
+import subprocess
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
+
+
+
+def _identity_from_url(url: str) -> str:
+    """SPM identity = last URL path component, `.git` stripped, lowercased.
+
+    SPM normalises identities this way internally for `.product(name:,
+    package: <identity>)` references, so this mirrors the matching used
+    elsewhere in the codebase (e.g. `_discover_transitive_packages`
+    in inspect.py).
+    """
+    s = url.strip().rstrip("/")
+    if not s:
+        return ""
+    last = s.rsplit("/", 1)[-1]
+    if last.endswith(".git"):
+        last = last[:-4]
+    return last.lower()
+
+
+def _is_word_boundary(text: str, idx: int) -> bool:
+    """True iff `idx` is past end-of-text or the char there isn't an
+    identifier continuation char. Used to confirm `#if` isn't actually
+    the start of `#iffoo` or `#ifdef` (the latter doesn't exist in
+    Swift but a defensive check is cheap).
+    """
+    if idx >= len(text):
+        return True
+    c = text[idx]
+    return not (c.isalnum() or c == "_")
+
+
+def _scan_keyword_after_hash(view: str, hash_idx: int) -> Tuple[str, int]:
+    """Given a `#` at view[hash_idx], return (keyword, end_idx) where
+    `keyword` is the directive keyword (e.g. "if", "endif", "elseif")
+    and `end_idx` points one past the keyword. Skips whitespace between
+    `#` and the keyword. Returns ("", hash_idx + 1) on no match.
+    """
+    j = hash_idx + 1
+    n = len(view)
+    while j < n and view[j] in " \t":
+        j += 1
+    start = j
+    while j < n and (view[j].isalnum() or view[j] == "_"):
+        j += 1
+    return view[start:j], j
+
+
+def _find_matching_endif(view: str, hash_idx: int) -> int:
+    """Given a `#if` at `view[hash_idx]`, return the index of the matching
+    `#endif`'s `#`. Handles nested `#if`/`#elseif`/`#else`/`#endif`.
+    Returns -1 if not found.
+    """
+    n = len(view)
+    kw, i = _scan_keyword_after_hash(view, hash_idx)
+    if kw != "if":
+        return -1
+    nesting = 1
+    while i < n:
+        if view[i] != "#":
+            i += 1
+            continue
+        kw, after = _scan_keyword_after_hash(view, i)
+        if kw == "if":
+            nesting += 1
+            i = after
+            continue
+        if kw == "endif":
+            nesting -= 1
+            if nesting == 0:
+                return i
+            i = after
+            continue
+        # else / elseif keep nesting, skip past.
+        i = after if after > i else i + 1
+    return -1
+
+
+def _strip_top_level_package_mutation_blocks(source: str) -> Tuple[str, List[str]]:
+    """Pass A: drop top-level `#if … #endif` blocks whose body mentions
+    `package.dependencies` or `package.targets`.
+
+    Returns (edited_source, removal_reasons). Reasons are human-readable
+    strings the caller can verbose-log.
+    """
+    view = _make_code_token_view(source)
+    n = len(view)
+    depth = 0
+    i = 0
+    spans: List[Tuple[int, int, str]] = []  # (start, end_exclusive, reason)
+    while i < n:
+        c = view[i]
+        if c in "({[":
+            depth += 1
+            i += 1
+            continue
+        if c in ")}]":
+            depth -= 1
+            i += 1
+            continue
+        if c == "#" and depth == 0:
+            kw, after = _scan_keyword_after_hash(view, i)
+            if kw == "if" and _is_word_boundary(view, after):
+                endif_idx = _find_matching_endif(view, i)
+                if endif_idx == -1:
+                    i += 1
+                    continue
+                # Slice the body from the source (use source to inspect, since
+                # _make_code_token_view blanks strings/comments but keeps
+                # identifiers). We want to know if the body references
+                # `package.dependencies` or `package.targets` as code.
+                body_end = _scan_keyword_after_hash(view, endif_idx)[1]
+                body_view = view[after:endif_idx]
+                if (
+                    "package.dependencies" in body_view
+                    or "package.targets" in body_view
+                ):
+                    # Compute the actual removal span in `source`, swallowing
+                    # the trailing newline (and the leading newline if the
+                    # `#if` started its own line) to keep the file tidy.
+                    start = i
+                    if start > 0 and source[start - 1] == "\n":
+                        start -= 1
+                    end = body_end
+                    if end < len(source) and source[end] == "\n":
+                        end += 1
+                    spans.append(
+                        (start, end, f"#if block mutating package.* (at offset {i})")
+                    )
+                    i = body_end
+                    continue
+        i += 1
+
+    if not spans:
+        return source, []
+
+    out_parts: List[str] = []
+    reasons: List[str] = []
+    cursor = 0
+    for start, end, reason in spans:
+        out_parts.append(source[cursor:start])
+        cursor = end
+        reasons.append(reason)
+    out_parts.append(source[cursor:])
+    return "".join(out_parts), reasons
+
+
+def _find_package_call(source: str) -> Optional[Tuple[int, int]]:
+    """Locate the top-level `Package(...)` constructor call. Returns
+    (open_paren_idx, close_paren_idx_inclusive) or None if not found.
+    """
+    view = _make_code_token_view(source)
+    # Look for `Package` token at file scope. Be tolerant of leading
+    # whitespace between identifier and `(`.
+    for m in re.finditer(r"\bPackage\b", view):
+        j = m.end()
+        n = len(view)
+        while j < n and view[j] in " \t\r\n":
+            j += 1
+        if j < n and view[j] == "(":
+            close = _balanced_close(source, j)
+            if close != -1:
+                return (j, close)
+    return None
+
+
+def _find_dependencies_array_in_package_call(
+    source: str,
+) -> Optional[Tuple[int, int]]:
+    """Within the top-level `Package(...)`, find the `dependencies: [...]`
+    argument array. Returns (open_bracket_idx, close_bracket_idx_inclusive)
+    or None if the argument isn't present.
+    """
+    pkg_call = _find_package_call(source)
+    if not pkg_call:
+        return None
+    open_paren, close_paren = pkg_call
+    view = _make_code_token_view(source)
+    inside_start = open_paren + 1
+    inside_end = close_paren  # exclusive of `)`
+    depth = 0
+    i = inside_start
+    while i < inside_end:
+        c = view[i]
+        if c in "({[":
+            depth += 1
+            i += 1
+            continue
+        if c in ")}]":
+            depth -= 1
+            i += 1
+            continue
+        if depth == 0:
+            # Match `dependencies:` label at the start of an arg position.
+            if (
+                view.startswith("dependencies", i)
+                and (i + 12 >= inside_end or not (view[i + 12].isalnum() or view[i + 12] == "_"))
+            ):
+                j = i + 12
+                while j < inside_end and view[j] in " \t\r\n":
+                    j += 1
+                if j < inside_end and view[j] == ":":
+                    j += 1
+                    while j < inside_end and view[j] in " \t\r\n":
+                        j += 1
+                    if j < inside_end and view[j] == "[":
+                        close = _balanced_close(source, j)
+                        if close == -1:
+                            return None
+                        return (j, close)
+                    return None
+        i += 1
+    return None
+
+
+_PACKAGE_ENTRY_URL_RE = re.compile(r'url\s*:\s*"([^"]+)"')
+
+
+def _prune_top_level_package_entries(
+    source: str, needed_identities: Set[str]
+) -> Tuple[str, List[str]]:
+    """Pass C: in the top-level `Package(...) dependencies: [...]`,
+    drop `.package(url:)` entries whose identity isn't in
+    `needed_identities`.
+
+    Returns (edited_source, removal_reasons). If the dependencies array
+    isn't found, no-op.
+    """
+    arr = _find_dependencies_array_in_package_call(source)
+    if not arr:
+        return source, []
+    open_b, close_b = arr  # close_b points at the `]`
+    view = _make_code_token_view(source)
+    inside_start = open_b + 1
+    inside_end = close_b
+
+    spans: List[Tuple[int, int, str]] = []
+    depth = 0
+    i = inside_start
+    while i < inside_end:
+        c = view[i]
+        if c in "({[":
+            depth += 1
+            i += 1
+            continue
+        if c in ")}]":
+            depth -= 1
+            i += 1
+            continue
+        if depth == 0 and c == ".":
+            # Looking for `.package(`
+            j = i + 1
+            while j < inside_end and view[j] in " \t\r\n":
+                j += 1
+            if view.startswith("package", j) and (
+                j + 7 >= inside_end or not (view[j + 7].isalnum() or view[j + 7] == "_")
+            ):
+                k = j + 7
+                while k < inside_end and view[k] in " \t\r\n":
+                    k += 1
+                if k < inside_end and view[k] == "(":
+                    close_paren = _balanced_close(source, k)
+                    if close_paren == -1 or close_paren >= inside_end:
+                        i += 1
+                        continue
+                    entry_src = source[i : close_paren + 1]
+                    m = _PACKAGE_ENTRY_URL_RE.search(entry_src)
+                    if m:
+                        identity = _identity_from_url(m.group(1))
+                        if identity and identity not in needed_identities:
+                            # Determine removal span: entry + trailing comma
+                            # + trailing newline + leading whitespace if the
+                            # entry was on its own line.
+                            entry_end = close_paren + 1
+                            scan = entry_end
+                            while scan < inside_end and source[scan] in " \t":
+                                scan += 1
+                            if scan < inside_end and source[scan] == ",":
+                                entry_end = scan + 1
+                            scan2 = entry_end
+                            while scan2 < inside_end and source[scan2] in " \t":
+                                scan2 += 1
+                            if scan2 < inside_end and source[scan2] == "\n":
+                                entry_end = scan2 + 1
+                            line_start = source.rfind("\n", inside_start, i) + 1
+                            if source[line_start:i].strip() == "":
+                                entry_start = line_start
+                            else:
+                                entry_start = i
+                            spans.append(
+                                (entry_start, entry_end, f".package({identity})")
+                            )
+                    i = close_paren + 1
+                    continue
+        i += 1
+
+    if not spans:
+        return source, []
+
+    out_parts: List[str] = []
+    reasons: List[str] = []
+    cursor = 0
+    for start, end, reason in spans:
+        out_parts.append(source[cursor:start])
+        cursor = end
+        reasons.append(reason)
+    out_parts.append(source[cursor:])
+    return "".join(out_parts), reasons
+
+
+def _dump_package_json(dir_path: Path) -> dict:
+    """Local wrapper around `swift package dump-package` that returns
+    parsed JSON or raises PrepareUserError on any non-zero exit / parse
+    failure. Inspect's `dump_package` does the same thing but returns
+    typed shards; here we just need the raw JSON to walk product/target
+    closures.
+    """
+    cp = subprocess.run(
+        ["swift", "package", "dump-package"],
+        cwd=str(dir_path),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if cp.returncode != 0:
+        tail = "\n".join((cp.stderr or "").rstrip().splitlines()[-5:])
+        raise PrepareUserError(
+            "prune-child: swift package dump-package failed:\n"
+            + (tail or "  (no stderr)")
+        )
+    try:
+        return json.loads(cp.stdout)
+    except json.JSONDecodeError as exc:
+        raise PrepareUserError(
+            f"prune-child: could not parse dump-package JSON: {exc}"
+        ) from exc
+
+
+def _collect_needed_identities(
+    raw_dump: dict, allowed_products: List[str]
+) -> Set[str]:
+    """From the child's dump-package, walk
+        allowed_products → product.targets → target.dependencies (`product` shape)
+        and recursively into internal target deps (`byName`, `target`)
+        → external identity
+    Return the lowercased identity set the child genuinely needs.
+    """
+    targets_by_name: Dict[str, dict] = {}
+    for t in raw_dump.get("targets", []) or []:
+        if isinstance(t, dict) and isinstance(t.get("name"), str):
+            targets_by_name[t["name"]] = t
+
+    allowed_lower = {p.lower() for p in allowed_products if isinstance(p, str)}
+    needed: Set[str] = set()
+    visited: Set[str] = set()
+
+    def visit(tname: str) -> None:
+        if tname in visited:
+            return
+        visited.add(tname)
+        t = targets_by_name.get(tname)
+        if not t:
+            return
+        for dep in t.get("dependencies", []) or []:
+            if not isinstance(dep, dict):
+                continue
+            prod = dep.get("product")
+            if isinstance(prod, list) and len(prod) >= 2 and isinstance(prod[1], str):
+                needed.add(prod[1].lower())
+                continue
+            for key in ("byName", "target"):
+                v = dep.get(key)
+                if isinstance(v, list) and v and isinstance(v[0], str):
+                    visit(v[0])
+
+    for prod in raw_dump.get("products", []) or []:
+        if not isinstance(prod, dict):
+            continue
+        name = prod.get("name")
+        if not isinstance(name, str):
+            continue
+        # Empty allowed list = no filter (build all products). Honor that
+        # so a buggy caller doesn't accidentally strip every dep.
+        if allowed_lower and name.lower() not in allowed_lower:
+            continue
+        for tn in prod.get("targets", []) or []:
+            if isinstance(tn, str):
+                visit(tn)
+    return needed
+
+
+def prune_child_manifest_for_products(
+    pre_staged_dir: Path,
+    allowed_products: List[str],
+    *,
+    verbose: bool = False,
+) -> None:
+    """Apply Pass A then Pass C to `pre_staged_dir/Package.swift` in place.
+
+    Validation contract: every write is followed by a `dump-package`
+    round-trip. If a pass produces a manifest SPM rejects, we restore
+    the manifest to the most recent validated state (Pass-A's output if
+    Pass C fails; the original text if Pass A fails) and raise
+    PrepareUserError so the orchestrator can decide whether to abort or
+    skip-with-warning (per `--best-effort-transitives`). Keeping Pass
+    A's output on a Pass-C failure preserves a strictly-better manifest
+    for any post-mortem of the pre-staged dir, and the orchestrator
+    abandons the dir anyway in the raise-path so there's no
+    downstream-state risk to the partial rollback.
+    """
+    pkg_swift = pre_staged_dir / "Package.swift"
+    if not pkg_swift.is_file():
+        return
+    # `pre_staged_dir` is copied from `.build/checkouts/<pkg>/`, which SPM
+    # makes read-only. Re-chmod Package.swift before we try to rewrite it.
+    try:
+        pkg_swift.chmod(pkg_swift.stat().st_mode | stat.S_IWUSR)
+    except OSError:
+        pass
+    raw = pkg_swift.read_text()
+
+    # Bail (no-op) if the manifest uses constructs the walker can't reason
+    # about — better to ship the foreign package's deps as-is than to
+    # produce a silently-broken edit.
+    try:
+        _assert_no_unsupported_swift_constructs(raw)
+    except PrepareUserError as exc:
+        verbose_log(
+            verbose,
+            f"  prune-child: skipping prune (unsupported manifest construct: {exc})",
+        )
+        return
+
+    original = raw
+
+    # Pass A: strip top-level #if blocks mutating package.dependencies/targets.
+    after_a, reasons_a = _strip_top_level_package_mutation_blocks(raw)
+    if reasons_a:
+        pkg_swift.write_text(after_a)
+        try:
+            raw_dump = _dump_package_json(pre_staged_dir)
+        except PrepareUserError:
+            pkg_swift.write_text(original)
+            raise
+        for r in reasons_a:
+            verbose_log(verbose, f"  prune-child: pass-A stripped {r}")
+    else:
+        raw_dump = _dump_package_json(pre_staged_dir)
+
+    # Pass C: drop unused .package(url:) entries.
+    needed = _collect_needed_identities(raw_dump, allowed_products)
+    after_c, reasons_c = _prune_top_level_package_entries(after_a, needed)
+    if reasons_c:
+        pkg_swift.write_text(after_c)
+        try:
+            _dump_package_json(pre_staged_dir)
+        except PrepareUserError:
+            # Roll back to the Pass-A result, since that one validated.
+            pkg_swift.write_text(after_a)
+            raise
+        for r in reasons_c:
+            verbose_log(verbose, f"  prune-child: pass-C stripped {r}")
 
 
 # ============================================================================
@@ -4489,10 +5714,56 @@ def rename_framework_bundle(
 
 
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Optional, Sequence, Tuple
 
+
+
+# SPM passes `-package-name <pkg>` to every target in a Swift package so
+# `package`-access symbols work between siblings. The flag gets recorded in
+# the emitted `.swiftinterface` header — any consumer Swift module that
+# imports this framework AND also gets `-package-name <pkg>` (i.e., happens
+# to live in an SPM package with the same name) will require a matching
+# `.package.swiftinterface` and refuse to load the public one. Since an
+# `.xcframework` is an external artifact, no consumer should treat it as
+# in-package; we strip the flag so the loaded interface is unambiguously
+# non-package and Swift falls back to the normal public-import path.
+#
+# Triggers seen in the matrix: Nuke 12.x — Nuke and NukeUI both live in
+# `staged`, so NukeUI fails to load Nuke.framework's interface with
+# "Module 'Nuke' is in package 'staged' but was built from a non-package
+# interface" unless we strip.
+#
+# The rewrite is scoped to the `// swift-module-flags[-ignorable]:` header
+# comment lines only. A blind file-wide substitution would silently corrupt
+# any public API whose body contains a string literal with the substring
+# " -package-name X" — unlikely, but exactly the class of "silently
+# producing a broken xcframework" we explicitly want to avoid.
+_PACKAGE_NAME_FLAG_RE = re.compile(r"[ \t]+-package-name[ \t]+\S+")
+_MODULE_FLAGS_PREFIX_RE = re.compile(
+    r"^//\s*swift-module-flags(?:-ignorable)?\s*:"
+)
+
+
+def _strip_package_name_from_swiftinterfaces(swiftmod_dir: Path) -> None:
+    for iface in swiftmod_dir.glob("*.swiftinterface"):
+        try:
+            text = iface.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        lines = text.splitlines(keepends=True)
+        changed = False
+        for idx, line in enumerate(lines):
+            if not _MODULE_FLAGS_PREFIX_RE.match(line):
+                continue
+            stripped = _PACKAGE_NAME_FLAG_RE.sub("", line)
+            if stripped != line:
+                lines[idx] = stripped
+                changed = True
+        if changed:
+            iface.write_text("".join(lines), encoding="utf-8")
 
 
 def _find_swiftmodule_in_dd(
@@ -4661,6 +5932,7 @@ def inject_swiftmodule(
     if dest.exists():
         shutil.rmtree(dest)
     shutil.copytree(swiftmod, dest)
+    _strip_package_name_from_swiftinterfaces(dest)
     _ensure_root_symlink(fw_path, "Modules")
     return True
 
@@ -6577,6 +7849,99 @@ def _platform_slice_for_library_identifier(lid: str) -> Optional[PlatformSlice]:
     return None
 
 
+def _filter_xcframework_slices_to_requested_platforms(
+    xcframework_path: Path,
+    requested_platforms: List[str],
+    *,
+    verbose: bool = False,
+) -> List[str]:
+    """Drop slices whose platform the user didn't request via `--min-*`.
+
+    Vendor xcframeworks routinely ship more platforms than any one
+    consumer asks for — Sentry 8.x ships ios+ios-simulator+ios-maccatalyst
+    +macos+tvos+tvos-simulator+watchos+visionos. If the user only asked
+    for `--min-ios`, the unrequested slices contribute nothing to their
+    build, and worse: a static maccatalyst slice triggers a
+    `-mtargetos=ios<ver>-macabi` clang invocation in
+    `promote_binary_xcframework_static_to_dynamic` that not every
+    installed clang accepts.
+
+    Mutates the xcframework in place: deletes each unrequested slice
+    directory and rewrites `Info.plist`'s `AvailableLibraries` to match.
+    Returns the list of identifiers removed (empty list when the vendor
+    xcframework already matches the requested set, including binary-only
+    auto-detect where the requested set was derived from the slices
+    themselves).
+
+    Errors:
+      - If requested_platforms is empty (defensive — caller should have
+        validated this before binary execute starts), no filtering runs.
+      - If the filter would leave zero slices, raise ExecuteError with
+        the requested-vs-available breakdown so the user knows the vendor
+        xcframework doesn't cover what they asked for.
+    """
+    if not requested_platforms:
+        return []
+    info_plist = xcframework_path / "Info.plist"
+    if not info_plist.is_file():
+        return []
+    try:
+        with info_plist.open("rb") as fh:
+            data = plistlib.load(fh)
+    except (plistlib.InvalidFileException, OSError, ValueError):
+        return []
+    available = data.get("AvailableLibraries")
+    if not isinstance(available, list):
+        return []
+
+    requested = set(requested_platforms)
+    kept: List[dict] = []
+    removed: List[str] = []
+    seen_platforms: set[str] = set()
+    for entry in available:
+        if not isinstance(entry, dict):
+            kept.append(entry)
+            continue
+        identifier = entry.get("LibraryIdentifier")
+        if not isinstance(identifier, str):
+            kept.append(entry)
+            continue
+        platform = _platform_from_library_identifier(identifier)
+        if platform is None:
+            # Unrecognised — keep, let Verify surface the oddity rather
+            # than silently dropping something we don't understand.
+            kept.append(entry)
+            continue
+        seen_platforms.add(platform)
+        if platform in requested:
+            kept.append(entry)
+        else:
+            removed.append(identifier)
+            slice_dir = xcframework_path / identifier
+            if slice_dir.is_dir():
+                shutil.rmtree(slice_dir, ignore_errors=True)
+
+    if not kept:
+        avail = ", ".join(sorted(seen_platforms)) or "(none recognisable)"
+        req = ", ".join(sorted(requested))
+        raise ExecuteError(
+            f"Filtering {xcframework_path.name} to requested platforms "
+            f"left zero slices. Requested: {req}. Vendor xcframework ships: "
+            f"{avail}."
+        )
+
+    if removed:
+        data["AvailableLibraries"] = kept
+        with info_plist.open("wb") as fh:
+            plistlib.dump(data, fh)
+        verbose_log(
+            verbose,
+            f"  Dropped {len(removed)} unrequested slice(s) from "
+            f"{xcframework_path.name}: {', '.join(removed)}",
+        )
+    return removed
+
+
 def promote_binary_xcframework_static_to_dynamic(
     xcframework_path: Path,
     *,
@@ -6835,6 +8200,21 @@ def execute_binary_plan(
             shutil.rmtree(dest)
         info(f"  Copying {src.name}...")
         shutil.copytree(src, dest, symlinks=True)
+        # Filter to user-requested platforms first. Two reasons: (a) the
+        # source-mode contract is "you got what you asked for via
+        # --min-*"; binary mode should behave the same, (b) keeping an
+        # unrequested slice can crash the promotion pass below (Sentry's
+        # maccatalyst slice → an unsupported `-mtargetos=ios<ver>-macabi`
+        # clang invocation on some installed toolchains).
+        requested_platforms = _enabled_platforms(config)
+        dropped = _filter_xcframework_slices_to_requested_platforms(
+            dest, requested_platforms, verbose=config.verbose,
+        )
+        if dropped:
+            info(
+                f"  Dropped {len(dropped)} unrequested slice(s) from "
+                f"{dest.name}: {', '.join(dropped)}"
+            )
         # Promote any static-archive slices to dynamic in place. No-op
         # for the common case of vendor xcframeworks that already ship
         # dynamic binaries — `_check_binary_dynamic` short-circuits the
@@ -7554,6 +8934,7 @@ def print_verify_summary(
 
 
 import argparse
+import os
 import shutil
 import sys
 import tempfile
@@ -7623,6 +9004,30 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> Tuple[argparse.Namespace
                              "Default: auto-derive from Package.swift.")
     parser.add_argument("--include-deps", action="store_true",
                         help="Also build xcframeworks for transitive dependencies (iOS-only in v1)")
+    parser.add_argument(
+        "--no-transitive-products",
+        action="store_true",
+        help=(
+            "Skip the in-process recursion that builds a sibling "
+            "xcframework for each external `.product(name:, package:)` "
+            "the root's targets depend on. The umbrella's "
+            ".swiftinterface may then `import` modules whose "
+            ".swiftmodule isn't on the consumer's search path; useful "
+            "only when you know the consumer doesn't link against those "
+            "transitive symbols."
+        ),
+    )
+    parser.add_argument(
+        "--best-effort-transitives",
+        action="store_true",
+        help=(
+            "Default: a transitive-package build/verify failure aborts "
+            "the whole run (the umbrella would ship with dangling "
+            ".swiftinterface imports). Pass this flag to continue with "
+            "whatever transitives succeeded; the umbrella runs anyway "
+            "and failed transitives are skipped with a warning."
+        ),
+    )
     parser.add_argument("--verbose", action="store_true",
                         help="Show full build output")
     parser.add_argument("--dry-run", action="store_true",
@@ -7692,6 +9097,8 @@ def _config_from_args(ns: argparse.Namespace) -> Config:
         keep_work=ns.keep_work,
         no_cleanup_stale=ns.no_cleanup_stale,
         no_dedup_overlap=ns.no_dedup_overlap,
+        no_transitive_products=ns.no_transitive_products,
+        best_effort_transitives=ns.best_effort_transitives,
         inspect_only=ns.inspect_only,
     )
 
@@ -7753,7 +9160,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         try:
             if config.binary_mode:
                 return _run_binary_mode(config)
-            return _run_source_mode(config)
+            return _run_source_mode_with_transitives(config)
         except _USER_FACING_ERRORS as exc:
             # User-facing phase errors (Fetch, Inspect, Plan): print a clean
             # one-line "Error (<phase>): <msg>" and exit with the
@@ -7778,28 +9185,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             shutil.rmtree(work_dir, ignore_errors=True)
 
 
-def _finalize_with_verify(
+def _verify_executed_and_collect_entries(
     executed: Sequence[ExecutedUnit],
     config: Config,
-    *,
-    old_manifest: Optional[OutputManifest] = None,
-) -> int:
-    """Run Verify against the executed units and print the final summary.
+) -> Tuple[int, List[ManifestEntry]]:
+    """Verify-only half of finalize.
 
-    Returns the exit code main() should use: 0 iff every planned unit
-    passed strict verification, otherwise `VerifyError.exit_code` (8).
-    Dependency xcframeworks (`--include-deps`) are folded into the verify
-    pass alongside the primary build units so they get the same strict
-    treatment.
+    Runs Verify against the executed units (including their dependency
+    xcframeworks promoted to first-class units), prints the per-unit
+    summary, and returns a `(exit_code, entries)` pair.
 
-    `old_manifest` is the manifest that was read BEFORE Execute ran
-    (or None for callers that don't want cross-run cleanup — notably
-    the test suite's direct-finalize tests). When provided AND every
-    unit passes Verify, stale entries from the old manifest that
-    aren't in the verified-produced set are removed from disk, and a
-    fresh manifest is written atomically. A failed-verify run leaves
-    both the old manifest AND the old artifacts completely untouched,
-    preserving the user's last known-good state.
+    - `exit_code` is 0 iff every unit passed; otherwise `VerifyError.exit_code`
+    - `entries` is the list of `ManifestEntry`s that should be written for
+      this run, classified primary vs dependency. Empty when verify failed.
+
+    No filesystem side effects on the output manifest. Callers either feed
+    `entries` into `_finalize_manifest` (single-package runs and the
+    top-level orchestrator) or merge them with other runs' entries before
+    calling the manifest finalizer once.
     """
     units: List[ExecutedUnit] = list(executed)
     # `--include-deps` builds extra xcframeworks under the same output
@@ -7841,8 +9244,6 @@ def _finalize_with_verify(
                 seen_dep_paths[resolved] = new_unit
                 units.append(new_unit)
                 continue
-            # Already verified — only upgrade the expected_language if
-            # the new signal is strictly more specific.
             new_rank = _language_specificity.get(dep.expected_language, 0)
             old_rank = _language_specificity.get(existing.expected_language, 0)
             if new_rank > old_rank:
@@ -7851,28 +9252,13 @@ def _finalize_with_verify(
     results = verify_output(units, config.output_dir)
     print_verify_summary(results, config.output_dir)
     if any(not r.passed for r in results):
-        # Verify failed: leave the prior manifest AND the prior on-disk
-        # artifacts completely untouched. The user's last known-good
-        # state is preserved; we do NOT overwrite the manifest with a
-        # partial / failing run, and we do NOT clean stale siblings.
-        return VerifyError.exit_code
+        return VerifyError.exit_code, []
 
-    # Every unit passed strict verify. Compute the "verified-produced"
-    # set from `VerifyResult.passed` entries (NOT from plan.build_units
-    # — a failed-then-skipped unit must not leak into the manifest).
-    verified_produced: Set[str] = {
-        r.xcframework_path.name for r in results if r.passed
-    }
-    # Classify each verified artifact as primary or dependency. Primary
-    # = an entry in the original `executed` list (top-level build unit).
-    # Dependency = an entry that only showed up via the dep-dedupe loop
-    # above. We built `units` as `list(executed) + dep_units`, so
-    # cross-reference by xcframework path name.
     primary_names: Set[str] = set()
     for u in executed:
         if u.xcframework_path is not None:
             primary_names.add(u.xcframework_path.name)
-    new_entries: List[ManifestEntry] = []
+    entries: List[ManifestEntry] = []
     for r in results:
         if not r.passed:
             continue
@@ -7882,29 +9268,39 @@ def _finalize_with_verify(
             if name in primary_names
             else _MANIFEST_KIND_DEPENDENCY
         )
-        new_entries.append(ManifestEntry(name=name, kind=kind))
+        entries.append(ManifestEntry(name=name, kind=kind))
+    return 0, entries
 
-    # Cleanup + manifest write. Both operations use the verified-
-    # produced set as the single source of truth — so a failed unit
-    # can never block cleanup of its stale siblings, and the written
-    # manifest reflects only what actually shipped.
+
+def _finalize_manifest(
+    config: Config,
+    new_entries: Sequence[ManifestEntry],
+    *,
+    old_manifest: Optional[OutputManifest],
+) -> None:
+    """Manifest-write half of finalize.
+
+    Given the full set of verified entries from this run (primary +
+    dependency + transitive across the whole orchestrator tree), perform
+    one cleanup pass against `old_manifest` and one atomic manifest write.
+
+    Called exactly once per top-level invocation. Children of the
+    `_run_source_mode_with_transitives` orchestrator must NOT call this;
+    they return their entries up to the orchestrator which calls this
+    after every child + the umbrella have been verified.
+    """
+    verified_produced: Set[str] = {e.name for e in new_entries}
+    merged: List[ManifestEntry] = list(new_entries)
+
     if old_manifest is not None:
         if config.no_cleanup_stale:
-            # `--no-cleanup-stale` means "delay cleanup by one run":
-            # don't delete stale entries from disk, AND merge them into
-            # the new manifest so they remain tool-tracked. A subsequent
-            # run without the flag will see them in the manifest and
-            # clean them normally.
-            existing = {e.name for e in new_entries}
+            existing = {e.name for e in merged}
             for entry in old_manifest.entries:
                 if entry.name in existing:
                     continue
-                # Only keep entries whose on-disk target still exists;
-                # a user who manually deleted one shouldn't have it
-                # resurrected in the new manifest.
                 if not (config.output_dir / entry.name).exists():
                     continue
-                new_entries.append(entry)
+                merged.append(entry)
         else:
             cleaned = _cleanup_stale_manifest_entries(
                 config.output_dir,
@@ -7917,16 +9313,44 @@ def _finalize_with_verify(
     try:
         _write_output_manifest(
             config.output_dir,
-            new_entries,
+            merged,
             package_source=config.package_source,
             package_version=config.user_version,
         )
     except OSError as exc:
-        # The manifest write is best-effort: if it fails (disk full,
-        # permission error), the run itself has succeeded and we
-        # shouldn't flip that to a failure. Warn so the user knows
-        # next-run cleanup won't find these artifacts.
         warn(f"Could not write output manifest: {exc}")
+
+
+def _finalize_with_verify(
+    executed: Sequence[ExecutedUnit],
+    config: Config,
+    *,
+    old_manifest: Optional[OutputManifest] = None,
+) -> int:
+    """Verify executed units; either finalize the manifest (top-level) or
+    park entries on `config.collected_entries` (child runs).
+
+    Standard single-package mode (`config.child_run` is False): runs
+    Verify, then on success cleans up stale prior outputs and atomically
+    writes a fresh manifest. On Verify failure, leaves both the prior
+    manifest AND the prior on-disk artifacts untouched.
+
+    Child mode (`config.child_run` is True): runs Verify only and stores
+    the resulting `ManifestEntry`s on `config.collected_entries`. The
+    orchestrator (`_run_source_mode_with_transitives`) is responsible for
+    merging entries across the child + umbrella tree and writing a
+    single manifest at the end. Child runs MUST NOT receive an
+    `old_manifest` — the orchestrator owns the one-shot read of the
+    shared manifest.
+    """
+    exit_code, entries = _verify_executed_and_collect_entries(executed, config)
+    if config.child_run:
+        if exit_code == 0:
+            config.collected_entries.extend(entries)
+        return exit_code
+    if exit_code != 0:
+        return exit_code
+    _finalize_manifest(config, entries, old_manifest=old_manifest)
     return 0
 
 
@@ -7963,18 +9387,19 @@ def _validate_platforms_post_autodetect(config: Config) -> None:
             )
 
 
-def _run_source_mode(config: Config) -> int:
-    """Source-mode pipeline: Fetch → Inspect → Plan → Prepare → Execute → Verify.
+def _source_mode_inspect(config: Config):
+    """Fetch + Stage + Inspect + autodetect + post-autodetect validation.
 
-    If Inspect reveals that every (non-system) product is backed solely by
-    binaryTarget targets, we transparently hand off to `_run_binary_mode`.
-    Source mode for such a package is fundamentally wrong: there's nothing
-    to compile, and the unconditional `force_dynamic` patch would be
-    rejected by SPM with "invalid type for binary product". The hand-off
-    fires only when `--binary` would also have worked (remote URL +
-    explicit `--version`); for the local-path case we surface a clear
-    PlanError pointing at the limitation rather than silently failing
-    deeper in.
+    Returns either:
+      - the tuple `(source_dir, staged_dir, package)` if the run should
+        proceed to Plan, or
+      - an `int` exit code when an early-exit path fires (--inspect-only,
+        or transparent handoff to binary mode for binary-only packages).
+
+    Splitting this from the rest of source mode lets
+    `_run_source_mode_with_transitives` pre-inspect the umbrella once to
+    discover transitives without paying for a second Fetch + Stage on the
+    umbrella's actual build pass.
     """
     source_dir = fetch_source(config)
     staged_dir = stage_source(config, source_dir)
@@ -8032,6 +9457,24 @@ def _run_source_mode(config: Config) -> int:
         config.binary_mode = True
         return _run_binary_mode(config)
 
+    return source_dir, staged_dir, package
+
+
+def _source_mode_after_inspect(
+    config: Config,
+    source_dir: Path,
+    staged_dir: Path,
+    package,
+) -> int:
+    """Plan → Prepare → Execute → Verify on an already-inspected package.
+
+    The `source_dir` argument is kept for symmetry with `_source_mode_inspect`'s
+    return shape even though Plan onwards never touches the source tree
+    again — Stage already produced the working tree.
+
+    Reads `old_manifest` only when NOT a child run. Children let the
+    orchestrator own the one-shot manifest read and merged write.
+    """
     plan = plan_source_build(config, package)
     for w in plan.warnings:
         warn(w)
@@ -8040,15 +9483,389 @@ def _run_source_mode(config: Config) -> int:
     if config.dry_run:
         return 0
 
-    # Read the prior run's manifest BEFORE Execute writes anything. The
-    # content is kept in memory only; the manifest file on disk is
-    # untouched until finalize succeeds. A missing/malformed manifest
-    # flattens to empty — no cross-run cleanup, same as a first run.
-    old_manifest = _read_output_manifest(config.output_dir)
+    old_manifest = (
+        None if config.child_run else _read_output_manifest(config.output_dir)
+    )
 
     prepared = prepare(staged_dir, plan, verbose=config.verbose)
     executed = execute_source_plan(prepared, config)
     return _finalize_with_verify(executed, config, old_manifest=old_manifest)
+
+
+def _run_source_mode(config: Config) -> int:
+    """Source-mode pipeline: Fetch → Inspect → Plan → Prepare → Execute → Verify.
+
+    If Inspect reveals that every (non-system) product is backed solely by
+    binaryTarget targets, we transparently hand off to `_run_binary_mode`.
+    Source mode for such a package is fundamentally wrong: there's nothing
+    to compile, and the unconditional `force_dynamic` patch would be
+    rejected by SPM with "invalid type for binary product". The hand-off
+    fires only when `--binary` would also have worked (remote URL +
+    explicit `--version`); for the local-path case we surface a clear
+    PlanError pointing at the limitation rather than silently failing
+    deeper in.
+    """
+    inspect_result = _source_mode_inspect(config)
+    if isinstance(inspect_result, int):
+        return inspect_result
+    source_dir, staged_dir, package = inspect_result
+    return _source_mode_after_inspect(config, source_dir, staged_dir, package)
+
+
+def _compute_selected_target_closure(
+    config: Config, package: "Package"
+) -> "Optional[Set[str]]":
+    """Return the set of root REGULAR target names the user has actually
+    asked to build, expanded by internal sibling deps.
+
+    Used by `_run_source_mode_with_transitives` to filter out transitives
+    referenced only by helper/example targets the umbrella build won't
+    touch. Returns None when no `--product` / `--target` filter is in
+    effect (the default-everything case — caller should treat that as
+    "keep every transitive").
+
+    Closure construction:
+      1. Seed = (product_filters' backing targets) ∪ target_filters.
+      2. Expand via `compute_internal_target_deps` (internal sibling
+         edges only — external `.product(...)` deps are NOT followed,
+         since those reach OTHER packages and don't belong in a same-
+         package target set).
+      3. Restrict to REGULAR targets (the only kind ever shipped as an
+         xcframework).
+    """
+    if not config.product_filters and not config.target_filters:
+        return None
+
+    products_by_name = {p.name: p for p in package.products}
+    targets_by_name = {t.name: t for t in package.targets}
+
+    seed: Set[str] = set()
+    for prod_name in config.product_filters or []:
+        prod = products_by_name.get(prod_name)
+        if prod is None:
+            continue
+        for tname in prod.targets:
+            if tname in targets_by_name:
+                seed.add(tname)
+    for tname in config.target_filters or []:
+        if tname in targets_by_name:
+            seed.add(tname)
+
+    deps_map = compute_internal_target_deps(package)
+    closure: Set[str] = set()
+    for name in seed:
+        closure.add(name)
+        closure.update(deps_map.get(name, set()))
+
+    return {n for n in closure if targets_by_name[n].kind == TargetKind.REGULAR}
+
+
+def _make_transitive_child_config(parent: Config, tp, child_work_dir: Path) -> Config:
+    """Build a child Config for a transitive checkout.
+
+    The child inherits the parent's output dir + platform flags +
+    keep-work + verbosity, but everything that scopes the build to the
+    parent's chosen products (target filters, version pinning,
+    `--include-deps`'s post-archive walker, the user's revision check) is
+    cleared. `product_filters` IS set, to the exact product names the
+    parent's REGULAR targets imported from this identity — that
+    `referenced_products` list flows down so the child only builds what
+    the umbrella actually consumes. The child's `child_run` flag
+    suppresses the shared-manifest read/write so the orchestrator owns
+    those for the whole tree.
+
+    Re-rooting the foreign checkout as the SPM root has a sharp edge:
+    the foreign Package.swift can declare its own dev/CI dependencies
+    (swift-docc-plugin, carton/wasm tooling, swift-format, …) that the
+    umbrella's resolve never paid for. If we hand the raw checkout to
+    Fetch, `swift package resolve` will follow those declarations and
+    clone tens of MB of unrelated graphs (carton drags in swift-nio,
+    swift-syntax, swift-tools-support-core). To prevent that, we copy
+    the checkout into a per-child pre-staged dir and run
+    `prune_child_manifest_for_products` over it: that drops top-level
+    `#if … #endif` blocks mutating `package.dependencies` / `targets`
+    and any unconditional `.package(url:)` entries the closure of the
+    requested products doesn't actually need. The pruned dir is then
+    fed to Fetch as `package_source`.
+
+    `no_transitive_products=True` enforces the one-level recursion limit:
+    children themselves do not recurse, which matches the design's
+    "depth=1, visited identities" contract.
+    """
+    from dataclasses import replace
+
+    pre_staged_dir = child_work_dir / "prestaged"
+    if pre_staged_dir.exists():
+        shutil.rmtree(pre_staged_dir)
+    shutil.copytree(tp.checkout_path, pre_staged_dir, symlinks=True)
+    # SPM publishes its `.build/checkouts/<pkg>/` trees with read-only
+    # files (and sometimes read-only directories); the copy inherits
+    # those modes. Subsequent Fetch/Stage on the child needs to write
+    # into `.build/`, edit Package.swift, etc. Grant the owner write
+    # access on the root pre-staged dir AND every file/dir under it.
+    # os.walk doesn't yield `pre_staged_dir` itself in the children-of-
+    # root loop below, so chmod it explicitly first — otherwise creating
+    # new files at the top level (e.g. swift package resolve's
+    # `Package.resolved`) would fail when SPM ships a read-only root.
+    import stat as _stat
+    try:
+        top_mode = os.lstat(pre_staged_dir).st_mode
+        os.chmod(pre_staged_dir, top_mode | _stat.S_IWUSR)
+    except (OSError, NotImplementedError):
+        pass
+    for root, dirs, files in os.walk(pre_staged_dir):
+        for name in dirs + files:
+            p = os.path.join(root, name)
+            try:
+                mode = os.lstat(p).st_mode
+                os.chmod(p, mode | _stat.S_IWUSR)
+            except (OSError, NotImplementedError):
+                pass
+    prune_child_manifest_for_products(
+        pre_staged_dir,
+        list(tp.referenced_products),
+        verbose=parent.verbose,
+    )
+
+    child = replace(
+        parent,
+        package_source=str(pre_staged_dir),
+        user_version="",
+        resolved_version="",
+        product_filters=list(tp.referenced_products),
+        target_filters=[],
+        revision=None,
+        include_deps=False,
+        inspect_only=False,
+        dry_run=False,
+        binary_mode=False,
+        no_transitive_products=True,
+        best_effort_transitives=False,
+        # Children build siblings from a single SPM package. SPM's
+        # `package`-level access modifier (Swift 5.9+) lets sibling
+        # targets see each other's `package func`/`package var` symbols
+        # so long as they share a build context — which they do under
+        # `swift build`/`xcodebuild archive`, but NOT when dedup-overlap
+        # rewrites one sibling to a `.binaryTarget`. The rewritten
+        # sibling becomes a foreign module and the parent target's
+        # references to its `package` symbols fail to type-check
+        # ("Cannot find '_fail' in scope" against `package func _fail`).
+        # We trade dedup-overlap's static-link savings for correctness:
+        # each child xcframework may statically embed its sibling deps'
+        # code, which is acceptable bloat for the transitive sidecar
+        # artifacts the umbrella's .swiftinterface only references for
+        # module-import resolution.
+        no_dedup_overlap=True,
+        child_run=True,
+        collected_entries=[],
+        work_dir=child_work_dir,
+    )
+    return child
+
+
+def _run_source_mode_with_transitives(config: Config) -> int:
+    """Top-level source-mode entry point with in-process transitive recursion.
+
+    Discovers external `.product(name:, package:)` dependencies of the
+    root's REGULAR targets, builds each as its own sibling xcframework via
+    a child `_run_source_mode` call against the resolved checkout, and
+    then builds the umbrella against the parent run. Children write their
+    artifacts into the same `--output` directory but never touch the
+    shared output manifest; the orchestrator reads the old manifest once
+    up front and writes a single merged manifest at the end.
+
+    Why this exists: xcodebuild's SPM integration static-links every
+    `.product(...)` reachable from the umbrella scheme into the umbrella's
+    dylib regardless of the product's declared `type:`. The umbrella's
+    consumer-visible `.swiftinterface` then `import`s modules whose
+    `.swiftmodule` isn't anywhere on the consumer's search path. Producing
+    sibling xcframeworks out-of-band (one fresh build per transitive
+    checkout) is the only reliable fix.
+
+    Failure mode is fail-fast by default: any transitive that fails Plan,
+    Execute, or Verify aborts the whole run — shipping the umbrella with
+    a missing sibling that its swiftinterface references would dangle at
+    consume time. Pass `--best-effort-transitives` to continue with
+    whatever transitives succeeded.
+
+    Depth is hard-capped at one level: `_make_transitive_child_config`
+    sets `no_transitive_products=True` on each child. The single-level
+    rule covers every package in the integration matrix today; lifting it
+    later only requires removing that flag and adding a visited-identity
+    parameter through this function.
+    """
+    if config.no_transitive_products or config.child_run:
+        return _run_source_mode(config)
+
+    inspect_result = _source_mode_inspect(config)
+    if isinstance(inspect_result, int):
+        return inspect_result
+    source_dir, staged_dir, package = inspect_result
+
+    transitives = list(package.transitive_packages)
+    if transitives:
+        # Drop transitives reached only from root targets the user's
+        # `--product`/`--target` filters exclude. `referencing_root_targets`
+        # is the set of root REGULAR targets that reference the
+        # transitive via `.product(name:, package:)`. The user-selected
+        # closure is product backing targets ∪ explicit --target names,
+        # expanded by internal sibling deps. With no filters set we keep
+        # every transitive (default scope = all root REGULAR targets).
+        selected_root_targets = _compute_selected_target_closure(config, package)
+        if selected_root_targets is not None:
+            from dataclasses import replace as _dc_replace
+
+            kept: List = []
+            dropped: List[str] = []
+            product_trims: List[Tuple[str, List[str], List[str]]] = []
+            for tp in transitives:
+                if not tp.referencing_root_targets:
+                    # Defensive: if inspect couldn't attribute the
+                    # transitive, keep it rather than silently drop.
+                    kept.append(tp)
+                    continue
+                if not any(t in selected_root_targets for t in tp.referencing_root_targets):
+                    dropped.append(tp.identity)
+                    continue
+                # Identity-level keep: at least one selected root target
+                # references this transitive. Now trim its `referenced_products`
+                # to only the products imported by selected root targets, so
+                # the child doesn't build (and the child planner doesn't try
+                # to validate) products only consumed by deselected siblings.
+                # If per-product attribution is missing (older inspect path),
+                # fall back to keeping all referenced products.
+                if tp.product_to_root_targets:
+                    trimmed = [
+                        p
+                        for p in tp.referenced_products
+                        if any(
+                            rt in selected_root_targets
+                            for rt in tp.product_to_root_targets.get(p, [])
+                        )
+                    ]
+                    if trimmed and trimmed != list(tp.referenced_products):
+                        product_trims.append(
+                            (tp.identity, list(tp.referenced_products), list(trimmed))
+                        )
+                        tp = _dc_replace(tp, referenced_products=trimmed)
+                    elif not trimmed:
+                        # All referenced products belong to deselected
+                        # root targets even though the union check matched
+                        # (e.g. attribution races against the union list).
+                        # Treat as dropped rather than building an empty
+                        # child.
+                        dropped.append(tp.identity)
+                        continue
+                kept.append(tp)
+            if dropped:
+                bold(
+                    f"Skipping {len(dropped)} transitive(s) referenced only by "
+                    f"deselected root targets: " + ", ".join(dropped)
+                )
+            for ident, before, after in product_trims:
+                bold(
+                    f"  trimming {ident!r} products to selected scope: "
+                    f"{', '.join(sorted(before))} → {', '.join(sorted(after))}"
+                )
+            transitives = kept
+
+    if not transitives:
+        # Self-contained package — no recursion needed.
+        return _source_mode_after_inspect(config, source_dir, staged_dir, package)
+
+    bold(
+        f"Will also build {len(transitives)} transitive package(s) "
+        f"as siblings: " + ", ".join(tp.identity for tp in transitives)
+    )
+
+    old_manifest = _read_output_manifest(config.output_dir)
+    all_entries: List[ManifestEntry] = []
+    # Seed `visited` with the root's own identity computed the same way
+    # `_collect_referenced_package_products` keys its entries — by SPM
+    # identity. `_identity_from_url` mirrors SPM's normalisation (last URL
+    # path component, `.git` stripped, lowercased). Falling back to
+    # `package.name` keeps the guard intact for local-path package
+    # sources where `package_source` isn't a URL.
+    root_identity = _identity_from_url(config.package_source) or package.name.lower()
+    visited: Set[str] = {root_identity}
+
+    parent_work = config.work_dir
+    if parent_work is None:
+        # Should never happen — main() always allocates a work_dir before
+        # routing here — but fall back to a tempdir under the system tmp
+        # so we don't crash on a manually-constructed Config.
+        parent_work = Path(tempfile.mkdtemp(prefix="spm2xc-orchestrator-"))
+        config.work_dir = parent_work
+
+    for tp in transitives:
+        ident_key = tp.identity.lower()
+        if ident_key in visited:
+            continue
+        visited.add(ident_key)
+        if not tp.checkout_path.exists():
+            warn(
+                f"  transitive {tp.identity!r}: checkout missing at "
+                f"{tp.checkout_path}; skipping"
+            )
+            continue
+        child_work_dir = parent_work / "transitives" / tp.identity
+        child_work_dir.mkdir(parents=True, exist_ok=True)
+        bold(f"\n=== transitive: {tp.identity} ===")
+        # `_make_transitive_child_config` runs the pre-stage copytree,
+        # the chmod walk, and the prune passes — all of which can raise
+        # `PrepareUserError` (read-only checkout, broken manifest,
+        # dump-package rejection of an edited file, ...). Wrap that call
+        # in the same handler that protects `_run_source_mode` itself
+        # so prep failures honour the fail-fast / best-effort contract
+        # and are attributed to the offending transitive identity.
+        try:
+            child_config = _make_transitive_child_config(config, tp, child_work_dir)
+            result = _run_source_mode(child_config)
+        except _USER_FACING_ERRORS as exc:
+            # Mirror main()'s clean-error path: a child's Fetch / Inspect /
+            # Plan / Execute / Prepare error shouldn't crash with a
+            # traceback at the orchestrator level, but it should still
+            # abort the run unless the user opted into best-effort mode.
+            phase = _phase_label_for(exc)
+            print(
+                _wrap(f"Error ({phase}, transitive {tp.identity!r}): {exc}", "red"),
+                file=sys.stderr,
+            )
+            if config.best_effort_transitives:
+                warn(
+                    f"  continuing per --best-effort-transitives; "
+                    f"{tp.identity!r} will not be shipped (any partial "
+                    f"artifacts under {config.output_dir} are excluded from "
+                    f"the manifest but not deleted — inspect before shipping)"
+                )
+                continue
+            return exc.exit_code
+        if result != 0:
+            if config.best_effort_transitives:
+                warn(
+                    f"  transitive {tp.identity!r} failed (exit {result}); "
+                    f"continuing per --best-effort-transitives (any partial "
+                    f"artifacts under {config.output_dir} are excluded from "
+                    f"the manifest but not deleted — inspect before shipping)"
+                )
+                continue
+            return result
+        all_entries.extend(child_config.collected_entries)
+
+    # Build the umbrella last, as a child run so it deposits its entries
+    # in the same merge bucket and skips the per-call manifest write.
+    bold(f"\n=== umbrella: {package.name} ===")
+    config.child_run = True
+    config.collected_entries = []
+    umbrella_result = _source_mode_after_inspect(
+        config, source_dir, staged_dir, package
+    )
+    if umbrella_result != 0:
+        return umbrella_result
+    all_entries.extend(config.collected_entries)
+
+    _finalize_manifest(config, all_entries, old_manifest=old_manifest)
+    return 0
 
 
 def _run_binary_mode(config: Config) -> int:

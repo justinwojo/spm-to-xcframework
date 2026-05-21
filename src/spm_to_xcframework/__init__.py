@@ -24,6 +24,7 @@ from .fetch import *  # noqa: F401,F403
 from .inspect import *  # noqa: F401,F403
 from .plan import *  # noqa: F401,F403
 from .prepare import *  # noqa: F401,F403
+from .prune_child import *  # noqa: F401,F403
 from .execute import *  # noqa: F401,F403
 from .output_manifest import *  # noqa: F401,F403
 from .verify import *  # noqa: F401,F403

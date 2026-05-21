@@ -11,6 +11,7 @@ bubble up so the user sees a full traceback.
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import sys
 import tempfile
@@ -45,14 +46,16 @@ from .inspect import (
 )
 from .plan import (
     _package_is_binary_only,
+    compute_internal_target_deps,
     plan_binary_build,
     plan_source_build,
     print_plan,
 )
-from .log import _wrap, die, dim, info, warn
-from .model import ExecutedUnit, Language
+from .log import _wrap, bold, die, dim, info, warn
+from .model import ExecutedUnit, Language, Package, TargetKind
 from .platforms import _autodetect_min_versions, _enabled_platforms
 from .prepare import prepare
+from .prune_child import _identity_from_url, prune_child_manifest_for_products
 from .execute import (
     detect_framework_type,
     execute_binary_plan,
@@ -134,6 +137,30 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> Tuple[argparse.Namespace
                              "Default: auto-derive from Package.swift.")
     parser.add_argument("--include-deps", action="store_true",
                         help="Also build xcframeworks for transitive dependencies (iOS-only in v1)")
+    parser.add_argument(
+        "--no-transitive-products",
+        action="store_true",
+        help=(
+            "Skip the in-process recursion that builds a sibling "
+            "xcframework for each external `.product(name:, package:)` "
+            "the root's targets depend on. The umbrella's "
+            ".swiftinterface may then `import` modules whose "
+            ".swiftmodule isn't on the consumer's search path; useful "
+            "only when you know the consumer doesn't link against those "
+            "transitive symbols."
+        ),
+    )
+    parser.add_argument(
+        "--best-effort-transitives",
+        action="store_true",
+        help=(
+            "Default: a transitive-package build/verify failure aborts "
+            "the whole run (the umbrella would ship with dangling "
+            ".swiftinterface imports). Pass this flag to continue with "
+            "whatever transitives succeeded; the umbrella runs anyway "
+            "and failed transitives are skipped with a warning."
+        ),
+    )
     parser.add_argument("--verbose", action="store_true",
                         help="Show full build output")
     parser.add_argument("--dry-run", action="store_true",
@@ -203,6 +230,8 @@ def _config_from_args(ns: argparse.Namespace) -> Config:
         keep_work=ns.keep_work,
         no_cleanup_stale=ns.no_cleanup_stale,
         no_dedup_overlap=ns.no_dedup_overlap,
+        no_transitive_products=ns.no_transitive_products,
+        best_effort_transitives=ns.best_effort_transitives,
         inspect_only=ns.inspect_only,
     )
 
@@ -264,7 +293,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         try:
             if config.binary_mode:
                 return _run_binary_mode(config)
-            return _run_source_mode(config)
+            return _run_source_mode_with_transitives(config)
         except _USER_FACING_ERRORS as exc:
             # User-facing phase errors (Fetch, Inspect, Plan): print a clean
             # one-line "Error (<phase>): <msg>" and exit with the
@@ -289,28 +318,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             shutil.rmtree(work_dir, ignore_errors=True)
 
 
-def _finalize_with_verify(
+def _verify_executed_and_collect_entries(
     executed: Sequence[ExecutedUnit],
     config: Config,
-    *,
-    old_manifest: Optional[OutputManifest] = None,
-) -> int:
-    """Run Verify against the executed units and print the final summary.
+) -> Tuple[int, List[ManifestEntry]]:
+    """Verify-only half of finalize.
 
-    Returns the exit code main() should use: 0 iff every planned unit
-    passed strict verification, otherwise `VerifyError.exit_code` (8).
-    Dependency xcframeworks (`--include-deps`) are folded into the verify
-    pass alongside the primary build units so they get the same strict
-    treatment.
+    Runs Verify against the executed units (including their dependency
+    xcframeworks promoted to first-class units), prints the per-unit
+    summary, and returns a `(exit_code, entries)` pair.
 
-    `old_manifest` is the manifest that was read BEFORE Execute ran
-    (or None for callers that don't want cross-run cleanup — notably
-    the test suite's direct-finalize tests). When provided AND every
-    unit passes Verify, stale entries from the old manifest that
-    aren't in the verified-produced set are removed from disk, and a
-    fresh manifest is written atomically. A failed-verify run leaves
-    both the old manifest AND the old artifacts completely untouched,
-    preserving the user's last known-good state.
+    - `exit_code` is 0 iff every unit passed; otherwise `VerifyError.exit_code`
+    - `entries` is the list of `ManifestEntry`s that should be written for
+      this run, classified primary vs dependency. Empty when verify failed.
+
+    No filesystem side effects on the output manifest. Callers either feed
+    `entries` into `_finalize_manifest` (single-package runs and the
+    top-level orchestrator) or merge them with other runs' entries before
+    calling the manifest finalizer once.
     """
     units: List[ExecutedUnit] = list(executed)
     # `--include-deps` builds extra xcframeworks under the same output
@@ -352,8 +377,6 @@ def _finalize_with_verify(
                 seen_dep_paths[resolved] = new_unit
                 units.append(new_unit)
                 continue
-            # Already verified — only upgrade the expected_language if
-            # the new signal is strictly more specific.
             new_rank = _language_specificity.get(dep.expected_language, 0)
             old_rank = _language_specificity.get(existing.expected_language, 0)
             if new_rank > old_rank:
@@ -362,28 +385,13 @@ def _finalize_with_verify(
     results = verify_output(units, config.output_dir)
     print_verify_summary(results, config.output_dir)
     if any(not r.passed for r in results):
-        # Verify failed: leave the prior manifest AND the prior on-disk
-        # artifacts completely untouched. The user's last known-good
-        # state is preserved; we do NOT overwrite the manifest with a
-        # partial / failing run, and we do NOT clean stale siblings.
-        return VerifyError.exit_code
+        return VerifyError.exit_code, []
 
-    # Every unit passed strict verify. Compute the "verified-produced"
-    # set from `VerifyResult.passed` entries (NOT from plan.build_units
-    # — a failed-then-skipped unit must not leak into the manifest).
-    verified_produced: Set[str] = {
-        r.xcframework_path.name for r in results if r.passed
-    }
-    # Classify each verified artifact as primary or dependency. Primary
-    # = an entry in the original `executed` list (top-level build unit).
-    # Dependency = an entry that only showed up via the dep-dedupe loop
-    # above. We built `units` as `list(executed) + dep_units`, so
-    # cross-reference by xcframework path name.
     primary_names: Set[str] = set()
     for u in executed:
         if u.xcframework_path is not None:
             primary_names.add(u.xcframework_path.name)
-    new_entries: List[ManifestEntry] = []
+    entries: List[ManifestEntry] = []
     for r in results:
         if not r.passed:
             continue
@@ -393,29 +401,39 @@ def _finalize_with_verify(
             if name in primary_names
             else _MANIFEST_KIND_DEPENDENCY
         )
-        new_entries.append(ManifestEntry(name=name, kind=kind))
+        entries.append(ManifestEntry(name=name, kind=kind))
+    return 0, entries
 
-    # Cleanup + manifest write. Both operations use the verified-
-    # produced set as the single source of truth — so a failed unit
-    # can never block cleanup of its stale siblings, and the written
-    # manifest reflects only what actually shipped.
+
+def _finalize_manifest(
+    config: Config,
+    new_entries: Sequence[ManifestEntry],
+    *,
+    old_manifest: Optional[OutputManifest],
+) -> None:
+    """Manifest-write half of finalize.
+
+    Given the full set of verified entries from this run (primary +
+    dependency + transitive across the whole orchestrator tree), perform
+    one cleanup pass against `old_manifest` and one atomic manifest write.
+
+    Called exactly once per top-level invocation. Children of the
+    `_run_source_mode_with_transitives` orchestrator must NOT call this;
+    they return their entries up to the orchestrator which calls this
+    after every child + the umbrella have been verified.
+    """
+    verified_produced: Set[str] = {e.name for e in new_entries}
+    merged: List[ManifestEntry] = list(new_entries)
+
     if old_manifest is not None:
         if config.no_cleanup_stale:
-            # `--no-cleanup-stale` means "delay cleanup by one run":
-            # don't delete stale entries from disk, AND merge them into
-            # the new manifest so they remain tool-tracked. A subsequent
-            # run without the flag will see them in the manifest and
-            # clean them normally.
-            existing = {e.name for e in new_entries}
+            existing = {e.name for e in merged}
             for entry in old_manifest.entries:
                 if entry.name in existing:
                     continue
-                # Only keep entries whose on-disk target still exists;
-                # a user who manually deleted one shouldn't have it
-                # resurrected in the new manifest.
                 if not (config.output_dir / entry.name).exists():
                     continue
-                new_entries.append(entry)
+                merged.append(entry)
         else:
             cleaned = _cleanup_stale_manifest_entries(
                 config.output_dir,
@@ -428,16 +446,44 @@ def _finalize_with_verify(
     try:
         _write_output_manifest(
             config.output_dir,
-            new_entries,
+            merged,
             package_source=config.package_source,
             package_version=config.user_version,
         )
     except OSError as exc:
-        # The manifest write is best-effort: if it fails (disk full,
-        # permission error), the run itself has succeeded and we
-        # shouldn't flip that to a failure. Warn so the user knows
-        # next-run cleanup won't find these artifacts.
         warn(f"Could not write output manifest: {exc}")
+
+
+def _finalize_with_verify(
+    executed: Sequence[ExecutedUnit],
+    config: Config,
+    *,
+    old_manifest: Optional[OutputManifest] = None,
+) -> int:
+    """Verify executed units; either finalize the manifest (top-level) or
+    park entries on `config.collected_entries` (child runs).
+
+    Standard single-package mode (`config.child_run` is False): runs
+    Verify, then on success cleans up stale prior outputs and atomically
+    writes a fresh manifest. On Verify failure, leaves both the prior
+    manifest AND the prior on-disk artifacts untouched.
+
+    Child mode (`config.child_run` is True): runs Verify only and stores
+    the resulting `ManifestEntry`s on `config.collected_entries`. The
+    orchestrator (`_run_source_mode_with_transitives`) is responsible for
+    merging entries across the child + umbrella tree and writing a
+    single manifest at the end. Child runs MUST NOT receive an
+    `old_manifest` — the orchestrator owns the one-shot read of the
+    shared manifest.
+    """
+    exit_code, entries = _verify_executed_and_collect_entries(executed, config)
+    if config.child_run:
+        if exit_code == 0:
+            config.collected_entries.extend(entries)
+        return exit_code
+    if exit_code != 0:
+        return exit_code
+    _finalize_manifest(config, entries, old_manifest=old_manifest)
     return 0
 
 
@@ -474,18 +520,19 @@ def _validate_platforms_post_autodetect(config: Config) -> None:
             )
 
 
-def _run_source_mode(config: Config) -> int:
-    """Source-mode pipeline: Fetch → Inspect → Plan → Prepare → Execute → Verify.
+def _source_mode_inspect(config: Config):
+    """Fetch + Stage + Inspect + autodetect + post-autodetect validation.
 
-    If Inspect reveals that every (non-system) product is backed solely by
-    binaryTarget targets, we transparently hand off to `_run_binary_mode`.
-    Source mode for such a package is fundamentally wrong: there's nothing
-    to compile, and the unconditional `force_dynamic` patch would be
-    rejected by SPM with "invalid type for binary product". The hand-off
-    fires only when `--binary` would also have worked (remote URL +
-    explicit `--version`); for the local-path case we surface a clear
-    PlanError pointing at the limitation rather than silently failing
-    deeper in.
+    Returns either:
+      - the tuple `(source_dir, staged_dir, package)` if the run should
+        proceed to Plan, or
+      - an `int` exit code when an early-exit path fires (--inspect-only,
+        or transparent handoff to binary mode for binary-only packages).
+
+    Splitting this from the rest of source mode lets
+    `_run_source_mode_with_transitives` pre-inspect the umbrella once to
+    discover transitives without paying for a second Fetch + Stage on the
+    umbrella's actual build pass.
     """
     source_dir = fetch_source(config)
     staged_dir = stage_source(config, source_dir)
@@ -543,6 +590,24 @@ def _run_source_mode(config: Config) -> int:
         config.binary_mode = True
         return _run_binary_mode(config)
 
+    return source_dir, staged_dir, package
+
+
+def _source_mode_after_inspect(
+    config: Config,
+    source_dir: Path,
+    staged_dir: Path,
+    package,
+) -> int:
+    """Plan → Prepare → Execute → Verify on an already-inspected package.
+
+    The `source_dir` argument is kept for symmetry with `_source_mode_inspect`'s
+    return shape even though Plan onwards never touches the source tree
+    again — Stage already produced the working tree.
+
+    Reads `old_manifest` only when NOT a child run. Children let the
+    orchestrator own the one-shot manifest read and merged write.
+    """
     plan = plan_source_build(config, package)
     for w in plan.warnings:
         warn(w)
@@ -551,15 +616,389 @@ def _run_source_mode(config: Config) -> int:
     if config.dry_run:
         return 0
 
-    # Read the prior run's manifest BEFORE Execute writes anything. The
-    # content is kept in memory only; the manifest file on disk is
-    # untouched until finalize succeeds. A missing/malformed manifest
-    # flattens to empty — no cross-run cleanup, same as a first run.
-    old_manifest = _read_output_manifest(config.output_dir)
+    old_manifest = (
+        None if config.child_run else _read_output_manifest(config.output_dir)
+    )
 
     prepared = prepare(staged_dir, plan, verbose=config.verbose)
     executed = execute_source_plan(prepared, config)
     return _finalize_with_verify(executed, config, old_manifest=old_manifest)
+
+
+def _run_source_mode(config: Config) -> int:
+    """Source-mode pipeline: Fetch → Inspect → Plan → Prepare → Execute → Verify.
+
+    If Inspect reveals that every (non-system) product is backed solely by
+    binaryTarget targets, we transparently hand off to `_run_binary_mode`.
+    Source mode for such a package is fundamentally wrong: there's nothing
+    to compile, and the unconditional `force_dynamic` patch would be
+    rejected by SPM with "invalid type for binary product". The hand-off
+    fires only when `--binary` would also have worked (remote URL +
+    explicit `--version`); for the local-path case we surface a clear
+    PlanError pointing at the limitation rather than silently failing
+    deeper in.
+    """
+    inspect_result = _source_mode_inspect(config)
+    if isinstance(inspect_result, int):
+        return inspect_result
+    source_dir, staged_dir, package = inspect_result
+    return _source_mode_after_inspect(config, source_dir, staged_dir, package)
+
+
+def _compute_selected_target_closure(
+    config: Config, package: "Package"
+) -> "Optional[Set[str]]":
+    """Return the set of root REGULAR target names the user has actually
+    asked to build, expanded by internal sibling deps.
+
+    Used by `_run_source_mode_with_transitives` to filter out transitives
+    referenced only by helper/example targets the umbrella build won't
+    touch. Returns None when no `--product` / `--target` filter is in
+    effect (the default-everything case — caller should treat that as
+    "keep every transitive").
+
+    Closure construction:
+      1. Seed = (product_filters' backing targets) ∪ target_filters.
+      2. Expand via `compute_internal_target_deps` (internal sibling
+         edges only — external `.product(...)` deps are NOT followed,
+         since those reach OTHER packages and don't belong in a same-
+         package target set).
+      3. Restrict to REGULAR targets (the only kind ever shipped as an
+         xcframework).
+    """
+    if not config.product_filters and not config.target_filters:
+        return None
+
+    products_by_name = {p.name: p for p in package.products}
+    targets_by_name = {t.name: t for t in package.targets}
+
+    seed: Set[str] = set()
+    for prod_name in config.product_filters or []:
+        prod = products_by_name.get(prod_name)
+        if prod is None:
+            continue
+        for tname in prod.targets:
+            if tname in targets_by_name:
+                seed.add(tname)
+    for tname in config.target_filters or []:
+        if tname in targets_by_name:
+            seed.add(tname)
+
+    deps_map = compute_internal_target_deps(package)
+    closure: Set[str] = set()
+    for name in seed:
+        closure.add(name)
+        closure.update(deps_map.get(name, set()))
+
+    return {n for n in closure if targets_by_name[n].kind == TargetKind.REGULAR}
+
+
+def _make_transitive_child_config(parent: Config, tp, child_work_dir: Path) -> Config:
+    """Build a child Config for a transitive checkout.
+
+    The child inherits the parent's output dir + platform flags +
+    keep-work + verbosity, but everything that scopes the build to the
+    parent's chosen products (target filters, version pinning,
+    `--include-deps`'s post-archive walker, the user's revision check) is
+    cleared. `product_filters` IS set, to the exact product names the
+    parent's REGULAR targets imported from this identity — that
+    `referenced_products` list flows down so the child only builds what
+    the umbrella actually consumes. The child's `child_run` flag
+    suppresses the shared-manifest read/write so the orchestrator owns
+    those for the whole tree.
+
+    Re-rooting the foreign checkout as the SPM root has a sharp edge:
+    the foreign Package.swift can declare its own dev/CI dependencies
+    (swift-docc-plugin, carton/wasm tooling, swift-format, …) that the
+    umbrella's resolve never paid for. If we hand the raw checkout to
+    Fetch, `swift package resolve` will follow those declarations and
+    clone tens of MB of unrelated graphs (carton drags in swift-nio,
+    swift-syntax, swift-tools-support-core). To prevent that, we copy
+    the checkout into a per-child pre-staged dir and run
+    `prune_child_manifest_for_products` over it: that drops top-level
+    `#if … #endif` blocks mutating `package.dependencies` / `targets`
+    and any unconditional `.package(url:)` entries the closure of the
+    requested products doesn't actually need. The pruned dir is then
+    fed to Fetch as `package_source`.
+
+    `no_transitive_products=True` enforces the one-level recursion limit:
+    children themselves do not recurse, which matches the design's
+    "depth=1, visited identities" contract.
+    """
+    from dataclasses import replace
+
+    pre_staged_dir = child_work_dir / "prestaged"
+    if pre_staged_dir.exists():
+        shutil.rmtree(pre_staged_dir)
+    shutil.copytree(tp.checkout_path, pre_staged_dir, symlinks=True)
+    # SPM publishes its `.build/checkouts/<pkg>/` trees with read-only
+    # files (and sometimes read-only directories); the copy inherits
+    # those modes. Subsequent Fetch/Stage on the child needs to write
+    # into `.build/`, edit Package.swift, etc. Grant the owner write
+    # access on the root pre-staged dir AND every file/dir under it.
+    # os.walk doesn't yield `pre_staged_dir` itself in the children-of-
+    # root loop below, so chmod it explicitly first — otherwise creating
+    # new files at the top level (e.g. swift package resolve's
+    # `Package.resolved`) would fail when SPM ships a read-only root.
+    import stat as _stat
+    try:
+        top_mode = os.lstat(pre_staged_dir).st_mode
+        os.chmod(pre_staged_dir, top_mode | _stat.S_IWUSR)
+    except (OSError, NotImplementedError):
+        pass
+    for root, dirs, files in os.walk(pre_staged_dir):
+        for name in dirs + files:
+            p = os.path.join(root, name)
+            try:
+                mode = os.lstat(p).st_mode
+                os.chmod(p, mode | _stat.S_IWUSR)
+            except (OSError, NotImplementedError):
+                pass
+    prune_child_manifest_for_products(
+        pre_staged_dir,
+        list(tp.referenced_products),
+        verbose=parent.verbose,
+    )
+
+    child = replace(
+        parent,
+        package_source=str(pre_staged_dir),
+        user_version="",
+        resolved_version="",
+        product_filters=list(tp.referenced_products),
+        target_filters=[],
+        revision=None,
+        include_deps=False,
+        inspect_only=False,
+        dry_run=False,
+        binary_mode=False,
+        no_transitive_products=True,
+        best_effort_transitives=False,
+        # Children build siblings from a single SPM package. SPM's
+        # `package`-level access modifier (Swift 5.9+) lets sibling
+        # targets see each other's `package func`/`package var` symbols
+        # so long as they share a build context — which they do under
+        # `swift build`/`xcodebuild archive`, but NOT when dedup-overlap
+        # rewrites one sibling to a `.binaryTarget`. The rewritten
+        # sibling becomes a foreign module and the parent target's
+        # references to its `package` symbols fail to type-check
+        # ("Cannot find '_fail' in scope" against `package func _fail`).
+        # We trade dedup-overlap's static-link savings for correctness:
+        # each child xcframework may statically embed its sibling deps'
+        # code, which is acceptable bloat for the transitive sidecar
+        # artifacts the umbrella's .swiftinterface only references for
+        # module-import resolution.
+        no_dedup_overlap=True,
+        child_run=True,
+        collected_entries=[],
+        work_dir=child_work_dir,
+    )
+    return child
+
+
+def _run_source_mode_with_transitives(config: Config) -> int:
+    """Top-level source-mode entry point with in-process transitive recursion.
+
+    Discovers external `.product(name:, package:)` dependencies of the
+    root's REGULAR targets, builds each as its own sibling xcframework via
+    a child `_run_source_mode` call against the resolved checkout, and
+    then builds the umbrella against the parent run. Children write their
+    artifacts into the same `--output` directory but never touch the
+    shared output manifest; the orchestrator reads the old manifest once
+    up front and writes a single merged manifest at the end.
+
+    Why this exists: xcodebuild's SPM integration static-links every
+    `.product(...)` reachable from the umbrella scheme into the umbrella's
+    dylib regardless of the product's declared `type:`. The umbrella's
+    consumer-visible `.swiftinterface` then `import`s modules whose
+    `.swiftmodule` isn't anywhere on the consumer's search path. Producing
+    sibling xcframeworks out-of-band (one fresh build per transitive
+    checkout) is the only reliable fix.
+
+    Failure mode is fail-fast by default: any transitive that fails Plan,
+    Execute, or Verify aborts the whole run — shipping the umbrella with
+    a missing sibling that its swiftinterface references would dangle at
+    consume time. Pass `--best-effort-transitives` to continue with
+    whatever transitives succeeded.
+
+    Depth is hard-capped at one level: `_make_transitive_child_config`
+    sets `no_transitive_products=True` on each child. The single-level
+    rule covers every package in the integration matrix today; lifting it
+    later only requires removing that flag and adding a visited-identity
+    parameter through this function.
+    """
+    if config.no_transitive_products or config.child_run:
+        return _run_source_mode(config)
+
+    inspect_result = _source_mode_inspect(config)
+    if isinstance(inspect_result, int):
+        return inspect_result
+    source_dir, staged_dir, package = inspect_result
+
+    transitives = list(package.transitive_packages)
+    if transitives:
+        # Drop transitives reached only from root targets the user's
+        # `--product`/`--target` filters exclude. `referencing_root_targets`
+        # is the set of root REGULAR targets that reference the
+        # transitive via `.product(name:, package:)`. The user-selected
+        # closure is product backing targets ∪ explicit --target names,
+        # expanded by internal sibling deps. With no filters set we keep
+        # every transitive (default scope = all root REGULAR targets).
+        selected_root_targets = _compute_selected_target_closure(config, package)
+        if selected_root_targets is not None:
+            from dataclasses import replace as _dc_replace
+
+            kept: List = []
+            dropped: List[str] = []
+            product_trims: List[Tuple[str, List[str], List[str]]] = []
+            for tp in transitives:
+                if not tp.referencing_root_targets:
+                    # Defensive: if inspect couldn't attribute the
+                    # transitive, keep it rather than silently drop.
+                    kept.append(tp)
+                    continue
+                if not any(t in selected_root_targets for t in tp.referencing_root_targets):
+                    dropped.append(tp.identity)
+                    continue
+                # Identity-level keep: at least one selected root target
+                # references this transitive. Now trim its `referenced_products`
+                # to only the products imported by selected root targets, so
+                # the child doesn't build (and the child planner doesn't try
+                # to validate) products only consumed by deselected siblings.
+                # If per-product attribution is missing (older inspect path),
+                # fall back to keeping all referenced products.
+                if tp.product_to_root_targets:
+                    trimmed = [
+                        p
+                        for p in tp.referenced_products
+                        if any(
+                            rt in selected_root_targets
+                            for rt in tp.product_to_root_targets.get(p, [])
+                        )
+                    ]
+                    if trimmed and trimmed != list(tp.referenced_products):
+                        product_trims.append(
+                            (tp.identity, list(tp.referenced_products), list(trimmed))
+                        )
+                        tp = _dc_replace(tp, referenced_products=trimmed)
+                    elif not trimmed:
+                        # All referenced products belong to deselected
+                        # root targets even though the union check matched
+                        # (e.g. attribution races against the union list).
+                        # Treat as dropped rather than building an empty
+                        # child.
+                        dropped.append(tp.identity)
+                        continue
+                kept.append(tp)
+            if dropped:
+                bold(
+                    f"Skipping {len(dropped)} transitive(s) referenced only by "
+                    f"deselected root targets: " + ", ".join(dropped)
+                )
+            for ident, before, after in product_trims:
+                bold(
+                    f"  trimming {ident!r} products to selected scope: "
+                    f"{', '.join(sorted(before))} → {', '.join(sorted(after))}"
+                )
+            transitives = kept
+
+    if not transitives:
+        # Self-contained package — no recursion needed.
+        return _source_mode_after_inspect(config, source_dir, staged_dir, package)
+
+    bold(
+        f"Will also build {len(transitives)} transitive package(s) "
+        f"as siblings: " + ", ".join(tp.identity for tp in transitives)
+    )
+
+    old_manifest = _read_output_manifest(config.output_dir)
+    all_entries: List[ManifestEntry] = []
+    # Seed `visited` with the root's own identity computed the same way
+    # `_collect_referenced_package_products` keys its entries — by SPM
+    # identity. `_identity_from_url` mirrors SPM's normalisation (last URL
+    # path component, `.git` stripped, lowercased). Falling back to
+    # `package.name` keeps the guard intact for local-path package
+    # sources where `package_source` isn't a URL.
+    root_identity = _identity_from_url(config.package_source) or package.name.lower()
+    visited: Set[str] = {root_identity}
+
+    parent_work = config.work_dir
+    if parent_work is None:
+        # Should never happen — main() always allocates a work_dir before
+        # routing here — but fall back to a tempdir under the system tmp
+        # so we don't crash on a manually-constructed Config.
+        parent_work = Path(tempfile.mkdtemp(prefix="spm2xc-orchestrator-"))
+        config.work_dir = parent_work
+
+    for tp in transitives:
+        ident_key = tp.identity.lower()
+        if ident_key in visited:
+            continue
+        visited.add(ident_key)
+        if not tp.checkout_path.exists():
+            warn(
+                f"  transitive {tp.identity!r}: checkout missing at "
+                f"{tp.checkout_path}; skipping"
+            )
+            continue
+        child_work_dir = parent_work / "transitives" / tp.identity
+        child_work_dir.mkdir(parents=True, exist_ok=True)
+        bold(f"\n=== transitive: {tp.identity} ===")
+        # `_make_transitive_child_config` runs the pre-stage copytree,
+        # the chmod walk, and the prune passes — all of which can raise
+        # `PrepareUserError` (read-only checkout, broken manifest,
+        # dump-package rejection of an edited file, ...). Wrap that call
+        # in the same handler that protects `_run_source_mode` itself
+        # so prep failures honour the fail-fast / best-effort contract
+        # and are attributed to the offending transitive identity.
+        try:
+            child_config = _make_transitive_child_config(config, tp, child_work_dir)
+            result = _run_source_mode(child_config)
+        except _USER_FACING_ERRORS as exc:
+            # Mirror main()'s clean-error path: a child's Fetch / Inspect /
+            # Plan / Execute / Prepare error shouldn't crash with a
+            # traceback at the orchestrator level, but it should still
+            # abort the run unless the user opted into best-effort mode.
+            phase = _phase_label_for(exc)
+            print(
+                _wrap(f"Error ({phase}, transitive {tp.identity!r}): {exc}", "red"),
+                file=sys.stderr,
+            )
+            if config.best_effort_transitives:
+                warn(
+                    f"  continuing per --best-effort-transitives; "
+                    f"{tp.identity!r} will not be shipped (any partial "
+                    f"artifacts under {config.output_dir} are excluded from "
+                    f"the manifest but not deleted — inspect before shipping)"
+                )
+                continue
+            return exc.exit_code
+        if result != 0:
+            if config.best_effort_transitives:
+                warn(
+                    f"  transitive {tp.identity!r} failed (exit {result}); "
+                    f"continuing per --best-effort-transitives (any partial "
+                    f"artifacts under {config.output_dir} are excluded from "
+                    f"the manifest but not deleted — inspect before shipping)"
+                )
+                continue
+            return result
+        all_entries.extend(child_config.collected_entries)
+
+    # Build the umbrella last, as a child run so it deposits its entries
+    # in the same merge bucket and skips the per-call manifest write.
+    bold(f"\n=== umbrella: {package.name} ===")
+    config.child_run = True
+    config.collected_entries = []
+    umbrella_result = _source_mode_after_inspect(
+        config, source_dir, staged_dir, package
+    )
+    if umbrella_result != 0:
+        return umbrella_result
+    all_entries.extend(config.collected_entries)
+
+    _finalize_manifest(config, all_entries, old_manifest=old_manifest)
+    return 0
 
 
 def _run_binary_mode(config: Config) -> int:

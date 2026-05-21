@@ -52,6 +52,7 @@ MODULE_ORDER: List[str] = [
     "inspect.py",
     "plan.py",
     "prepare.py",
+    "prune_child.py",
     "execute/archive.py",
     "execute/rename_framework.py",
     "execute/inject_swiftmodule.py",

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 class Linkage:
@@ -75,6 +75,50 @@ class Target:
 
 
 @dataclass
+class TransitivePackageInfo:
+    """A directly-referenced external dependency package: its SPM identity
+    (as used in `.product(name: X, package: identity)` from the root's
+    targets), the resolved checkout path under `<staged>/.build/checkouts/`,
+    and its dumped library products.
+
+    Populated by Inspect for every package identity that any REGULAR target
+    in the root package references via `.product(name:, package:)`. The
+    planner reads from this pre-computed data so it stays subprocess-free
+    (Plan purity contract).
+    """
+
+    identity: str                    # SPM identity, e.g. "swift-clocks"
+    checkout_path: Path              # absolute, under .build/checkouts/
+    products: List["Product"]        # parsed via _parse_dump on the checkout
+    tools_version: str               # for active-manifest selection in Prepare
+    # The exact product names the root's REGULAR targets imported from this
+    # identity via `.product(name: X, package: <identity>)`. Order preserved;
+    # duplicates removed. The orchestrator passes these to the child run as
+    # `Config.product_filters` so the child only builds what the umbrella
+    # actually consumes, and the child's manifest pruner uses them to
+    # compute the closure of external `.package(url:)` deps that must be
+    # kept in the pre-staged Package.swift. The orchestrator may further
+    # trim this list to only those products imported by IN-CLOSURE root
+    # targets before handing it to the child.
+    referenced_products: List[str] = field(default_factory=list)
+    # Root-package target names that reference this transitive identity via
+    # `.product(name:, package:)`. The orchestrator intersects this set with
+    # the user's selected-target closure (product_filters + target_filters,
+    # expanded by internal dep edges) to drop transitives reached only from
+    # unrelated regular helper/example targets — avoiding fail-fast aborts on
+    # external dependencies that the umbrella product would never link.
+    referencing_root_targets: List[str] = field(default_factory=list)
+    # Per-product attribution: product name -> ordered list of root REGULAR
+    # target names that reference that specific product. Populated by Inspect
+    # so the orchestrator can trim `referenced_products` down to only those
+    # products an IN-CLOSURE root target actually imports — without this, a
+    # package referenced by two different root targets via two different
+    # products would force the child to build BOTH products even if only one
+    # caller is in the user's selection.
+    product_to_root_targets: Dict[str, List[str]] = field(default_factory=dict)
+
+
+@dataclass
 class Package:
     """Typed snapshot of `swift package dump-package` for the staged
     package. Read-only after Inspect; the planner consumes it."""
@@ -87,11 +131,33 @@ class Package:
     schemes: List[str]              # from xcodebuild -list -json against staged
     raw_dump: dict                  # untouched dump-package JSON, for debugging
     staged_dir: Path
+    # Direct (1st-level) external dependency packages whose products the
+    # root's REGULAR targets reference via `.product(name:, package:)`.
+    # Populated by Inspect when the root has external product deps, empty
+    # for self-contained packages. Consumed by the top-level orchestrator
+    # `_run_source_mode_with_transitives` to drive in-process recursion —
+    # one child `_run_source_mode` call per identity, building each
+    # transitive checkout as its own xcframework alongside the umbrella.
+    transitive_packages: List["TransitivePackageInfo"] = field(default_factory=list)
 
     def target_by_name(self, name: str) -> Optional[Target]:
         for t in self.targets:
             if t.name == name:
                 return t
+        return None
+
+    def transitive_package_by_identity(
+        self, identity: str
+    ) -> Optional["TransitivePackageInfo"]:
+        """Case-insensitive lookup: SPM normalises identities to lowercase
+        in `dump-package`'s `.product` shape, but the value the manifest
+        passes to `package:` is whatever the author wrote in their
+        `.package(...)` declaration.
+        """
+        target_lower = identity.lower()
+        for tp in self.transitive_packages:
+            if tp.identity.lower() == target_lower:
+                return tp
         return None
 
 

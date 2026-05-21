@@ -138,11 +138,14 @@ def _make_code_token_view(text: str) -> str:
     well-formed manifest.
 
     Limitations match `_strip_swift_comments`: only `"..."` strings are
-    tracked. `#\"...\"#` raw strings, `\"\"\"...\"\"\"` multi-line
-    strings, and `\\(...)` interpolation aren't supported here — they
-    would be rejected upstream by
+    tracked. `#\"...\"#` raw strings and `\"\"\"...\"\"\"` multi-line
+    strings aren't supported here — they would be rejected upstream by
     `_assert_no_unsupported_swift_constructs` before any prepare-time
-    edit runs.
+    edit runs. `\\(...)` string interpolation IS handled by recursing
+    through `_balanced_close` to find the closing `)` of the embedded
+    expression, then resuming string mode — matching what
+    `_balanced_close` itself does, so the two views agree on where
+    strings end.
 
     On an unterminated string or block comment, falls through
     conservatively: copies the suspicious tail verbatim. The trigger
@@ -156,12 +159,22 @@ def _make_code_token_view(text: str) -> str:
     while i < n:
         c = text[i]
         # Double-quoted string: blank delimiters + body with spaces, keep newlines.
+        # Honors `\(...)` interpolation via recursion through `_balanced_close`,
+        # so a string like `"Sources/\(name + "Tests")"` doesn't mis-terminate
+        # on the inner `"` of the interpolation expression.
         if c == '"':
             j = i + 1
             terminated = False
             while j < n:
                 cc = text[j]
                 if cc == "\\" and j + 1 < n:
+                    if text[j + 1] == "(":
+                        close_idx = _balanced_close(text, j + 1)
+                        if close_idx == -1:
+                            # Unterminated interpolation — bail conservatively.
+                            break
+                        j = close_idx + 1
+                        continue
                     j += 2
                     continue
                 if cc == '"':
@@ -225,11 +238,11 @@ def _assert_no_unsupported_swift_constructs(text: str) -> None:
     walker can't reason about.
 
     The walker handles double-quoted strings (with backslash escapes),
-    line comments (//) and block comments. It does NOT handle Swift raw
-    strings (#"..."#), multi-line triple-quoted strings, or string
-    interpolation: parens inside an interpolated expression would fool
-    the depth counter, and unescaped quotes inside a raw string would
-    confuse the string-skip state.
+    line comments (//), block comments, and string interpolation
+    (`\\(...)` via recursion through the walker). It does NOT handle
+    Swift raw strings (`#"..."#`) or multi-line triple-quoted strings:
+    unescaped quotes inside a raw string would confuse the string-skip
+    state, and triple-quotes use a different terminator.
 
     To avoid flagging false positives on doc comments that legitimately
     mention these constructs (e.g. `/// Uses #"..."# internally`), we
@@ -259,12 +272,11 @@ def _assert_no_unsupported_swift_constructs(text: str) -> None:
             "which the balanced-paren walker doesn't understand. "
             "File a bug if this needs to be supported."
         )
-    if '\\(' in scanned:
-        raise PrepareUserError(
-            "Package.swift uses Swift string interpolation (`\\(...)`), "
-            "which the balanced-paren walker doesn't understand. "
-            "File a bug if this needs to be supported."
-        )
+    # Swift string interpolation (`\\(...)`) used to be rejected here but
+    # the walker now handles it via recursion through itself in the
+    # string-skip path. Real-world manifests use it heavily (e.g.
+    # swift-collections' Package.swift builds path strings from target
+    # names via `"Sources/\\(name)"`).
 
 
 def _balanced_close(text: str, open_idx: int) -> int:
@@ -273,11 +285,13 @@ def _balanced_close(text: str, open_idx: int) -> int:
     string literals (`"..."` with `\\"` escapes), `// ...` line comments, and
     `/* ... */` block comments. Returns -1 if no matching close is found.
 
-    Does NOT handle Swift multi-line triple-quoted strings, raw strings,
-    or string interpolation. Callers should run
+    Does NOT handle Swift multi-line triple-quoted strings or raw
+    strings. `\\(...)` string interpolation IS handled by recursing
+    through this same walker to find the closing `)` of the interpolation
+    expression, then resuming string mode. Callers should still run
     `_assert_no_unsupported_swift_constructs` on the full manifest text
-    before invoking this walker so unsupported syntax fails loudly with a
-    targeted PrepareError instead of being silently mis-parsed.
+    so the unsupported constructs that remain fail loudly with a targeted
+    PrepareError instead of being silently mis-parsed.
     """
     if open_idx < 0 or open_idx >= len(text):
         return -1
@@ -318,12 +332,22 @@ def _balanced_close(text: str, open_idx: int) -> int:
             if block_depth > 0:
                 return -1
             continue
-        # String literal: skip to closing quote, honoring `\\"` escapes.
+        # String literal: skip to closing quote, honoring `\\"` escapes
+        # and `\(...)` interpolation. Interpolation embeds an arbitrary
+        # Swift expression (which itself can contain strings, comments,
+        # nested interpolation, and brackets) — we recurse through this
+        # same walker to find the closing `)`, then resume string mode.
         if c == '"':
             i += 1
             while i < n:
                 cc = text[i]
                 if cc == "\\" and i + 1 < n:
+                    if text[i + 1] == "(":
+                        close_idx = _balanced_close(text, i + 1)
+                        if close_idx == -1:
+                            return -1
+                        i = close_idx + 1
+                        continue
                     i += 2
                     continue
                 if cc == '"':
@@ -409,6 +433,12 @@ def _flatten_to_top_level(span: str) -> str:
             while j < n:
                 cc = span[j]
                 if cc == "\\" and j + 1 < n:
+                    if span[j + 1] == "(":
+                        close_idx = _balanced_close(span, j + 1)
+                        if close_idx == -1:
+                            break
+                        j = close_idx + 1
+                        continue
                     j += 2
                     continue
                 if cc == '"':
@@ -539,6 +569,101 @@ def _has_binary_target_with_name(text: str, target_name: str) -> bool:
         if _top_level_name_label(span) == target_name:
             return True
         pos = close_idx + 1
+
+
+_PACKAGE_CALL_RE = re.compile(r"\bPackage\s*\(")
+_PRODUCTS_LABEL_RE = re.compile(r"\bproducts\s*:")
+
+
+def edit_append_synth_product_to_package(
+    manifest_text: str, product_name: str, targets: Sequence[str]
+) -> str:
+    """Append `.library(name: <product_name>, type: .dynamic, targets:
+    [<targets>])` to the top-level `Package(...)` call's `products:`
+    argument by rewriting `products: <expr>` to `products: <expr> +
+    [<synth>]`.
+
+    Fallback for `swift package add-product` failures when the manifest's
+    `products:` argument is not a literal array. Real example:
+    swift-collections 1.1.4 builds its product list programmatically
+    (`products: _products`), which SPM rejects with "unable to find
+    array literal for 'products' argument".
+
+    The `(<expr>) + [<synth>]` rewrite is well-typed both for literal
+    arrays and for any `[Product]`-typed expression, so we don't need
+    to locate the closing `]` of an array — we just splice at the
+    expression's end (next top-level comma or the closing `)` of the
+    Package call). The original expression is wrapped in parens to defend
+    against precedence surprises: a manifest written as
+    `products: cond ? a : b` would, without the wrap, parse as
+    `products: cond ? a : (b + [<synth>])` because `+` binds tighter than
+    `?:`. The same hazard applies to `??`. The synthetic entry's type is
+    always `.dynamic` because that's the only kind of synthetic library
+    we currently emit via this path; `synth_library` (non-dynamic) goes
+    through add-product on packages whose manifest shape allows it.
+    """
+    code_view = _make_code_token_view(manifest_text)
+    m = _PACKAGE_CALL_RE.search(code_view)
+    if not m:
+        raise PrepareUserError(
+            "synth-product fallback: no top-level `Package(` call found "
+            "in the manifest."
+        )
+    pkg_open = m.end() - 1
+    pkg_close = _balanced_close(manifest_text, pkg_open)
+    if pkg_close == -1:
+        raise PrepareUserError(
+            "synth-product fallback: unmatched `(` for `Package(`; "
+            "manifest may be malformed."
+        )
+    body_start = pkg_open + 1
+    body_end = pkg_close
+    body = manifest_text[body_start:body_end]
+    body_dz = _depth_zero_view(body)
+    lm = _PRODUCTS_LABEL_RE.search(body_dz)
+    if not lm:
+        raise PrepareUserError(
+            "synth-product fallback: no top-level `products:` argument "
+            "inside the Package(...) call. The manifest shape is not "
+            "supported by this fallback."
+        )
+    # Bound the products expression: from just after `products:` (skipping
+    # any leading horizontal whitespace) to the next top-level comma or
+    # the end of the Package body. Walk back over trailing whitespace so
+    # the closing `)` lands flush against the expression instead of
+    # swallowing pre-comma indentation.
+    expr_start_in_body = lm.end()
+    while (
+        expr_start_in_body < len(body)
+        and body[expr_start_in_body] in " \t"
+    ):
+        expr_start_in_body += 1
+    comma_idx = body_dz.find(",", expr_start_in_body)
+    expr_end_in_body = comma_idx if comma_idx != -1 else len(body)
+    while (
+        expr_end_in_body > expr_start_in_body
+        and body[expr_end_in_body - 1] in " \t\n"
+    ):
+        expr_end_in_body -= 1
+
+    expr_start_offset = body_start + expr_start_in_body
+    expr_end_offset = body_start + expr_end_in_body
+
+    targets_list = ", ".join(_swift_string_literal(t) for t in targets)
+    synth_tail = (
+        f") + [.library(name: {_swift_string_literal(product_name)}, "
+        f"type: .dynamic, targets: [{targets_list}])]"
+    )
+    # Wrap the original expression in parens, then append `+ [<synth>]`.
+    # Done as a single splice so the two edits don't disturb each other's
+    # offsets.
+    return (
+        manifest_text[:expr_start_offset]
+        + "("
+        + manifest_text[expr_start_offset:expr_end_offset]
+        + synth_tail
+        + manifest_text[expr_end_offset:]
+    )
 
 
 def edit_replace_with_binary_target(
@@ -691,6 +816,12 @@ def _depth_zero_view(span: str) -> str:
             while j < n:
                 cc = span[j]
                 if cc == "\\" and j + 1 < n:
+                    if span[j + 1] == "(":
+                        close_idx = _balanced_close(span, j + 1)
+                        if close_idx == -1:
+                            break
+                        j = close_idx + 1
+                        continue
                     j += 2
                     continue
                 if cc == '"':
@@ -870,6 +1001,38 @@ def _read_declared_tools_version(path: Path) -> Optional[Tuple[int, int, int]]:
     return None
 
 
+def _bump_tools_version_if_below(
+    manifest_path: Path, min_version: Tuple[int, int]
+) -> Optional[Tuple[int, int, int]]:
+    """Rewrite the manifest's `// swift-tools-version: X.Y` line to
+    `min_version` if currently below it. Returns the original parsed
+    version if a bump was applied, else None.
+
+    Why: `swift package add-product` requires tools-version >= 5.2; SPM's
+    own error message recommends bumping to 5.5+. Old packages like
+    MBProgressHUD (4.2) use only the manifest-format subset that's
+    backward-compatible with 5.5, so bumping doesn't break the build —
+    it just unblocks the synthetic-product edit.
+    """
+    declared = _read_declared_tools_version(manifest_path)
+    if declared is None:
+        return None
+    if declared[:2] >= min_version:
+        return None
+    try:
+        text = manifest_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    lines = text.splitlines(keepends=True)
+    replacement = f"// swift-tools-version: {min_version[0]}.{min_version[1]}\n"
+    for i, line in enumerate(lines[:8]):
+        if _TOOLS_VERSION_RE.search(line):
+            lines[i] = replacement
+            manifest_path.write_text("".join(lines), encoding="utf-8")
+            return declared
+    return None
+
+
 def _select_active_manifest(staged_dir: Path) -> Path:
     """Pick the Package.swift file SPM will actually read for this toolchain.
 
@@ -923,6 +1086,91 @@ def _select_active_manifest(staged_dir: Path) -> Path:
         ):
             best = (declared, candidate)
     return best[1] if best is not None else base
+
+
+def _add_product_via_active_manifest_proxy(
+    staged_dir: Path,
+    active_manifest: Path,
+    product_name: str,
+    targets: Sequence[str],
+) -> None:
+    """Run `swift package add-product` so the edit lands in
+    `active_manifest`, even when SPM picks a version-specific manifest
+    (e.g. Package@swift-5.9.swift) over the base Package.swift.
+
+    Problem: `swift package add-product` is hard-coded to edit
+    `Package.swift`. When SPM selects a version-specific manifest as
+    active, the call returns 0, edits Package.swift, and leaves the
+    active manifest untouched — `dump-package` (which reads the active)
+    then shows no product and round-trip validation rejects the edit as
+    a silent no-op. Reproduced on Nuke 12.8.0 and swift-dependencies
+    1.6.3 (both ship Package.swift + Package@swift-5.9.swift).
+
+    Fix: temporarily put the active manifest's text into Package.swift,
+    run add-product (which edits Package.swift in place), then copy the
+    edited content back to the active manifest and restore the original
+    Package.swift.
+    """
+    base_manifest = staged_dir / "Package.swift"
+    if active_manifest == base_manifest:
+        _invoke_swift_add_product(staged_dir, product_name, targets)
+        return
+
+    base_existed = base_manifest.is_file()
+    base_text_before = base_manifest.read_text() if base_existed else None
+    active_text = active_manifest.read_text()
+    try:
+        base_manifest.write_text(active_text)
+        _invoke_swift_add_product(staged_dir, product_name, targets)
+        active_manifest.write_text(base_manifest.read_text())
+    finally:
+        # Restore the original state. If Package.swift didn't exist before
+        # (legal per SE-0152: a package may ship only version-specific
+        # manifests), unlink the temporary file we wrote so we don't leave
+        # a ghost manifest behind that the package never had. Skipping this
+        # would change the manifest set the package presents to SPM on the
+        # next invocation.
+        if base_text_before is not None:
+            base_manifest.write_text(base_text_before)
+        elif not base_existed and base_manifest.is_file():
+            base_manifest.unlink()
+
+
+def _apply_single_synth_edit(
+    staged_dir: Path,
+    active_manifest: Path,
+    product_name: str,
+    targets: Sequence[str],
+) -> None:
+    """Add one synthetic dynamic library via add-product, falling back to
+    manual text surgery if SPM rejects the manifest's `products:` shape.
+
+    SPM's add-product requires `products: [ ... ]` to be a literal array
+    expression in the source. swift-collections (and other packages that
+    build their product list programmatically) instead write something
+    like `products: _products`, which SPM rejects with "unable to find
+    array literal for 'products' argument". In that case we fall through
+    to `edit_append_synth_product_to_package`, which appends the
+    synthetic entry via a `+ [...]` expression that works for both
+    literal arrays and non-literal expressions.
+    """
+    try:
+        _add_product_via_active_manifest_proxy(
+            staged_dir, active_manifest, product_name, targets
+        )
+        return
+    except PrepareBug as exc:
+        if "unable to find array literal" not in str(exc).lower():
+            raise
+        info(
+            f"  swift add-product can't edit non-literal `products:`; "
+            f"falling back to manual surgery for {product_name}"
+        )
+
+    edited = edit_append_synth_product_to_package(
+        active_manifest.read_text(), product_name, targets
+    )
+    active_manifest.write_text(edited)
 
 
 def _invoke_swift_add_product(
@@ -1037,14 +1285,36 @@ def apply_package_swift_edits(staged_dir: Path, plan: Plan) -> str:
     if not snapshot_path.exists():
         snapshot_path.write_text(original_text)
 
+    # `swift package add-product` rejects manifests below tools-version
+    # 5.2 (SPM's own error message recommends 5.5). Old packages like
+    # MBProgressHUD (4.2) work fine under 5.5's manifest format — just
+    # bump the line before invoking add-product. Only relevant when the
+    # plan actually has synth edits.
+    has_synth = any(
+        edit.kind in ("synth_dynamic_library", "synth_library")
+        for edit in plan.package_swift_edits
+    )
+    if has_synth:
+        bumped_from = _bump_tools_version_if_below(manifest_path, (5, 5))
+        if bumped_from is not None:
+            info(
+                f"  Bumped swift-tools-version "
+                f"{bumped_from[0]}.{bumped_from[1]} → 5.5 "
+                f"in {manifest_path.name} (required for add-product)"
+            )
+
     # Apply edits in plan order so the post-edit products array reflects
     # planner sequencing. synth_dynamic_library and synth_library are both
     # implemented by the same `swift package add-product` call; the only
-    # difference is naming policy at plan time.
+    # difference is naming policy at plan time. Routed through a
+    # base-manifest proxy because add-product is hard-coded to edit
+    # Package.swift even when SPM is reading Package@swift-X.Y.swift,
+    # and through a surgery fallback when the manifest's `products:` is
+    # not a literal array.
     for edit in plan.package_swift_edits:
         if edit.kind in ("synth_dynamic_library", "synth_library"):
-            _invoke_swift_add_product(
-                staged_dir, edit.product_name, edit.targets
+            _apply_single_synth_edit(
+                staged_dir, manifest_path, edit.product_name, edit.targets
             )
 
     return original_text

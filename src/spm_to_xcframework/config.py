@@ -70,6 +70,33 @@ class Config:
     # to opt out (e.g. to reproduce legacy single-shot behavior for
     # debugging). See REWRITE_DESIGN.md §5.4 dedup-overlap.
     no_dedup_overlap: bool = False
+    # When False (default), the top-level orchestrator
+    # `_run_source_mode_with_transitives` recurses one level into each
+    # external `.product(name:, package:)` dependency of the root's
+    # REGULAR targets, building each transitive checkout as its own
+    # sibling xcframework. Pass --no-transitive-products to skip the
+    # recursion (the umbrella may then ship with dangling .swiftinterface
+    # imports — useful only for legacy workflows where the consumer
+    # ignores the dropped modules).
+    no_transitive_products: bool = False
+    # When False (default), a transitive sibling that fails plan/build/
+    # verify aborts the whole run — shipping the umbrella with a missing
+    # sibling that its .swiftinterface imports would dangle at consume
+    # time. Pass --best-effort-transitives to continue with whatever
+    # transitives succeeded; the umbrella runs anyway and the failed
+    # transitives are skipped with a warning.
+    best_effort_transitives: bool = False
+    # Internal: set True for child invocations spawned by
+    # `_run_source_mode_with_transitives` to suppress shared-output-
+    # manifest reads/writes/cleanup (the orchestrator owns those for the
+    # whole tree) and to prefix banners with `[transitive: <identity>]`.
+    # Never set this from the CLI.
+    child_run: bool = False
+    # Output sink populated by `_finalize_with_verify` when child_run is
+    # True: the orchestrator drains each child's list, merges them with
+    # the umbrella's entries, and writes one manifest at the end.
+    # Always empty on parent Configs.
+    collected_entries: List["ManifestEntry"] = field(default_factory=list)
     work_dir: Optional[Path] = None  # set in main() before fetch/inspect run
 
     @property

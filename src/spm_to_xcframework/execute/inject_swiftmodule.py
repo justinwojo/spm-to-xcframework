@@ -8,11 +8,57 @@ agnostic at the call site.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Optional, Sequence, Tuple
 
 from ..log import dim, verbose_log
+
+
+# SPM passes `-package-name <pkg>` to every target in a Swift package so
+# `package`-access symbols work between siblings. The flag gets recorded in
+# the emitted `.swiftinterface` header — any consumer Swift module that
+# imports this framework AND also gets `-package-name <pkg>` (i.e., happens
+# to live in an SPM package with the same name) will require a matching
+# `.package.swiftinterface` and refuse to load the public one. Since an
+# `.xcframework` is an external artifact, no consumer should treat it as
+# in-package; we strip the flag so the loaded interface is unambiguously
+# non-package and Swift falls back to the normal public-import path.
+#
+# Triggers seen in the matrix: Nuke 12.x — Nuke and NukeUI both live in
+# `staged`, so NukeUI fails to load Nuke.framework's interface with
+# "Module 'Nuke' is in package 'staged' but was built from a non-package
+# interface" unless we strip.
+#
+# The rewrite is scoped to the `// swift-module-flags[-ignorable]:` header
+# comment lines only. A blind file-wide substitution would silently corrupt
+# any public API whose body contains a string literal with the substring
+# " -package-name X" — unlikely, but exactly the class of "silently
+# producing a broken xcframework" we explicitly want to avoid.
+_PACKAGE_NAME_FLAG_RE = re.compile(r"[ \t]+-package-name[ \t]+\S+")
+_MODULE_FLAGS_PREFIX_RE = re.compile(
+    r"^//\s*swift-module-flags(?:-ignorable)?\s*:"
+)
+
+
+def _strip_package_name_from_swiftinterfaces(swiftmod_dir: Path) -> None:
+    for iface in swiftmod_dir.glob("*.swiftinterface"):
+        try:
+            text = iface.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        lines = text.splitlines(keepends=True)
+        changed = False
+        for idx, line in enumerate(lines):
+            if not _MODULE_FLAGS_PREFIX_RE.match(line):
+                continue
+            stripped = _PACKAGE_NAME_FLAG_RE.sub("", line)
+            if stripped != line:
+                lines[idx] = stripped
+                changed = True
+        if changed:
+            iface.write_text("".join(lines), encoding="utf-8")
 
 
 def _find_swiftmodule_in_dd(
@@ -181,5 +227,6 @@ def inject_swiftmodule(
     if dest.exists():
         shutil.rmtree(dest)
     shutil.copytree(swiftmod, dest)
+    _strip_package_name_from_swiftinterfaces(dest)
     _ensure_root_symlink(fw_path, "Modules")
     return True
