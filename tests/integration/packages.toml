@@ -96,22 +96,35 @@ exercises = [
 
 # 6 — Apple library-evolution stress. Filtered to the umbrella product to
 # keep build time bounded — the .swiftinterface emission path is the same.
+# Also the canonical CustomTarget-wrapper case: the manifest assigns
+# `Target.target = CustomTarget.target` so every `.target(...)` call is
+# really a wrapper. Drives the overlay-injection path in Prepare and the
+# phantom-helper dep augmentation in Execute (the umbrella's compile needs
+# FRAMEWORK_SEARCH_PATHS to reach the auto-synth'd sibling xcframeworks).
 [[package]]
 name = "swift-collections"
 url = "https://github.com/apple/swift-collections"
 version = "1.1.4"
 min_versions = { ios = "13.0" }
 args = ["--product", "Collections"]
-expected_products = ["Collections"]
+expected_products = [
+    "Collections",
+    "BitCollections",
+    "DequeModule",
+    "HashTreeCollections",
+    "HeapModule",
+    "OrderedCollections",
+    "InternalCollectionsUtilities",
+]
 exercises = [
     "library-evolution",
     "inject_swiftmodule-swiftinterface",
     "string-interpolation-walker",
     "non-literal-products-surgery-fallback",  # `products: _products` (variable)
+    "custom-target-wrapper-overlay",  # CustomTarget.target shadow → overlay injection
+    "auto-synth-sibling-xcframeworks",  # internal-only Swift siblings promoted to standalone
+    "phantom-helper-dep-injection",  # umbrella's deps array gets transitive helpers appended
 ]
-known_broken = true
-broken_signature = "['BitCollections', 'DequeModule', 'HashTreeCollections', 'HeapModule', 'OrderedCollections']"
-broken_reason = "Prepare + Execute now succeed (string-interpolation walker + non-literal-products surgery fallback both landed 2026-05-21). Remaining: the Collections umbrella product depends on sibling internal targets (BitCollections, DequeModule, HashTreeCollections, HeapModule, OrderedCollections) which are statically linked into Collections.framework's binary, but their .swiftmodule directories aren't bundled into the xcframework — so a Swift consumer can't import Collections (the .swiftinterface references the siblings). Fix would require either bundling sibling .swiftmodules into the umbrella framework's Modules/ or shipping each sibling as its own xcframework. Surfaced 2026-05-21 by this harness."
 
 # 7 — Binary mode + binary discovery. Pre-vendored Lottie.xcframework
 # via SPM binary target. Cheap canary for the --binary code path.
@@ -214,3 +227,48 @@ exercises = [
     "internal-target-deps",
 ]
 notes = "Multi-product + internal .target sibling deps. Triggers the dedup-overlap rewrite — Stripe.xcframework would otherwise statically embed StripeCore. All five sibling .targets the Stripe umbrella `.swiftinterface` imports are listed so the produced bundle is consumer-complete (a partial build leaves unresolved `import StripeApplePay`/`StripePayments`/`StripePaymentsUI`)."
+
+# 12 — Library-evolution resilience boundary stress test. swift-syntax has ~31
+# internal targets; SwiftParser depends on SwiftSyntax + six version-compat
+# layers (SwiftSyntax509…603). The compat layers have no `.library()` products
+# (internal-only) so auto-synth promotes them. SwiftSyntax HAS a library
+# product, so it stays as a regular .target dep.
+#
+# Requires `--no-dedup-overlap` because SwiftParser does exhaustive switches
+# over enums from SwiftSyntax (e.g., `Keyword`, `RawSameTypeRequirementSyntax.LeftType`).
+# With dedup-overlap ON, SwiftSyntax gets rewritten to `.binaryTarget` for
+# SwiftParser's build → SwiftParser sees SwiftSyntax as an externally-resilient
+# module → exhaustive switches without `@unknown default` become hard errors
+# at .swiftinterface emit time. With dedup-overlap OFF, SwiftSyntax stays a
+# .target dep and SPM's normal cross-product framework search paths handle
+# the dynamic linkage correctly.
+#
+# This is a real architectural limitation of dedup-overlap, not a swift-syntax
+# bug. Documented as P1 in ROADMAP.md (auto-detect resilience-incompatible
+# packages and selectively disable dedup-overlap).
+[[package]]
+name = "swift-syntax"
+url = "https://github.com/swiftlang/swift-syntax"
+version = "603.0.1"
+min_versions = { ios = "13.0" }
+args = ["--product", "SwiftParser", "--no-dedup-overlap"]
+expected_products = [
+    "SwiftParser",
+    "SwiftSyntax",
+    "SwiftSyntax509",
+    "SwiftSyntax510",
+    "SwiftSyntax600",
+    "SwiftSyntax601",
+    "SwiftSyntax602",
+    "SwiftSyntax603",
+]
+exercises = [
+    "large-internal-target-graph",  # ~31 targets in package
+    "auto-synth-sibling-xcframeworks",  # 6 compat layers (no product) promoted
+    "auto-synth-respects-existing-product",  # SwiftSyntax has product, not auto-promoted
+    "no-dedup-overlap-flag",
+    "non-literal-products-surgery-fallback",  # let products: [Product] with conditional
+    "mixed-c-swift-internal-target",  # _SwiftSyntaxCShims (C) embedded into SwiftSyntax framework
+    "cross-product-framework-search-path-linkage",  # SwiftParser dyn-links SwiftSyntax via SPM
+]
+notes = "Surfaced the dedup-overlap-vs-library-evolution incompatibility on 2026-05-21. Workaround is the existing --no-dedup-overlap flag. SwiftSyntax.xcframework reports as [Mixed] because of the _SwiftSyntaxCShims C target embedded into it; SwiftParser and the six SwiftSyntax5XX-603 compat layers are pure [Swift]."
