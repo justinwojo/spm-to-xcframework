@@ -218,14 +218,23 @@ class Config:
     target_filters: List[str] = field(default_factory=list)
     revision: Optional[str] = None
     # Per-platform deployment targets. `None` means "don't build this platform".
-    # iOS defaults to "15.0" for backward compatibility; pass --no-ios to opt out.
-    # Each non-iOS platform is opt-in via its --min-* flag.
-    min_ios: Optional[str] = "15.0"
+    # All default to None; when the user passes zero --min-* flags, the
+    # source-mode pipeline auto-derives the set from `Package.platforms[]`
+    # after Inspect. The auto-detect falls back to iOS 15.0 when the
+    # package declares no platforms at all. Binary mode (no Inspect)
+    # applies the same iOS-15 fallback in `_run_binary_mode` (cli.py).
+    min_ios: Optional[str] = None
     min_macos: Optional[str] = None
     min_maccatalyst: Optional[str] = None
     min_tvos: Optional[str] = None
     min_watchos: Optional[str] = None
     min_visionos: Optional[str] = None
+    # True iff the user passed --no-ios. Distinguishes "user explicitly
+    # opted out of iOS" from "user passed nothing and we'll auto-detect."
+    # Both end up with `min_ios == None` after _config_from_args, so the
+    # auto-detect needs this flag to know whether to skip iOS or fill it
+    # from the package.
+    no_ios: bool = False
     include_deps: bool = False
     binary_mode: bool = False
     verbose: bool = False
@@ -732,6 +741,58 @@ def _selected_slices(config: "Config") -> List[Tuple[PlatformSlice, str]]:
         for s in _PLATFORM_SLICES[plat]:
             out.append((s, version))
     return out
+
+
+def _autodetect_min_versions(config: "Config", package: "Package") -> Dict[str, str]:
+    """Fill in `config.min_<platform>` fields from `Package.platforms[]`
+    when the user passed zero --min-* flags.
+
+    Returns the dict of `{platform: version}` that was applied (empty
+    when no auto-detect ran — i.e., the user provided explicit flags).
+    Mutates `config` in place.
+
+    Two policy choices, both deliberate:
+
+    1. Explicit-vs-auto is all-or-nothing. If the user passed any
+       --min-* flag, we honor exactly that set; no mixing with derived
+       platforms. Keeps the mental model "what I typed is what I got."
+
+    2. When the package declares NO platforms at all (`platforms:` array
+       absent or empty), fall back to iOS 15.0 — today's pre-auto-detect
+       default. Many small library packages omit `platforms:` entirely
+       and rely on SPM's implicit minima; the tool's downstream (.NET
+       binding generation) almost always wants iOS, so the fallback
+       preserves the most common case.
+
+    `--no-ios` is respected: if it was passed, auto-detect skips the iOS
+    entry from the package even when the package declares iOS. The
+    other declared platforms still get filled in. A `--no-ios`-only
+    invocation against an iOS-only package therefore yields zero
+    platforms; the caller's post-autodetect validator surfaces that as a
+    clear error.
+    """
+    user_provided_any = any([
+        config.min_ios, config.min_macos, config.min_maccatalyst,
+        config.min_tvos, config.min_watchos, config.min_visionos,
+    ])
+    if user_provided_any:
+        return {}
+
+    derived: Dict[str, str] = {}
+    for p in package.platforms:
+        if p.name not in _PLATFORM_ORDER or not p.version:
+            continue
+        if p.name == "ios" and config.no_ios:
+            continue
+        derived[p.name] = p.version
+
+    if not derived and not config.no_ios:
+        config.min_ios = "15.0"
+        return {"ios": "15.0"}
+
+    for plat, ver in derived.items():
+        setattr(config, f"min_{plat}", ver)
+    return derived
 
 
 def _enabled_platforms(config: "Config") -> List[str]:
@@ -7536,20 +7597,30 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> Tuple[argparse.Namespace
                         help="Download pre-built xcframeworks from binary SPM targets")
     parser.add_argument("--revision", default=None,
                         help="Verify git tag resolves to this commit SHA before building")
-    parser.add_argument("--min-ios", default="15.0",
-                        help="Minimum iOS deployment target (default: 15.0). Pass --no-ios to skip iOS.")
+    parser.add_argument("--min-ios", default=None,
+                        help="Minimum iOS deployment target (e.g. 15.0). "
+                             "Default: auto-derive from Package.swift `platforms:`; "
+                             "falls back to 15.0 if the package declares no platforms. "
+                             "Pass --no-ios to skip iOS.")
     parser.add_argument("--no-ios", action="store_true",
-                        help="Skip iOS entirely; requires at least one other --min-* flag.")
+                        help="Skip iOS entirely. The remaining platforms are auto-derived "
+                             "from `Package.platforms[]`; pass another --min-* flag to "
+                             "specify one explicitly. Mutually exclusive with --min-ios.")
     parser.add_argument("--min-macos", default=None,
-                        help="Minimum macOS deployment target (e.g. 11.0). Adds the macOS slice.")
+                        help="Minimum macOS deployment target (e.g. 11.0). Adds the macOS slice. "
+                             "Default: auto-derive from Package.swift.")
     parser.add_argument("--min-maccatalyst", default=None,
-                        help="Minimum Mac Catalyst deployment target (e.g. 15.0). Adds the Mac Catalyst slice.")
+                        help="Minimum Mac Catalyst deployment target (e.g. 15.0). Adds the Mac Catalyst slice. "
+                             "Default: auto-derive from Package.swift.")
     parser.add_argument("--min-tvos", default=None,
-                        help="Minimum tvOS deployment target (e.g. 15.0). Adds tvOS device + simulator slices.")
+                        help="Minimum tvOS deployment target (e.g. 15.0). Adds tvOS device + simulator slices. "
+                             "Default: auto-derive from Package.swift.")
     parser.add_argument("--min-watchos", default=None,
-                        help="Minimum watchOS deployment target (e.g. 8.0). Adds watchOS device + simulator slices.")
+                        help="Minimum watchOS deployment target (e.g. 8.0). Adds watchOS device + simulator slices. "
+                             "Default: auto-derive from Package.swift.")
     parser.add_argument("--min-visionos", default=None,
-                        help="Minimum visionOS deployment target (e.g. 1.0). Adds visionOS device + simulator slices.")
+                        help="Minimum visionOS deployment target (e.g. 1.0). Adds visionOS device + simulator slices. "
+                             "Default: auto-derive from Package.swift.")
     parser.add_argument("--include-deps", action="store_true",
                         help="Also build xcframeworks for transitive dependencies (iOS-only in v1)")
     parser.add_argument("--verbose", action="store_true",
@@ -7613,6 +7684,7 @@ def _config_from_args(ns: argparse.Namespace) -> Config:
         min_tvos=ns.min_tvos,
         min_watchos=ns.min_watchos,
         min_visionos=ns.min_visionos,
+        no_ios=bool(ns.no_ios),
         include_deps=ns.include_deps,
         binary_mode=ns.binary,
         verbose=ns.verbose,
@@ -7632,6 +7704,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("Error: package source is required.", file=sys.stderr)
         return 2
 
+    # --no-ios + --min-ios is a contradiction; reject it explicitly
+    # rather than silently dropping --min-ios in _config_from_args.
+    if ns.no_ios and ns.min_ios is not None:
+        die("--no-ios and --min-ios are mutually exclusive. "
+            "Drop one or the other.")
+
     config = _config_from_args(ns)
 
     # Argument-injection hardening. Reject shapes that could be
@@ -7650,25 +7728,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if config.binary_mode and config.target_filters:
         die("--target is a source-build escape hatch and cannot be combined with --binary.")
 
-    # Validate that the user has selected at least one platform.
-    enabled = _enabled_platforms(config)
-    if not enabled:
-        die("No platforms selected. Pass at least one of --min-ios, --min-macos, "
-            "--min-maccatalyst, --min-tvos, --min-watchos, --min-visionos. "
-            "(--no-ios disables iOS, so combine it with one of the others.)")
-
-    # --include-deps is iOS-only in v1. Fail-fast if iOS is disabled; warn
-    # if iOS is enabled alongside non-iOS platforms.
-    if config.include_deps:
-        if "ios" not in enabled:
-            die("--include-deps requires iOS to be enabled in v1. "
-                "Drop --no-ios or omit --include-deps.")
-        non_ios = [p for p in enabled if p != "ios"]
-        if non_ios:
-            warn(
-                "--include-deps: dependency xcframeworks will be iOS-only; "
-                f"non-iOS slices ({', '.join(non_ios)}) won't carry dep artifacts."
-            )
+    # Platform validation runs AFTER auto-detect (source mode) or AFTER the
+    # binary-mode iOS-15 fallback (binary mode), since neither set is known
+    # at this point in main(). See `_validate_platforms_post_autodetect`.
 
     # Resolve the version tag now, before any clones, so we can populate
     # both user_version and resolved_version (bug 1 fix). Binary mode
@@ -7868,6 +7930,39 @@ def _finalize_with_verify(
     return 0
 
 
+def _validate_platforms_post_autodetect(config: Config) -> None:
+    """Shared post-resolution validation for source mode (after
+    `_autodetect_min_versions`) and binary mode (after the iOS-15
+    fallback in `_run_binary_mode`).
+
+    Enforces:
+      - at least one platform is enabled
+      - `--include-deps` requires iOS to be among the enabled platforms;
+        warns when non-iOS slices are also enabled (deps are iOS-only in v1)
+    """
+    enabled = _enabled_platforms(config)
+    if not enabled:
+        # Reachable when --no-ios is set against a package that declares
+        # no non-iOS platforms (either platforms: is empty/missing, or it
+        # only declares iOS). --no-ios suppresses the iOS-15 fallback in
+        # both source-mode auto-detect and the binary-mode default, so
+        # the enabled set legitimately ends up empty.
+        die("No platforms selected. Pass at least one of --min-ios, --min-macos, "
+            "--min-maccatalyst, --min-tvos, --min-watchos, --min-visionos. "
+            "(--no-ios disables iOS, so combine it with one of the others.)")
+
+    if config.include_deps:
+        if "ios" not in enabled:
+            die("--include-deps requires iOS to be enabled in v1. "
+                "Drop --no-ios or omit --include-deps.")
+        non_ios = [p for p in enabled if p != "ios"]
+        if non_ios:
+            warn(
+                "--include-deps: dependency xcframeworks will be iOS-only; "
+                f"non-iOS slices ({', '.join(non_ios)}) won't carry dep artifacts."
+            )
+
+
 def _run_source_mode(config: Config) -> int:
     """Source-mode pipeline: Fetch → Inspect → Plan → Prepare → Execute → Verify.
 
@@ -7884,6 +7979,22 @@ def _run_source_mode(config: Config) -> int:
     source_dir = fetch_source(config)
     staged_dir = stage_source(config, source_dir)
     package = inspect_package(config, staged_dir)
+
+    # Auto-derive the platform set + deployment targets from
+    # `Package.platforms[]` when the user passed no --min-* flags. Runs
+    # BEFORE the --inspect-only early return so the post-autodetect
+    # validator (--include-deps requires iOS, etc.) still fires for
+    # inspect runs, AND before the binary-only route below so the
+    # derived versions flow into binary mode too. No-op when any
+    # --min-* was explicit.
+    derived = _autodetect_min_versions(config, package)
+    if derived:
+        info(
+            "Auto-detected platforms from Package.swift: "
+            + ", ".join(f"{p} {v}" for p, v in derived.items())
+            + " (pass any --min-* flag to override)."
+        )
+    _validate_platforms_post_autodetect(config)
 
     if config.inspect_only:
         print_package(package)
@@ -7953,6 +8064,16 @@ def _run_binary_mode(config: Config) -> int:
     """
     if config.inspect_only:
         die("--inspect-only is not supported for --binary.")
+
+    # Binary mode has no Inspect phase, so the source-mode auto-detect
+    # can't fill in platforms from `Package.platforms[]`. Preserve
+    # today's behavior: when the user passed zero --min-* flags, default
+    # to iOS 15.0. (A future improvement could read platform metadata
+    # from the resolved binary xcframework's Info.plist; for now,
+    # explicit flags are required for non-iOS binary builds.)
+    if not _enabled_platforms(config) and not config.no_ios:
+        config.min_ios = "15.0"
+    _validate_platforms_post_autodetect(config)
 
     artifacts = discover_binary_artifacts(config)
     plan = plan_binary_build(config, artifacts)

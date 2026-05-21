@@ -66,6 +66,7 @@ from spm_to_xcframework import (  # noqa: F401
     _select_active_manifest,
     _selected_slices,
     _enabled_platforms,
+    _autodetect_min_versions,
     _spm_platform_entries,
     _platform_from_library_identifier,
     _variant_from_library_identifier,
@@ -3382,6 +3383,110 @@ def _selftest_selected_slices_no_ios_path() -> None:
     _assert(ids == ["macos"], f"expected only macos slice, got {ids}")
     _assert(_enabled_platforms(cfg) == ["macos"],
             f"unexpected enabled platforms: {_enabled_platforms(cfg)!r}")
+
+
+def _autodetect_pkg(platforms: List[Tuple[str, str]]) -> "tool.Package":
+    """Helper: construct a minimal Package with the given (name, version)
+    platform list and no products/targets — enough for
+    `_autodetect_min_versions` to walk."""
+    return tool.Package(
+        name="AutodetectFixture", tools_version="5.9.0",
+        platforms=[tool.Platform(name=n, version=v) for n, v in platforms],
+        products=[], targets=[], schemes=[],
+        raw_dump={}, staged_dir=Path("/tmp/spm2xc-autodetect-fixture"),
+    )
+
+
+def _selftest_autodetect_multi_platform_package() -> None:
+    """No --min-* flags + multi-platform package → every declared
+    platform is filled in at its declared version."""
+    cfg = tool.Config(package_source="/dev/null")
+    pkg = _autodetect_pkg([
+        ("ios", "13.0"), ("macos", "10.15"),
+        ("tvos", "15.0"), ("visionos", "1.0"),
+    ])
+    derived = _autodetect_min_versions(cfg, pkg)
+    _assert(derived == {"ios": "13.0", "macos": "10.15",
+                        "tvos": "15.0", "visionos": "1.0"},
+            f"unexpected derived map: {derived!r}")
+    _assert(cfg.min_ios == "13.0", f"min_ios: {cfg.min_ios!r}")
+    _assert(cfg.min_macos == "10.15", f"min_macos: {cfg.min_macos!r}")
+    _assert(cfg.min_tvos == "15.0", f"min_tvos: {cfg.min_tvos!r}")
+    _assert(cfg.min_visionos == "1.0", f"min_visionos: {cfg.min_visionos!r}")
+    _assert(cfg.min_watchos is None, "watchos must remain unset")
+    _assert(cfg.min_maccatalyst is None, "maccatalyst must remain unset")
+
+
+def _selftest_autodetect_explicit_flag_is_noop() -> None:
+    """Any --min-* flag passed → auto-detect is a no-op. Mixed mode is
+    deliberately rejected; explicit-is-explicit."""
+    cfg = tool.Config(package_source="/dev/null", min_ios="17.0")
+    pkg = _autodetect_pkg([("ios", "13.0"), ("macos", "10.15")])
+    derived = _autodetect_min_versions(cfg, pkg)
+    _assert(derived == {}, f"expected no-op, got: {derived!r}")
+    _assert(cfg.min_ios == "17.0", "user's explicit --min-ios must survive")
+    _assert(cfg.min_macos is None,
+            "macOS must NOT auto-fill when any other flag was explicit")
+
+
+def _selftest_autodetect_no_platforms_declared_falls_back_to_ios_15() -> None:
+    """Package omits `platforms:` → fall back to today's iOS 15.0
+    default so the common single-package case keeps working."""
+    cfg = tool.Config(package_source="/dev/null")
+    pkg = _autodetect_pkg([])
+    derived = _autodetect_min_versions(cfg, pkg)
+    _assert(derived == {"ios": "15.0"}, f"unexpected fallback: {derived!r}")
+    _assert(cfg.min_ios == "15.0", f"min_ios: {cfg.min_ios!r}")
+
+
+def _selftest_autodetect_no_ios_with_ios_only_package_yields_empty() -> None:
+    """--no-ios + package declares only iOS → derived map empty, no
+    fallback (the post-autodetect validator surfaces the error)."""
+    cfg = tool.Config(package_source="/dev/null", no_ios=True)
+    pkg = _autodetect_pkg([("ios", "13.0")])
+    derived = _autodetect_min_versions(cfg, pkg)
+    _assert(derived == {}, f"expected empty, got: {derived!r}")
+    _assert(cfg.min_ios is None, "min_ios must stay None under --no-ios")
+
+
+def _selftest_autodetect_no_ios_with_multi_platform_skips_ios_only() -> None:
+    """--no-ios + multi-platform package → derives non-iOS platforms,
+    skips the iOS entry."""
+    cfg = tool.Config(package_source="/dev/null", no_ios=True)
+    pkg = _autodetect_pkg([
+        ("ios", "13.0"), ("macos", "11.0"), ("tvos", "15.0"),
+    ])
+    derived = _autodetect_min_versions(cfg, pkg)
+    _assert(derived == {"macos": "11.0", "tvos": "15.0"},
+            f"unexpected derived: {derived!r}")
+    _assert(cfg.min_ios is None, "iOS must stay disabled under --no-ios")
+    _assert(cfg.min_macos == "11.0", f"min_macos: {cfg.min_macos!r}")
+    _assert(cfg.min_tvos == "15.0", f"min_tvos: {cfg.min_tvos!r}")
+
+
+def _selftest_autodetect_ignores_unknown_platform_names() -> None:
+    """A platformName we don't recognise (e.g. a future Apple platform)
+    is skipped silently rather than crashing. Tool-stability invariant."""
+    cfg = tool.Config(package_source="/dev/null")
+    pkg = _autodetect_pkg([("ios", "15.0"), ("driverkit", "20.0")])
+    derived = _autodetect_min_versions(cfg, pkg)
+    _assert(derived == {"ios": "15.0"},
+            f"unknown platform should be filtered: {derived!r}")
+
+
+def _selftest_autodetect_skips_platform_with_empty_version() -> None:
+    """A Platform whose version is the empty string (or otherwise
+    falsy) is silently dropped — Inspect occasionally emits entries
+    without a parseable version, and we'd rather fall back to iOS-15
+    than crash with an empty deployment target. Guard at platforms.py
+    `not p.version` continue."""
+    cfg = tool.Config(package_source="/dev/null")
+    pkg = _autodetect_pkg([("ios", "")])
+    derived = _autodetect_min_versions(cfg, pkg)
+    # ios entry was dropped → effective "no platforms declared" → iOS-15 fallback
+    _assert(derived == {"ios": "15.0"},
+            f"empty-version entry should be filtered, falling back to ios-15: {derived!r}")
+    _assert(cfg.min_ios == "15.0", f"min_ios fallback: {cfg.min_ios!r}")
 
 
 def _selftest_spm_platform_entries_string_form() -> None:
@@ -8230,6 +8335,20 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          _selftest_selected_slices_order_and_filter, False),
         ("multi-platform: --no-ios drops both iOS slices",
          _selftest_selected_slices_no_ios_path, False),
+        ("autodetect: multi-platform package fills all declared --min-* fields",
+         _selftest_autodetect_multi_platform_package, False),
+        ("autodetect: any explicit --min-* flag suppresses auto-detect (no mixing)",
+         _selftest_autodetect_explicit_flag_is_noop, False),
+        ("autodetect: package with no platforms: falls back to iOS 15.0",
+         _selftest_autodetect_no_platforms_declared_falls_back_to_ios_15, False),
+        ("autodetect: --no-ios + iOS-only package yields empty (no fallback)",
+         _selftest_autodetect_no_ios_with_ios_only_package_yields_empty, False),
+        ("autodetect: --no-ios + multi-platform package skips iOS, fills others",
+         _selftest_autodetect_no_ios_with_multi_platform_skips_ios_only, False),
+        ("autodetect: unknown platform names are silently ignored",
+         _selftest_autodetect_ignores_unknown_platform_names, False),
+        ("autodetect: empty-version platform entries are silently skipped",
+         _selftest_autodetect_skips_platform_with_empty_version, False),
         ("multi-platform: binary shim emits string-form .Plat(\"X.Y\") entries",
          _selftest_spm_platform_entries_string_form, False),
         ("multi-platform: per-package validation rejects undeclared platforms",

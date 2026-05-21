@@ -2,9 +2,9 @@
 
 Build or download xcframeworks from Swift Package Manager packages — Swift, Objective-C, or mixed.
 
-Takes an SPM package URL (or local path) and produces ready-to-use xcframeworks for each library product. Source packages default to iOS device + simulator slices built with `BUILD_LIBRARY_FOR_DISTRIBUTION=YES` for ABI stability; macOS, Mac Catalyst, tvOS, watchOS, and visionOS slices are opt-in via per-platform `--min-*` flags. Packages that use SPM binary targets can also be downloaded directly with `--binary`.
+Point it at an SPM package (URL or local path) and it produces ready-to-use xcframeworks for each library product. The platform set is auto-derived from the package's `Package.swift` `platforms:` declaration — multi-platform packages emit every declared platform's slice automatically, while packages that don't declare anything fall back to iOS 15. Override or extend that set with `--min-*` flags. Packages that distribute pre-built artifacts via SPM binary targets can be downloaded directly with `--binary`.
 
-Framework type (Swift, ObjC, Mixed) is auto-detected and reported in the build output.
+Framework type (Swift, ObjC, Mixed) is auto-detected per output and reported in the build summary.
 
 ## Install
 
@@ -14,113 +14,190 @@ git clone https://github.com/justinwojo/spm-to-xcframework.git
 export PATH="$PWD/spm-to-xcframework:$PATH"
 ```
 
-Or just run it directly — it's a single self-contained script with no dependencies beyond Xcode and the Python 3 that ships with macOS.
+Or just run the committed root `spm-to-xcframework` directly — it's a single self-contained script with no dependencies beyond Xcode and the system Python.
 
-`spm-to-xcframework` is implemented in **Python 3.9+** and uses only the Python standard library. No `pip install` step.
+`spm-to-xcframework` is implemented in **Python 3.9+** using only the standard library. No `pip install` step.
 
 ### Requirements
 
-- macOS with Xcode installed (provides `xcodebuild`, `swift`)
-- `python3` (system Python on macOS is sufficient — Python 3.9 or later)
+- macOS with Xcode installed (provides `xcodebuild`, `swift`, `clang`)
+- `python3` (the system Python on macOS is sufficient — Python 3.9 or later)
+- Any platform SDK the build will exercise (e.g. visionOS / watchOS via *Xcode › Settings › Components*). See [Troubleshooting](#troubleshooting).
+
+## Quick start
+
+```bash
+# Build all library products from a remote package at a tag
+spm-to-xcframework https://github.com/Alamofire/Alamofire.git -v 5.10.2
+
+# Build from a local checkout
+spm-to-xcframework ./MyPackage -o ./output
+
+# Download pre-built xcframeworks (no source compile)
+spm-to-xcframework https://github.com/nicklockwood/iCarousel.git -v 1.8.3 --binary
+```
+
+Each successful run drops the resulting xcframeworks (and a manifest used for cross-run cleanup) under `--output` (default `./xcframeworks`).
 
 ## Usage
 
 ```
-spm-to-xcframework <package-url-or-path> --version <ver> [options]
+spm-to-xcframework <package-url-or-path> [--version <ver>] [options]
 ```
 
 ### Options
 
+**Package selection**
+
 | Flag | Description |
 |------|-------------|
-| `-v, --version <ver>` | Git tag to check out (required for remote URLs) |
-| `-o, --output <dir>` | Output directory (default: `./xcframeworks`) |
-| `-p, --product <name>` | Build only these products (repeatable; default: all library products) |
-| `-t, --target <name>` | Build an SPM target that isn't exposed as a `.library()` product (repeatable). Escape hatch — see warning below. |
-| `--binary` | Download pre-built xcframeworks from binary SPM targets instead of building from source (remote URLs only) |
-| `--revision <sha>` | Verify the git tag resolves to this full 40-character commit SHA before fetching (supply-chain security) |
-| `--min-ios <ver>` | Minimum iOS deployment target for source builds (default: `15.0`). Pass `--no-ios` to skip iOS entirely. |
-| `--no-ios` | Skip the iOS slices. Requires at least one other `--min-*` flag. |
-| `--min-macos <ver>` | Add the macOS slice (e.g. `11.0`). |
-| `--min-maccatalyst <ver>` | Add the Mac Catalyst slice (e.g. `15.0`). |
-| `--min-tvos <ver>` | Add tvOS device + simulator slices (e.g. `15.0`). |
-| `--min-watchos <ver>` | Add watchOS device + simulator slices (e.g. `8.0`). |
-| `--min-visionos <ver>` | Add visionOS device + simulator slices (e.g. `1.0`). |
-| `--include-deps` | Also build xcframeworks for transitive dependencies in source-build mode (iOS-only — requires iOS to be enabled) |
-| `--verbose` | Show full xcodebuild output |
+| `-v, --version <ver>` | Git tag to check out. Required for remote URLs. A `v`-prefix mismatch (e.g. tag is `v1.2.3`, you typed `1.2.3`) is resolved automatically. |
+| `-o, --output <dir>` | Output directory (default: `./xcframeworks`). |
+| `-p, --product <name>` | Build only these products (repeatable; default: all library products). |
+| `-t, --target <name>` | Build an SPM target that isn't exposed as a `.library()` product (repeatable). Escape hatch — see [`--target`](#--target-escape-hatch). |
+| `--binary` | Download pre-built xcframeworks from binary SPM targets instead of building from source (remote URLs only). |
+| `--revision <sha>` | Verify the resolved tag points at this full 40-character commit SHA before fetching (supply-chain check). |
+
+**Platform selection**
+
+| Flag | Description |
+|------|-------------|
+| `--min-ios <ver>` | Minimum iOS deployment target (e.g. `15.0`). Default: auto-derive from `Package.swift`; falls back to `15.0` if the package declares no platforms. |
+| `--no-ios` | Skip the iOS slices. The other platforms are auto-derived from `Package.swift`, or pass another `--min-*` flag to specify one explicitly. Mutually exclusive with `--min-ios`. |
+| `--min-macos <ver>` | Minimum macOS deployment target (e.g. `11.0`). Default: auto-derive from `Package.swift`. |
+| `--min-maccatalyst <ver>` | Minimum Mac Catalyst deployment target (e.g. `15.0`). Default: auto-derive from `Package.swift`. |
+| `--min-tvos <ver>` | Minimum tvOS deployment target (e.g. `15.0`). Default: auto-derive from `Package.swift`. |
+| `--min-watchos <ver>` | Minimum watchOS deployment target (e.g. `8.0`). Default: auto-derive from `Package.swift`. |
+| `--min-visionos <ver>` | Minimum visionOS deployment target (e.g. `1.0`). Default: auto-derive from `Package.swift`. |
+
+> **Platform selection at a glance**
+> - **No `--min-*` flags** → exactly the set declared in `Package.swift platforms:`. Empty/missing → iOS 15.0 fallback.
+> - **Any `--min-*` flag** → all-or-nothing override. The tool builds exactly the platforms you typed; auto-detect is suppressed entirely.
+> - **`--no-ios`** → drops iOS from the auto-detected set but keeps the rest; mutually exclusive with `--min-ios`.
+> - Auto-detect can request platforms whose SDKs aren't installed locally (e.g. watchOS / visionOS). Install via *Xcode › Settings › Components*, or pin to installed platforms with explicit `--min-*` flags.
+>
+> Full rules: [Platform selection](#platform-selection).
+
+**Build behavior**
+
+| Flag | Description |
+|------|-------------|
+| `--include-deps` | Also build xcframeworks for transitive dependencies. iOS-only in v1; requires iOS to be enabled. |
+| `--no-dedup-overlap` | Disable inter-unit `.binaryTarget` substitution. By default, when one product depends on a sibling product/target in the same package, the sibling is built first and rewritten into a `.binaryTarget` before the umbrella's archive runs — this stops the umbrella from statically embedding the sibling's Mach-O. Pass this flag to keep the legacy single-shot behavior. |
+| `--no-cleanup-stale` | Skip cleanup of stale xcframeworks from prior runs this time, but keep them tracked in the manifest so a subsequent normal run will clean them. See [Stale-output cleanup](#stale-output-cleanup). |
+
+**Diagnostics**
+
+| Flag | Description |
+|------|-------------|
+| `--verbose` | Show full `xcodebuild` output. |
 | `--dry-run` | Show what would be produced without completing the final build/copy step. In binary mode this still resolves artifacts so the reported set is exact. |
-| `--keep-work` | Keep temporary work directory (for debugging) |
-| `--no-cleanup-stale` | Skip cleanup of stale xcframeworks from prior runs this time, but keep them tracked in the manifest so a subsequent normal run will clean them. See "Stale-output cleanup" below. |
-| `--inspect-only` | Run Fetch + Inspect and print the parsed Package model, then exit (debugging aid) |
-| `-h, --help` | Show help |
+| `--inspect-only` | Run Fetch + Inspect and print the parsed Package model, then exit. |
+| `--keep-work` | Keep the temporary work directory for debugging. |
+| `-h, --help` | Show help. |
 
 ## Examples
 
+### Use the package's declared platforms (auto-detect)
+
 ```bash
-# Build all products from Alamofire (Swift)
+# Alamofire declares iOS, macOS, tvOS, watchOS — all four slices come out
+# at the deployment targets the package specifies. No --min-* flags needed,
+# provided every declared platform's SDK is installed locally.
 spm-to-xcframework https://github.com/Alamofire/Alamofire.git -v 5.10.2
+```
 
-# Build just the Nuke product, output to custom dir
-spm-to-xcframework https://github.com/kean/Nuke.git -v 12.8.0 -o ./nuke-fw
+### Override platforms explicitly
 
-# Build from a local package (Swift, ObjC, or mixed)
-spm-to-xcframework ./MyPackage -o ./output
+```bash
+# Force exactly the slices you typed; auto-detect is suppressed.
+spm-to-xcframework https://github.com/Alamofire/Alamofire.git -v 5.10.2 \
+    --min-ios 15.0 --min-macos 11.0
 
-# Build multiple specific products from a large package
+# Drop iOS, keep everything else the package declared.
+spm-to-xcframework https://github.com/Alamofire/Alamofire.git -v 5.10.2 --no-ios
+
+# Build only macOS (single-slice xcframework).
+spm-to-xcframework https://github.com/Alamofire/Alamofire.git -v 5.10.2 \
+    --no-ios --min-macos 11.0
+```
+
+### Filter to specific products
+
+```bash
+# A large package, two products
 spm-to-xcframework https://github.com/stripe/stripe-ios.git -v 25.6.2 \
     --product Stripe --product StripePayments
 
-# Mix products and internal-only targets — Stripe ships StripeCore/StripeUICore as
-# .target(...) rather than .library(...), so --target is the only way to build them
-# (see the "--target escape hatch" section below for the caveat)
+# Mix products and internal-only targets — Stripe ships StripeCore / StripeUICore
+# as .target(...) rather than .library(...), so --target is the only way in.
 spm-to-xcframework https://github.com/stripe/stripe-ios.git -v 25.6.2 \
     --product Stripe --target StripeCore --target StripeUICore
+```
 
-# Build an ObjC library with a static SPM product (auto-promoted to dynamic)
-spm-to-xcframework https://github.com/jdg/MBProgressHUD.git -v 1.2.0
+### Build with dependencies
 
-# Multi-platform: iOS + macOS + tvOS in one xcframework
-spm-to-xcframework https://github.com/kean/Nuke.git -v 12.8.0 \
-    --min-macos 11.0 --min-tvos 15.0
+```bash
+# Also emit xcframeworks for transitive deps under the same output dir
+spm-to-xcframework https://github.com/kean/Nuke.git -v 12.8.0 --include-deps
+```
 
-# macOS-only build (no iOS slices)
-spm-to-xcframework https://github.com/Alamofire/Alamofire.git -v 5.10.2 \
-    --no-ios --min-macos 11.0
+### Binary mode
 
-# Download pre-built binary xcframeworks (no source build)
+```bash
+# Some libraries (Firebase, BlinkID, iCarousel) ship pre-built xcframeworks
+# through SPM binary targets — download instead of building.
 spm-to-xcframework https://github.com/nicklockwood/iCarousel.git -v 1.8.3 --binary
+```
 
-# Verify tag SHA before building (supply-chain security)
+### Supply-chain check
+
+```bash
+# Refuse to build if the tag doesn't resolve to this exact commit
 spm-to-xcframework https://github.com/kean/Nuke.git -v 12.8.0 \
     --revision a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2
+```
+
+### Other
+
+```bash
+# An ObjC library whose product declares static linkage — the planner
+# injects a synthetic .library(..., type: .dynamic, ...) wrapper, builds
+# that, and renames the output to MBProgressHUD.xcframework.
+spm-to-xcframework https://github.com/jdg/MBProgressHUD.git -v 1.2.0
 
 # See what would be built without building
 spm-to-xcframework https://github.com/kean/Nuke.git -v 12.8.0 --dry-run
+
+# Print the parsed Package model and exit (debug)
+spm-to-xcframework https://github.com/kean/Nuke.git -v 12.8.0 --inspect-only
 ```
 
 ## How it works
 
 ### Source builds (default)
 
-1. **Normalizes the tag name** for remote packages. Tags with a `v` prefix are resolved automatically, so `-v 1.2.3` works even when the actual tag is `v1.2.3`.
-2. **Verifies revision** if `--revision` is provided — runs `git ls-remote` before fetching any source, handles annotated tags, and fails with a clear mismatch error.
+1. **Normalizes the tag** for remote packages. Tags with a `v` prefix are resolved automatically, so `-v 1.2.3` works even when the actual tag is `v1.2.3`.
+2. **Verifies revision** when `--revision` is provided — runs `git ls-remote` before fetching any source, handles annotated tags, and fails with a clear mismatch error.
 3. **Clones** the package at the resolved tag (or copies a local path).
-4. **Discovers** library products via `swift package dump-package` — works for Swift, ObjC, and mixed-language targets. Additional SPM targets passed via `--target` are verified against the package's `targets[]` array and queued alongside the products.
-5. **Resolves** build schemes via `xcodebuild -list` against the staged copy. Sibling `.xcodeproj`/`.xcworkspace` files are pruned during staging so xcodebuild always picks SPM-generated schemes — no special handling needed for packages that ship multiple Xcode projects (e.g. GRDB's `GRDB.xcodeproj` + `GRDBCustom.xcodeproj`).
-6. **Patches** `Package.swift` to set the requested library products to `type: .dynamic`. Only the specific products you asked for are touched — internal dependency targets and `.systemLibrary(...)` products (e.g. GRDB's `GRDBSQLite`) are left alone, and the round-trip validator runs `swift package dump-package` against the edited manifest to confirm every requested edit actually took effect.
-7. **Builds** every enabled slice in parallel via `xcodebuild archive` (default: iOS device + simulator; additional slices added by `--min-macos`, `--min-maccatalyst`, `--min-tvos`, `--min-watchos`, `--min-visionos`). Pool width is capped at 4 to avoid Xcode license/DerivedData contention. Each archive runs with:
-   - `BUILD_LIBRARY_FOR_DISTRIBUTION=YES` — ABI stability + swiftinterface emission
-   - `SKIP_INSTALL=NO` — framework included in archive products
-   - the slice's platform-specific deployment-target build setting (`IPHONEOS_DEPLOYMENT_TARGET`, `MACOSX_DEPLOYMENT_TARGET`, `TVOS_DEPLOYMENT_TARGET`, `WATCHOS_DEPLOYMENT_TARGET`, or `XROS_DEPLOYMENT_TARGET`)
-8. **Promotes** static archives to dynamic frameworks when needed — some ObjC-only packages (e.g. MBProgressHUD) produce `.a` files even when patched to `.dynamic`. The tool detects this, re-links the static archive as a dynamic library via `clang -dynamiclib`, infers system framework dependencies from source imports, and wraps the result in a `.framework` bundle.
-9. **Injects** `.swiftmodule`/`.swiftinterface` from DerivedData when missing from the framework bundle (common with SPM dynamic libraries).
-10. **Injects** ObjC public headers and modulemaps from the source tree for ObjC/mixed targets that don't include them in archive output.
+4. **Stages** the clone into a clean working tree, pruning `.git`, `.build`, `DerivedData`, `node_modules`, and any sibling `.xcodeproj` / `.xcworkspace` files (see [Always-clean build tree](#always-clean-build-tree)).
+5. **Inspects** the package via `swift package dump-package`. Library products, internal targets, declared `platforms:`, and `tools-version` are all parsed. The set of platforms to build is resolved at this point (see [Platform selection](#platform-selection)).
+6. **Plans** the build. Each requested product becomes a build unit; transitive sibling/dependency targets are walked.
+7. **Edits `Package.swift` via `swift package add-product`** rather than regex surgery on the manifest text. Two edit kinds get emitted by the planner:
+   - **`synth_dynamic_library`** — for any requested library product whose linkage is not already `.dynamic`, the planner allocates a non-colliding synthetic name (`<Product>Dynamic`, falling back to `<Product>__Dynamic`, then `__Dynamic2`, … when the primary name collides — Alamofire ships both `Alamofire` and `AlamofireDynamic`, so the first synthetic gets named `Alamofire__Dynamic`). A `.library(name: <synthetic>, type: .dynamic, targets: <product's targets>)` entry is added; the build runs against `<synthetic>`, then the post-archive rename pass turns `<synthetic>.framework` into `<original>.framework` per slice. Already-dynamic siblings, system-library products, and `.binaryTarget`-only products are skipped (no synth needed / no synth possible). Binary-only whole packages auto-route to `--binary` mode before this step is reached.
+   - **`synth_library`** — for each `--target T` request, an equivalent `.library(name: T, type: .dynamic, targets: [T])` entry is added so the target is exposed as a buildable product. The tool refuses to synthesize for non-source targets (binary, system, plugin, macro, executable, test) with a clear `PlanError`.
+
+   After Prepare invokes `swift package add-product`, a round-trip `swift package dump-package` confirms each new product appears with linkage DYNAMIC and the requested target list — manifests that fail this validation fail the run loudly.
+8. **Builds** every enabled slice in parallel via `xcodebuild archive`. Pool width is capped at 4 to avoid Xcode license / DerivedData contention. Each archive runs with:
+   - `BUILD_LIBRARY_FOR_DISTRIBUTION=YES` — ABI stability + `.swiftinterface` emission.
+   - `SKIP_INSTALL=NO` — framework included in archive products.
+   - the slice's platform-specific deployment-target build setting (`IPHONEOS_DEPLOYMENT_TARGET`, `MACOSX_DEPLOYMENT_TARGET`, `TVOS_DEPLOYMENT_TARGET`, `WATCHOS_DEPLOYMENT_TARGET`, or `XROS_DEPLOYMENT_TARGET`).
+9. **Deduplicates inter-unit overlap.** Before each unit's archive runs, every sibling that has already been built in this run is rewritten in `Package.swift` to a `.binaryTarget(path: <built-xcframework>)`. This stops umbrella products (e.g. Stripe) from statically embedding all their sibling targets' Mach-O — the umbrella links dynamically against the sibling xcframeworks instead. After the umbrella is done, the synthetic dynamic product is demoted back to an automatic library so the next pass can re-link against it cleanly. Pass `--no-dedup-overlap` to opt out.
+10. **Injects** `.swiftmodule` / `.swiftinterface` from DerivedData when missing from the framework bundle (common with SPM dynamic libraries), then ObjC public headers and modulemaps from the source tree for ObjC/mixed targets that don't include them in archive output, plus any SwiftPM-emitted resource bundles.
 11. **Assembles** xcframeworks via `xcodebuild -create-xcframework`.
-12. **Detects** framework type (Swift, ObjC, or Mixed) based on content:
-    - **Swift**: Has `.swiftinterface` files
-    - **ObjC**: Has public headers + modulemap, no Swift interfaces
-    - **Mixed**: Has both Swift interfaces and ObjC headers
-13. **Verifies** every produced xcframework with strict per-unit checks. The build only reports success when all of these pass for every output:
+12. **Bundles `.systemLibrary` clang shims** as binary-less sibling frameworks inside each xcframework slice (e.g. GRDB's `GRDBSQLite` wrapper around `<sqlite3.h>`), plus any project-shipped clang modulemaps the swiftinterface imports but the primary framework's modulemap doesn't declare (e.g. WCDB's `WCDB_Private` shipped via `src/bridge/module.modulemap`).
+13. **Detects** framework type per xcframework: **Swift** (has `.swiftinterface`), **ObjC** (public headers + modulemap, no Swift interfaces), or **Mixed** (both).
+14. **Verifies** every produced xcframework with strict per-unit checks. The build only reports success when all of these pass for every output:
     - The `Info.plist` parses through `plistlib` (catches AppleDouble `__MACOSX` ghost xcframeworks).
     - Every requested (platform, variant) slice appears in `AvailableLibraries` — e.g. `--min-ios 15 --min-macos 11` requires `ios-device`, `ios-simulator`, and `macos-device` to all be present. Single-slice xcframeworks (pure macOS, pure Mac Catalyst) are valid.
     - Every slice's binary is a dynamically-linked Mach-O (no static archives masquerading as frameworks).
@@ -130,35 +207,47 @@ spm-to-xcframework https://github.com/kean/Nuke.git -v 12.8.0 --dry-run
 
 ### Binary mode (`--binary`)
 
-Some libraries (e.g. BlinkID, Firebase) distribute pre-built xcframeworks through SPM binary targets. Binary mode downloads these without building from source:
+Some libraries (Firebase, BlinkID, iCarousel, …) distribute pre-built xcframeworks through SPM binary targets. Binary mode downloads them without building from source:
 
-1. Normalizes the tag name for `v`-prefixed repositories, and verifies `--revision` if provided.
+1. Normalizes the tag and verifies `--revision` if provided.
 2. Creates a temporary `Package.swift` that depends on the target repo.
 3. Runs `swift package resolve` to download binary artifacts.
 4. Locates xcframeworks in `.build/artifacts/`, pruning `__MACOSX` AppleDouble ghosts that some vendor zips ship alongside the real artifacts (BlinkID 7.6.x is the canonical example).
 5. Validates `--product` filters against the resolved artifact names.
-6. Reports the filtered set that matches the request.
-7. Copies the matching xcframeworks to the output directory and runs the same strict per-unit verify pass that source mode uses.
+6. Copies the matching xcframeworks to the output directory.
+7. **Promotes any static-archive slices to dynamic frameworks.** Some vendors ship xcframeworks whose individual slices are static Mach-O archives (`.a` masquerading as a framework binary), which downstream binding generators and dynamic linkers can't consume. For each affected slice, the tool re-links the static archive in place via `xcrun … clang -dynamiclib -Xlinker -all_load … -Xlinker -undefined -Xlinker dynamic_lookup`, preserving architectures and using the slice's `LibraryIdentifier`-derived clang `-m<sdk>-version-min=` flag. The framework bundle layout is rewritten as needed (including macOS's `Versions/A` layout) so the result loads cleanly.
+8. Runs the same strict per-unit verify pass that source mode uses.
 
-Product filtering (`--product`), revision verification (`--revision`), and dry-run all work in binary mode. In binary dry-run mode, the tool still resolves artifacts so it can validate the requested products and show the exact filtered set, but it does not copy anything to the output directory.
+Product filtering (`--product`), revision verification (`--revision`), and dry-run all work in binary mode. In binary dry-run, the tool still resolves artifacts so it can validate the requested products and show the exact filtered set, but it does not copy anything to the output directory. `--target` is rejected in binary mode (source-build escape hatch only).
+
+### Platform selection
+
+The tool resolves the platform set after `swift package dump-package`, before scheduling any builds. The rules:
+
+- **Zero `--min-*` flags** — the platform set is auto-derived from `Package.swift` `platforms:`. Every declared platform (with a recognized name) becomes an xcframework slice at the package's own minimum version. Platform-name strings the tool doesn't recognize (e.g. `driverkit`) are silently ignored.
+- **Any `--min-*` flag** — auto-detect is fully suppressed. The tool builds exactly the platforms you typed at the versions you typed. There is no mixing of derived and explicit platforms by design — "what I typed is what I got."
+- **No declared platforms in the manifest** — the tool falls back to iOS 15. Many small library packages omit `platforms:` entirely and rely on SPM's implicit minima; the downstream consumers of this tool almost always want iOS.
+- **`--no-ios`** — drops iOS from the auto-detected set but lets non-iOS declared platforms flow through. Combined with no other `--min-*` flag against a package that declares only iOS, the run errors out with a clear "no platforms selected" message. Mutually exclusive with `--min-ios`.
+- **SDK availability** — auto-detect will faithfully request every declared platform; if a platform's SDK isn't installed locally (visionOS / watchOS are common offenders on a fresh Xcode install), `xcodebuild` fails with `Unable to find a destination matching the provided destination specifier`. Install the missing SDK via *Xcode › Settings › Components*, or pin to installed platforms with explicit `--min-*` flags.
+- **Binary mode** — no `Package.swift` to read, so auto-detect doesn't apply. A run with zero `--min-*` flags still defaults to iOS 15; non-iOS binary builds require an explicit `--min-*`.
 
 ### `--target` escape hatch
 
-Some packages declare important modules as `.target(...)` in `Package.swift` without exposing them as `.library(...)` products. stripe-ios is the canonical example: `StripeCore`, `StripeUICore`, `Stripe3DS2`, and `StripeCameraCore` are all plain targets, so `--product StripeCore` fails with "No library products matching filter". The `--target` flag tells the tool to inject a synthetic `.library(name: "<name>", type: .dynamic, targets: ["<name>"])` entry into `Package.swift` for each requested target, then build the synthesized product like any other library product.
+Some packages declare important modules as `.target(...)` in `Package.swift` without exposing them as `.library(...)` products. stripe-ios is the canonical example: `StripeCore`, `StripeUICore`, `Stripe3DS2`, and `StripeCameraCore` are all plain targets, so `--product StripeCore` fails with "No library products matching filter". The `--target` flag tells the planner to emit a `synth_library` edit that injects a synthetic `.library(name: "<name>", type: .dynamic, targets: ["<name>"])` into `Package.swift` (via `swift package add-product`), then build the synthesized product like any other library product.
 
-Because the synthetic library is a real `.library(...)` declaration with `type: .dynamic`, only the requested target is forced dynamic — internal C/ObjC dependency targets keep their natural build type. This makes `--target` safe for packages like Firebase that bundle static helper libs (nanopb, leveldb, GoogleUtilities) inside their target graph. The tool refuses to synthesize a library for `.binaryTarget(...)` targets, so accidental misuse fails with a clear planner error.
+Because the synthetic library is a real `.library(...)` declaration with `type: .dynamic`, only the requested target is forced dynamic — internal C/ObjC dependency targets keep their natural build type. This makes `--target` safe for packages like Firebase that bundle static helper libs (nanopb, leveldb, GoogleUtilities) inside their target graph. The tool refuses to synthesize a library for non-source targets (`.binaryTarget`, `.systemLibrary`, plugin, macro, executable, test) with a clear `PlanError`.
 
-Note: the older `MACH_O_TYPE=mh_dylib` global override is gone. Synthetic libraries replaced it because the global override broke any package whose internal targets produced object files or static archives.
+If `--target T` names a target that already happens to be exposed as a library product, the existing product is used instead (with a warning) — `--target` will never cause duplicate planning.
 
 ### Always-clean build tree
 
-Every source-mode build runs against a freshly-staged copy of the package with `.git`, `.build`, `DerivedData`, `node_modules`, and any sibling `.xcodeproj`/`.xcworkspace` files pruned. Pruning the Xcode projects forces `xcodebuild` to use SPM-generated schemes, which sidesteps both the "multiple projects with the current extension" error (GRDB ships `GRDB.xcodeproj` + `GRDBCustom.xcodeproj`) and the "does not contain a scheme" wording mismatch that the legacy bash had to grep around.
+Every source-mode build runs against a freshly-staged copy of the package with `.git`, `.build`, `DerivedData`, `node_modules`, and any sibling `.xcodeproj` / `.xcworkspace` files pruned. Pruning the Xcode projects forces `xcodebuild` to use SPM-generated schemes, which sidesteps both the "multiple projects with the current extension" error (GRDB ships `GRDB.xcodeproj` + `GRDBCustom.xcodeproj`) and the "does not contain a scheme" wording mismatch that legacy bash had to grep around.
 
 ### Stale-output cleanup
 
 The tool drops a `.spm-to-xcframework-manifest.json` file in the output directory recording exactly which xcframeworks each successful run produced (primary outputs and, when `--include-deps` is set, transitive dependency outputs too). Before the next run finishes, anything tracked by that manifest that the new run no longer produces is removed.
 
-Cleanup runs **only after every output passes the strict per-unit verify pass** — a failed run leaves the prior manifest and prior xcframeworks untouched so you can retry against a known-good baseline. Files in the output directory that the tool didn't put there (your own xcframeworks, READMEs, build outputs from other tools) are never touched: only entries listed in the manifest are eligible for cleanup, and entry names are constrained to plain basenames inside the output dir (no `..`, no absolute paths, no path separators).
+Cleanup runs **only after every output passes the strict per-unit verify pass** — a failed run leaves the prior manifest and prior xcframeworks untouched so you can retry against a known-good baseline. Files in the output directory that the tool didn't put there (your own xcframeworks, READMEs, build outputs from other tools) are never touched: only entries listed in the manifest are eligible for cleanup, and entry names are constrained to plain basenames inside the output directory (no `..`, no absolute paths, no path separators).
 
 Pass `--no-cleanup-stale` to skip cleanup for one run while keeping the orphans tracked. The preserved entries are merged into the new manifest, so a subsequent run *without* the flag will clean them naturally — opting out once doesn't leak orphans forever.
 
@@ -168,29 +257,37 @@ Source URLs and tag/revision arguments are validated before they reach `git`. Pa
 
 ## Output
 
+A real source-mode run (some per-slice success lines and `xcodebuild` stderr noise elided, marked with `...`):
+
 ```
-$ spm-to-xcframework https://github.com/Alamofire/Alamofire.git -v 5.10.2 -o ./output
+$ spm-to-xcframework https://github.com/Alamofire/Alamofire.git -v 5.10.2 \
+    --min-ios 15.0 --min-macos 11.0 -o ./output
 
 Cloning https://github.com/Alamofire/Alamofire.git @ 5.10.2
 Staging package into clean working tree...
+  Resolving package dependencies...
 Inspecting package...
-Planning source build...
 
 Plan for Alamofire @ 5.10.2  (source mode)
+  Package edits:
+    - synth_dynamic_library: Alamofire__Dynamic → targets=[Alamofire]
   Build units:
-    [1] Alamofire         scheme=Alamofire         language=Swift  → Alamofire.xcframework
-    [2] AlamofireDynamic  scheme=AlamofireDynamic  language=Swift  → AlamofireDynamic.xcframework
-  Package.swift edits:
-    - force_dynamic: Alamofire → targets=[Alamofire]
-
+    [1] Alamofire         scheme=Alamofire__Dynamic  language=Swift  → Alamofire.xcframework
+    [2] AlamofireDynamic  scheme=AlamofireDynamic    language=Swift  → AlamofireDynamic.xcframework
+  Selected slices: ios-arm64, ios-simulator, macos
 Preparing Package.swift edits...
   Prepare validated 1 edit(s) ✓
+
 Executing 2 build unit(s)...
-  Building Alamofire — ios-arm64, ios-simulator (parallel)...
+  Building Alamofire — ios-arm64, ios-simulator, macos (parallel)...
   ...
+  Renaming Alamofire__Dynamic.framework → Alamofire.framework
+  Injecting Swift module interfaces (ios-arm64)
+  Creating Alamofire.xcframework...
   Alamofire.xcframework ready [Swift]
-  Building AlamofireDynamic — ios-arm64, ios-simulator (parallel)...
+  Building AlamofireDynamic — ios-arm64, ios-simulator, macos (parallel)...
   ...
+  Creating AlamofireDynamic.xcframework...
   AlamofireDynamic.xcframework ready [Swift]
 
 === Summary ===
@@ -199,28 +296,51 @@ Executing 2 build unit(s)...
 Output: /path/to/output
 
 Xcframeworks:
-  Alamofire.xcframework         (16.0M) [Swift]
-  AlamofireDynamic.xcframework  (16.0M) [Swift]
+  Alamofire.xcframework         (26.7M) [Swift]
+  AlamofireDynamic.xcframework  (26.6M) [Swift]
 ```
 
-The output directory will also contain a `.spm-to-xcframework-manifest.json` file used to track which outputs the tool owns across runs (see "Stale-output cleanup" above). It is safe to commit, ignore, or delete; the tool re-creates it on the next successful run.
+Note how the planner allocated `Alamofire__Dynamic` for the synthetic — `AlamofireDynamic` is already taken by an existing sibling product, so the planner reached for the `__Dynamic` fallback. The final framework on disk is still `Alamofire.xcframework`; the synthetic name is only visible in the plan and during the rename pass.
 
-## Using with Swift.Bindings
+The output directory also contains a `.spm-to-xcframework-manifest.json` file used to track which outputs the tool owns across runs (see [Stale-output cleanup](#stale-output-cleanup)). It is safe to commit, ignore, or delete; the tool re-creates it on the next successful run.
 
-The xcframeworks produced by this tool are ready for .NET binding generation with Swift.Bindings. The binding generator auto-detects framework type from the xcframework contents:
+## Using with .NET binding generators
 
-- **Swift** xcframeworks: P/Invoke bindings via ABI JSON
-- **ObjC** xcframeworks: `ApiDefinition.cs` + `StructsAndEnums.cs` via clang AST
-- **Mixed** xcframeworks: both pipelines, two-project output
+The xcframeworks produced by this tool are ready for .NET binding generation (e.g. [Swift.Bindings](https://github.com/dotnet/runtime/tree/main/src/native/managed/cdac-tools/swift-bindings)). The binding generator auto-detects framework type from the xcframework contents:
+
+- **Swift** xcframeworks: P/Invoke bindings via ABI JSON.
+- **ObjC** xcframeworks: `ApiDefinition.cs` + `StructsAndEnums.cs` via clang AST.
+- **Mixed** xcframeworks: both pipelines, two-project output.
+
+The strict per-unit verify pass (dynamic Mach-O check, `.swiftinterface` requirement for Swift/Mixed, header + modulemap requirement for ObjC/Mixed) means a run that exits 0 is, by construction, a run whose outputs the binding generator can consume. There is no "this might still fail in the binding step" caveat — verify is the gate.
+
+## Troubleshooting
+
+Symptoms below show the leading prefix of the actual error message — the real output often continues with extra context (available products, available destinations, etc.). Match by prefix when `grep`-ing logs.
+
+| Symptom | Likely cause / fix |
+|---------|--------------------|
+| `Error: --no-ios and --min-ios are mutually exclusive. Drop one or the other.` | You passed both. Drop one — `--no-ios` already says "skip iOS"; `--min-ios` says "use this iOS version." |
+| `Error: No platforms selected.` | You passed `--no-ios` against a package that declares only iOS (or no platforms). Add another `--min-*` flag or drop `--no-ios`. |
+| `xcodebuild` reports `Unable to find a destination matching … { generic:1, platform:watchOS }` (or visionOS) | Auto-detect requested a platform whose SDK isn't installed locally. Install it via *Xcode › Settings › Components*, or pin to installed platforms with explicit `--min-*` flags. |
+| `Error (fetch): Tag '<x>' not found` | The remote repo doesn't have that tag. Check `git ls-remote --tags <url>`. |
+| `Error (plan): --product filter matched no products: [...]` | A product name in `--product` doesn't exist. Run with `--inspect-only` to see the package's declared products and targets. If the module is exposed as a plain `.target(...)` instead, use `--target <name>`. |
+| `Error (plan): Plan produced zero build units.` | `--product` filtered everything out, or the package declares only non-library products (e.g. executables, macros). |
+| `Error (plan): --target '<name>': target kind is '<kind>'; only regular source targets can be synthesized…` | You pointed `--target` at a `.binaryTarget`, `.systemLibrary`, plugin, macro, or test target. `--target` only works for normal source targets (Swift, ObjC, C). |
+| `Error (plan): Detected a binary-only Package.swift` against a local path | Binary auto-route needs a remote URL + `--version`. Point at the upstream URL or extract the xcframework from the vendor artifact directly. |
+| `Error (prepare): Package.swift uses Swift raw string literals (#"..."#) / triple-quoted strings (""") / string interpolation (\(…))` | The Package.swift uses Swift constructs the tool's heuristic walker doesn't understand. File a bug with the package URL + tag. |
+| `Error (inspect): swift package dump-package failed: ... Is the swift-tools-version supported by your toolchain?` | The package's `swift-tools-version` is newer than (or incompatible with) your installed Swift. Update Xcode or pin to an older tag. |
+| Swift xcframework missing `.swiftinterface` files | The package doesn't enable library evolution. ObjC binding generation still works; Swift binding generation requires `.swiftinterface`. |
 
 ## Known limitations
 
-- Packages with very old `swift-tools-version` (< 5.0) fail at package resolution
-- SPM-only products forced to dynamic linking can fail when system framework linkage is missing from the package manifest — these are typically redundant dynamic variants (e.g. `AlamofireDynamic`, `Lottie-Dynamic`)
-- Packages that don't support library evolution (`-enable-library-evolution`) may produce xcframeworks without `.swiftinterface` files — Swift binding generation requires these, but ObjC binding generation is unaffected
-- ObjC-only SPM targets must declare public headers via `publicHeadersPath` in `Package.swift` for headers to appear in the xcframework
-- `--binary` only works with remote packages that distribute binary xcframeworks via SPM binary targets — packages with a mix of binary and source targets will only resolve the binary artifacts
-- `--revision` requires the full 40-character commit SHA; short SHAs are rejected
+- Packages with `swift-tools-version` not supported by the installed toolchain fail at `swift package dump-package`. The inspect error explicitly suggests checking the tools version.
+- Packages that don't support library evolution (`-enable-library-evolution`) may produce xcframeworks without `.swiftinterface` files — Swift binding generation requires these, but ObjC binding generation is unaffected.
+- ObjC-only SPM targets must declare public headers via `publicHeadersPath` in `Package.swift` for headers to appear in the xcframework.
+- `--binary` only works with remote packages that distribute binary xcframeworks via SPM binary targets — packages with a mix of binary and source targets will only resolve the binary artifacts.
+- `--include-deps` is iOS-only in v1; combine it with iOS-enabled invocations only.
+- `--revision` requires the full 40-character commit SHA; short SHAs are rejected.
+- The planner's static-construct check (raw strings, triple-quoted strings, string interpolation in `Package.swift`) is a heuristic, not a full Swift parser; a manifest using these constructs is rejected with a clear `PrepareError` rather than silently mis-parsed.
 
 ## License
 

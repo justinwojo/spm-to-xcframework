@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from .config import Config
+from .model import Package
 
 
 @dataclass(frozen=True)
@@ -134,6 +135,58 @@ def _selected_slices(config: "Config") -> List[Tuple[PlatformSlice, str]]:
         for s in _PLATFORM_SLICES[plat]:
             out.append((s, version))
     return out
+
+
+def _autodetect_min_versions(config: "Config", package: "Package") -> Dict[str, str]:
+    """Fill in `config.min_<platform>` fields from `Package.platforms[]`
+    when the user passed zero --min-* flags.
+
+    Returns the dict of `{platform: version}` that was applied (empty
+    when no auto-detect ran — i.e., the user provided explicit flags).
+    Mutates `config` in place.
+
+    Two policy choices, both deliberate:
+
+    1. Explicit-vs-auto is all-or-nothing. If the user passed any
+       --min-* flag, we honor exactly that set; no mixing with derived
+       platforms. Keeps the mental model "what I typed is what I got."
+
+    2. When the package declares NO platforms at all (`platforms:` array
+       absent or empty), fall back to iOS 15.0 — today's pre-auto-detect
+       default. Many small library packages omit `platforms:` entirely
+       and rely on SPM's implicit minima; the tool's downstream (.NET
+       binding generation) almost always wants iOS, so the fallback
+       preserves the most common case.
+
+    `--no-ios` is respected: if it was passed, auto-detect skips the iOS
+    entry from the package even when the package declares iOS. The
+    other declared platforms still get filled in. A `--no-ios`-only
+    invocation against an iOS-only package therefore yields zero
+    platforms; the caller's post-autodetect validator surfaces that as a
+    clear error.
+    """
+    user_provided_any = any([
+        config.min_ios, config.min_macos, config.min_maccatalyst,
+        config.min_tvos, config.min_watchos, config.min_visionos,
+    ])
+    if user_provided_any:
+        return {}
+
+    derived: Dict[str, str] = {}
+    for p in package.platforms:
+        if p.name not in _PLATFORM_ORDER or not p.version:
+            continue
+        if p.name == "ios" and config.no_ios:
+            continue
+        derived[p.name] = p.version
+
+    if not derived and not config.no_ios:
+        config.min_ios = "15.0"
+        return {"ios": "15.0"}
+
+    for plat, ver in derived.items():
+        setattr(config, f"min_{plat}", ver)
+    return derived
 
 
 def _enabled_platforms(config: "Config") -> List[str]:

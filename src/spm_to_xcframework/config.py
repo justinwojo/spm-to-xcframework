@@ -31,14 +31,23 @@ class Config:
     target_filters: List[str] = field(default_factory=list)
     revision: Optional[str] = None
     # Per-platform deployment targets. `None` means "don't build this platform".
-    # iOS defaults to "15.0" for backward compatibility; pass --no-ios to opt out.
-    # Each non-iOS platform is opt-in via its --min-* flag.
-    min_ios: Optional[str] = "15.0"
+    # All default to None; when the user passes zero --min-* flags, the
+    # source-mode pipeline auto-derives the set from `Package.platforms[]`
+    # after Inspect. The auto-detect falls back to iOS 15.0 when the
+    # package declares no platforms at all. Binary mode (no Inspect)
+    # applies the same iOS-15 fallback in `_run_binary_mode` (cli.py).
+    min_ios: Optional[str] = None
     min_macos: Optional[str] = None
     min_maccatalyst: Optional[str] = None
     min_tvos: Optional[str] = None
     min_watchos: Optional[str] = None
     min_visionos: Optional[str] = None
+    # True iff the user passed --no-ios. Distinguishes "user explicitly
+    # opted out of iOS" from "user passed nothing and we'll auto-detect."
+    # Both end up with `min_ios == None` after _config_from_args, so the
+    # auto-detect needs this flag to know whether to skip iOS or fill it
+    # from the package.
+    no_ios: bool = False
     include_deps: bool = False
     binary_mode: bool = False
     verbose: bool = False
