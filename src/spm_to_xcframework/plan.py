@@ -23,6 +23,7 @@ from .model import (
     BuildUnit,
     Language,
     Linkage,
+    MacroSupport,
     Package,
     PackageSwiftEdit,
     Plan,
@@ -655,11 +656,26 @@ def plan_source_build(config: Config, package: Package) -> Plan:
             "products?"
         )
 
-    # Transitive `.product(name:, package:)` references that need their own
-    # sibling xcframework are handled by the top-level orchestrator
-    # `_run_source_mode_with_transitives`: each `TransitivePackageInfo`
-    # turns into a fresh `_run_source_mode` call against the resolved
-    # checkout. Plan stays single-package and subprocess-free.
+    # Fourth pass: macro support. For each planned build unit, walk its
+    # transitive internal target dep closure and collect any
+    # `TargetKind.MACRO` targets. Each such macro is later pre-built by
+    # Prepare as a host-arch compiler-plugin executable, its name is
+    # stripped from regular targets' dep arrays in the manifest, and
+    # Execute injects `-load-plugin-executable` flags so swiftc can
+    # expand `#externalMacro(...)` references against the pre-built
+    # plugin. See `MacroSupport` in model.py for the full rationale.
+    _detect_macro_support(plan, package)
+
+    # Fifth pass: consume pre-built transitive sibling xcframeworks. The
+    # top-level orchestrator `_run_source_mode_with_transitives` builds
+    # each external `.product(name:, package:)` dependency as its own
+    # sibling xcframework BEFORE the umbrella runs and pre-populates
+    # `Config.prebuilt_sibling_xcframeworks` with the resulting paths.
+    # Without this pass the umbrella inherits a dangling
+    # `.product(name: P, package: PKG)` reference after dedup-overlap
+    # rewrites an internal sibling to `.binaryTarget` — see
+    # `Config.prebuilt_sibling_xcframeworks` for the full rationale.
+    _plan_external_sibling_consumption(plan, package, config)
 
     return plan
 
@@ -920,6 +936,134 @@ def _auto_synth_sibling_units(
         existing_planned_names.add(existing.name)
 
 
+def _detect_macro_support(plan: Plan, package: Package) -> None:
+    """Populate `plan.macros` and per-unit `macro_deps` based on which
+    `.macro(...)` targets are transitively reachable from each planned
+    build unit.
+
+    Walks `compute_internal_target_deps(package)` to find macro targets
+    in the transitive closure of every planned unit's `source_targets`.
+    A unit "depends on" a macro iff the macro target name appears in
+    that closure (directly or transitively). The unit's `macro_deps` is
+    sorted for deterministic OTHER_SWIFT_FLAGS ordering at archive
+    time; `plan.macros` is deduped across units.
+
+    Idempotent: re-running on the same `plan` doesn't add duplicates
+    (rebuilds the list from scratch). No-op when `package` declares no
+    `.macro(...)` targets.
+
+    Pure planning step — no subprocesses, no file I/O. Prepare is the
+    layer that pre-builds the plugin executable and fills in
+    `MacroSupport.plugin_executable_path`.
+    """
+    macro_targets = {
+        t.name for t in package.targets if t.kind == TargetKind.MACRO
+    }
+    if not macro_targets:
+        plan.macros = []
+        for unit in plan.build_units:
+            unit.macro_deps = []
+        return
+
+    deps_map = compute_internal_target_deps(package)
+    needed_macros: Set[str] = set()
+    for unit in plan.build_units:
+        # Per-unit macro closure: union of every source target's transitive
+        # deps, intersected with the macro target set. A source target may
+        # itself BE a macro (unlikely — macro targets aren't normally
+        # planned as build units), so also include direct self-matches.
+        unit_macros: Set[str] = set()
+        for src_t in unit.source_targets:
+            if src_t in macro_targets:
+                unit_macros.add(src_t)
+            unit_macros |= deps_map.get(src_t, set()) & macro_targets
+        unit.macro_deps = sorted(unit_macros)
+        needed_macros |= unit_macros
+
+    plan.macros = [
+        MacroSupport(macro_target_name=name)
+        for name in sorted(needed_macros)
+    ]
+
+
+def _plan_external_sibling_consumption(
+    plan: Plan, package: Package, config: Config
+) -> None:
+    """Emit `consume_external_sibling` PackageSwiftEdits for every
+    transitive `.product()` reference whose backing xcframework has
+    already been built as a sibling by the orchestrator.
+
+    Reads `config.prebuilt_sibling_xcframeworks` (product-name → absolute
+    path map populated by `_run_source_mode_with_transitives` before the
+    umbrella's plan/prepare runs). For each `TransitivePackageInfo` on
+    `package.transitive_packages`, the entries in `tp.referenced_products`
+    that have a matching sibling xcframework become edits.
+
+    The orchestrator already trims `tp.referenced_products` to the
+    user's selected target closure (see
+    `_run_source_mode_with_transitives`), so we never emit an edit for a
+    product no in-closure root target imports — the resulting overlay
+    block stays scoped to the umbrella's actual surface.
+
+    Idempotent at the data level: emitting one edit per (product,
+    identity) pair, and Prepare's overlay injection + dependency rewrite
+    are both idempotent themselves.
+
+    No-op when the dict is empty (the common single-package /
+    `--no-transitive-products` path).
+    """
+    sibling_map = config.prebuilt_sibling_xcframeworks
+    if not sibling_map:
+        return
+    identity_map = config.prebuilt_sibling_identities
+
+    seen_products: Set[str] = set()
+    # Phase 1: emit edits for products the umbrella's source actually
+    # references via `.product(name: P, package: ident)`. These edits
+    # carry a known `package_identity`, which Prepare uses to scope the
+    # `.product()` → `"P"` rewrite and to drive the matching
+    # `.package(url:)` strip.
+    for tp in package.transitive_packages:
+        identity = tp.identity
+        for product_name in tp.referenced_products:
+            if product_name in seen_products:
+                continue
+            xcfx = sibling_map.get(product_name)
+            if xcfx is None:
+                continue
+            seen_products.add(product_name)
+            plan.package_swift_edits.append(
+                PackageSwiftEdit(
+                    kind="consume_external_sibling",
+                    product_name=product_name,
+                    package_identity=identity,
+                    xcframework_path=xcfx,
+                )
+            )
+
+    # Phase 2: every other freshly-built sibling xcframework gets an
+    # injection-only edit (no `package_identity`). These cover the
+    # swiftinterface re-export case: a sibling's `.swiftinterface` may
+    # `import M` where M is a different product of the same transitive
+    # package that the umbrella's source never imports directly. The
+    # binaryTarget overlay needs an entry for M so xcodebuild's
+    # swiftinterface verifier can resolve it; no `.product()` rewrite
+    # or `.package(url:)` strip is needed (the source never named M, and
+    # M's owning package is already being stripped via a Phase 1 edit).
+    for product_name, xcfx in sibling_map.items():
+        if product_name in seen_products:
+            continue
+        seen_products.add(product_name)
+        plan.package_swift_edits.append(
+            PackageSwiftEdit(
+                kind="consume_external_sibling",
+                product_name=product_name,
+                package_identity=identity_map.get(product_name),
+                xcframework_path=xcfx,
+            )
+        )
+
+
 def plan_binary_build(config: Config, artifacts: Sequence[BinaryArtifact]) -> Plan:
     """Pure planner for binary-mode builds.
 
@@ -1051,6 +1195,17 @@ def print_plan(
                     f"    - synth_library: {edit.product_name} "
                     f"→ targets=[{tgts}]"
                 )
+            elif edit.kind == "consume_external_sibling":
+                xcfx_basename = (
+                    edit.xcframework_path.name
+                    if edit.xcframework_path is not None
+                    else "(missing path)"
+                )
+                pkg_ident = edit.package_identity or "(unknown package)"
+                print(
+                    f"    - consume_external_sibling: {edit.product_name} "
+                    f"(package={pkg_ident}) ← {xcfx_basename}"
+                )
             else:
                 print(f"    - {edit.kind}: {edit.product_name}")
     elif not plan.binary_mode:
@@ -1085,6 +1240,10 @@ def print_plan(
     if selected:
         ids = ", ".join(s.slice_id for s, _ in selected)
         print(f"  Selected slices: {ids}")
+
+    if plan.macros:
+        names = ", ".join(m.macro_target_name for m in plan.macros)
+        print(f"  Macro plugins: {names} (pre-built host-side via swift build)")
 
     if plan.skipped:
         print("  Skipped:")

@@ -21,12 +21,18 @@ sequencing units in topological order over internal target deps so
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set
 
 from ..errors import ExecuteError
 from ..log import bold, info, success, verbose_log, warn
 from ..config import Config
-from ..model import BuildUnit, DependencyXcframework, ExecutedUnit, PreparedPlan
+from ..model import (
+    BuildUnit,
+    DependencyXcframework,
+    ExecutedUnit,
+    MacroSupport,
+    PreparedPlan,
+)
 from ..plan import compute_internal_target_deps, topo_order_units
 from ..platforms import (
     PlatformSlice,
@@ -80,6 +86,43 @@ def _is_resilience_diagnostic(error_message: str) -> bool:
     return _RESILIENCE_DIAGNOSTIC_PATTERN in error_message
 
 
+def _macro_swift_flags_for_unit(
+    unit: BuildUnit, macros: List[MacroSupport]
+) -> List[str]:
+    """Return the `-Xfrontend -load-plugin-executable -Xfrontend
+    <path>#<name>` token triplets that `unit` needs appended to its
+    `OTHER_SWIFT_FLAGS`.
+
+    Looks up each name in `unit.macro_deps` against `macros` (the
+    planner-emitted, prepare-resolved list). A unit may transitively
+    reach the same macro twice — `unit.macro_deps` is already deduped
+    by Plan, so a single pass over `unit.macro_deps` is sufficient.
+
+    Returns an empty list when `unit.macro_deps` is empty or every
+    referenced macro's `plugin_executable_path` is still unresolved
+    (the empty-resolution case means Prepare didn't build the plugin
+    for some reason — caller already raised PrepareBug there, so a
+    second defensive log here would be redundant).
+    """
+    if not unit.macro_deps:
+        return []
+    by_name = {m.macro_target_name: m for m in macros}
+    flags: List[str] = []
+    for name in unit.macro_deps:
+        ms = by_name.get(name)
+        if ms is None or ms.plugin_executable_path is None:
+            continue
+        flags.extend(
+            [
+                "-Xfrontend",
+                "-load-plugin-executable",
+                "-Xfrontend",
+                f"{ms.plugin_executable_path}#{name}",
+            ]
+        )
+    return flags
+
+
 def _run_one_unit(
     unit: BuildUnit,
     *,
@@ -108,12 +151,21 @@ def _run_one_unit(
             "--min-tvos / --min-maccatalyst / --min-watchos / --min-visionos"
         )
 
+    extra_swift_flags = _macro_swift_flags_for_unit(unit, prepared.plan.macros)
+    if extra_swift_flags:
+        verbose_log(
+            config.verbose,
+            f"  {unit.name}: injecting macro plugin flags "
+            f"{' '.join(extra_swift_flags)}",
+        )
+
     archive_slices = _archive_all_parallel(
         unit,
         selected=selected,
         staged_dir=staged_dir,
         work_dir=work_dir,
         verbose=config.verbose,
+        extra_swift_flags=extra_swift_flags,
     )
 
     for sid, s in archive_slices.items():

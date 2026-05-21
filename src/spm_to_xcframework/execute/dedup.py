@@ -169,11 +169,26 @@ def _apply_dedup_overlap_substitutions(
     from ..prepare import (
         _assert_no_unsupported_swift_constructs,
         _OVERLAY_SENTINEL_BEGIN,
+        _patch_sibling_swiftinterfaces_for_package_access,
         _select_active_manifest,
         edit_inject_or_extend_overlay_binary_targets,
         edit_replace_with_binary_target,
     )
     from ..plan import _manifest_uses_custom_target_wrapper_text
+    # Promote `package`-scoped decls in every sibling xcframework's
+    # swiftinterface to `public` (and drop the `.package.swiftinterface`
+    # files). Sibling targets built from a single SPM package share
+    # `package` access during the original source build, but once we
+    # split them into separate `.binaryTarget`s the consumer is a
+    # different "package" from swiftc's POV and `package` lookups fail
+    # ("Unknown attribute 'X'" for property-wrapper types, "no type
+    # named 'X' in module 'Y'" for nested helpers). Mirrors the
+    # external-sibling patch in `_apply_consume_external_sibling_edits`;
+    # idempotent, so safe to run on each consumer unit. See the
+    # `_patch_sibling_swiftinterfaces_for_package_access` docstring for
+    # the full rationale and trade-offs.
+    for _sib_name, sibling_path in substitutions:
+        _patch_sibling_swiftinterfaces_for_package_access(Path(sibling_path))
     manifest_path = _select_active_manifest(staged_dir)
     if not manifest_path.is_file():
         raise ExecuteError(

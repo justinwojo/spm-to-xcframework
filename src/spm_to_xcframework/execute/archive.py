@@ -61,6 +61,7 @@ def run_xcodebuild_archive(
     result_bundle_path: Path,
     log_path: Path,
     verbose: bool,
+    extra_swift_flags: Optional[Sequence[str]] = None,
 ) -> int:
     """Run `xcodebuild archive` for one (build unit, slice) combination.
 
@@ -76,9 +77,19 @@ def run_xcodebuild_archive(
         <slice.deployment_target_var>=<deployment_target>
         GCC_TREAT_WARNINGS_AS_ERRORS=NO
         SWIFT_TREAT_WARNINGS_AS_ERRORS=NO
-        OTHER_SWIFT_FLAGS=-no-verify-emitted-module-interface
+        OTHER_SWIFT_FLAGS=-no-verify-emitted-module-interface [<extras>]
         -skipPackagePluginValidation
         -skipMacroValidation
+
+    `extra_swift_flags` is appended to the OTHER_SWIFT_FLAGS value as
+    additional space-separated tokens. The canonical use is the macro
+    support pass: per-unit `-Xfrontend -load-plugin-executable
+    -Xfrontend <path>#<macro_name>` triplets so swiftc can expand
+    `#externalMacro` calls against a pre-built host plugin (see
+    `MacroSupport` in model.py for the architectural rationale). Each
+    element is concatenated verbatim — callers are responsible for any
+    shell quoting needed. In practice the work-dir paths we generate
+    don't contain spaces, so unquoted joining is safe.
 
     There is **no MACH_O_TYPE=mh_dylib**. Dynamic linkage is handled at
     the Package.swift layer in Prepare; never at the xcodebuild CLI layer.
@@ -99,6 +110,11 @@ def run_xcodebuild_archive(
     if result_bundle_path.exists():
         shutil.rmtree(result_bundle_path, ignore_errors=True)
 
+    swift_flag_tokens: List[str] = ["-no-verify-emitted-module-interface"]
+    if extra_swift_flags:
+        swift_flag_tokens.extend(extra_swift_flags)
+    other_swift_flags = "OTHER_SWIFT_FLAGS=" + " ".join(swift_flag_tokens)
+
     cmd = [
         "xcodebuild",
         "archive",
@@ -112,7 +128,7 @@ def run_xcodebuild_archive(
         f"{slice.deployment_target_var}={deployment_target}",
         "GCC_TREAT_WARNINGS_AS_ERRORS=NO",
         "SWIFT_TREAT_WARNINGS_AS_ERRORS=NO",
-        "OTHER_SWIFT_FLAGS=-no-verify-emitted-module-interface",
+        other_swift_flags,
         "-skipPackagePluginValidation",
         "-skipMacroValidation",
     ]
@@ -271,6 +287,7 @@ def _archive_one_slice(
     staged_dir: Path,
     work_dir: Path,
     verbose: bool,
+    extra_swift_flags: Optional[Sequence[str]] = None,
 ) -> Tuple[ArchiveSlice, int]:
     """Run xcodebuild archive once for one (build unit, slice) combination
     and return the slice metadata plus the xcodebuild return code.
@@ -301,6 +318,7 @@ def _archive_one_slice(
         result_bundle_path=result_bundle_path,
         log_path=log_path,
         verbose=verbose,
+        extra_swift_flags=extra_swift_flags,
     )
     framework_path = None
     if rc == 0:
@@ -346,6 +364,7 @@ def _archive_all_parallel(
     staged_dir: Path,
     work_dir: Path,
     verbose: bool,
+    extra_swift_flags: Optional[Sequence[str]] = None,
 ) -> "collections.OrderedDict[str, ArchiveSlice]":
     """Build every requested (platform_slice, deployment_target) archive
     for one build unit in parallel via `ThreadPoolExecutor`.
@@ -382,6 +401,7 @@ def _archive_all_parallel(
                 staged_dir=staged_dir,
                 work_dir=work_dir,
                 verbose=verbose,
+                extra_swift_flags=extra_swift_flags,
             )
             futures[fut] = platform_slice
         results: Dict[str, Tuple[ArchiveSlice, int]] = {}

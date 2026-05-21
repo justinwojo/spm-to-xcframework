@@ -180,9 +180,10 @@ class StageSpec:
 @dataclass
 class PackageSwiftEdit:
     """Whitelisted Package.swift edit, produced by Plan and consumed by
-    Prepare. Two source-mode kinds (a third kind, replace_with_binary_target,
-    is generated and applied dynamically inside Execute for dedup-overlap
-    and never travels through this struct):
+    Prepare. Three source-mode kinds (a fourth kind,
+    replace_with_binary_target, is generated and applied dynamically
+    inside Execute for dedup-overlap and never travels through this
+    struct):
 
       - "synth_dynamic_library"   — add a new `.library(name: P, type:
                                     .dynamic, targets: [...])` to wrap an
@@ -200,16 +201,45 @@ class PackageSwiftEdit:
                                     product name, so no rename is needed
                                     and `BuildUnit.scheme ==
                                     BuildUnit.framework_name`.
+      - "consume_external_sibling" — consume a pre-built transitive
+                                    sibling `.xcframework` from the
+                                    output dir. Injects `.binaryTarget(
+                                    name: P, path: ...)` into
+                                    `Package.targets` via the overlay
+                                    mechanism and rewrites every
+                                    `.product(name: P, package: <ident>)`
+                                    reference inside `.target` /
+                                    `.executableTarget` / `.testTarget`
+                                    dependency arrays to the bare string
+                                    `"P"` so SPM resolves the dep against
+                                    the injected binaryTarget instead of
+                                    the now-orphaned external package.
+                                    Emitted by the planner only when the
+                                    orchestrator pre-populates
+                                    `Config.prebuilt_sibling_xcframeworks`
+                                    in the umbrella's Plan input. Carries
+                                    `product_name` (external product
+                                    name), `package_identity` (SPM
+                                    identity used in the `.product(...)`
+                                    `package:` argument), and
+                                    `xcframework_path` (absolute path to
+                                    the sibling xcframework; Prepare
+                                    relativizes it for the manifest).
 
-    Both kinds are implemented by Prepare as a `swift package add-product`
-    subprocess invocation, then a round-trip dump-package validation that
-    the new product appears with linkage DYNAMIC and the requested target
-    list.
+    The two synth_* kinds are implemented by Prepare as a
+    `swift package add-product` subprocess invocation, then a
+    round-trip dump-package validation that the new product appears
+    with linkage DYNAMIC and the requested target list. The
+    consume_external_sibling kind runs as a text edit followed by the
+    same dump-package round-trip.
     """
 
-    kind: str  # "synth_dynamic_library" | "synth_library"
+    kind: str  # "synth_dynamic_library" | "synth_library" | "consume_external_sibling"
     product_name: str
     targets: List[str] = field(default_factory=list)
+    # Populated only for `consume_external_sibling`:
+    package_identity: Optional[str] = None
+    xcframework_path: Optional[Path] = None
 
 
 @dataclass
@@ -247,6 +277,47 @@ class BuildUnit:
     # Populated only for archive_strategy == "copy-artifact". Absolute path
     # to the xcframework discovered under `.build/artifacts/` by Fetch.
     artifact_path: Optional[Path] = None
+    # Macro target names this unit's transitive internal dep closure
+    # reaches. Populated by Plan from `compute_internal_target_deps`.
+    # Execute looks each name up in `Plan.macros` to find the pre-built
+    # plugin executable path and threads
+    # `-Xfrontend -load-plugin-executable -Xfrontend <path>#<name>`
+    # into the unit's OTHER_SWIFT_FLAGS so swiftc can expand
+    # `#externalMacro(module: name, ...)` calls.
+    macro_deps: List[str] = field(default_factory=list)
+
+
+@dataclass
+class MacroSupport:
+    """Pre-built compiler-plugin executable for a `.macro(...)` target.
+
+    Plan emits one MacroSupport per macro target reachable from the
+    transitive internal dep closure of any planned build unit. Prepare
+    materialises the executable via
+    `swift build -c release --product <macro_target_name>` and fills in
+    `plugin_executable_path`. Execute threads
+    `-Xfrontend -load-plugin-executable -Xfrontend <path>#<macro_target_name>`
+    into per-unit `OTHER_SWIFT_FLAGS` so swiftc can expand
+    `#externalMacro(module: macro_target_name, ...)` calls.
+
+    The compiler-plugin shuffle is necessary because xcodebuild's SPM
+    integration doesn't propagate `.product(name:, package:)` deps
+    declared on `.macro(...)` targets into the generated Xcode project —
+    when archive runs, the macro target builds as an isolated Swift
+    compilation that can't find swift-syntax modules and dies with
+    `Unable to find module dependency: 'SwiftSyntax'`. Pre-building via
+    `swift build` (which handles dep resolution natively, no Xcode-
+    project layer) sidesteps the gap; the manifest-text edit strips the
+    macro name from regular targets' dep arrays so xcodebuild stops
+    trying to build the macro target at all.
+
+    By construction the macro target name equals the module name a
+    consumer references in `#externalMacro(module:)` — SPM macro
+    targets are compiled as same-named executable plugins.
+    """
+
+    macro_target_name: str
+    plugin_executable_path: Optional[Path] = None
 
 
 @dataclass
@@ -285,6 +356,12 @@ class Plan:
     # True for binary-mode plans. Execute uses this to skip xcodebuild
     # entirely. The planner is the only thing that sets it.
     binary_mode: bool = False
+    # Macro target descriptors reachable from any planned build unit's
+    # transitive internal dep closure. Plan populates `macro_target_name`;
+    # Prepare materialises `plugin_executable_path`; Execute reads both
+    # to thread `-load-plugin-executable` flags into per-unit
+    # `OTHER_SWIFT_FLAGS`. See `MacroSupport` for the rationale.
+    macros: List["MacroSupport"] = field(default_factory=list)
 
 
 @dataclass

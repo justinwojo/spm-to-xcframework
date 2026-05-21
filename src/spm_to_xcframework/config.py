@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 
 @dataclass
@@ -98,6 +98,40 @@ class Config:
     # Always empty on parent Configs.
     collected_entries: List["ManifestEntry"] = field(default_factory=list)
     work_dir: Optional[Path] = None  # set in main() before fetch/inspect run
+    # Populated by `_run_source_mode_with_transitives` immediately before
+    # the umbrella's `_source_mode_after_inspect` runs: maps each
+    # external product name P (from `package.transitive_packages[*]
+    # .referenced_products`) to the absolute path of the sibling
+    # `<P>.xcframework` the transitive child just deposited under
+    # `--output`. The umbrella's Plan reads this dict and, for every P
+    # present, emits a `consume_external_sibling` PackageSwiftEdit so
+    # Prepare can splice `.binaryTarget(name: P, path: ...)` into the
+    # manifest (via the existing overlay mechanism) and rewrite every
+    # `.product(name: P, package: ...)` reference in target deps to the
+    # bare string `"P"`. Without this rewrite, dedup-overlap's substitution
+    # of internal sibling targets to `.binaryTarget` orphans the external
+    # `.product(...)` deps the original target used to declare — SPM
+    # then declines to resolve/build those products, and any other unit
+    # that imports them (directly or via a sibling's swiftinterface) fails
+    # with "Unable to find module dependency: ...". Empty dict means
+    # nothing to inject (default; matches single-package runs and any
+    # transitive-free umbrella). Never set this from the CLI.
+    prebuilt_sibling_xcframeworks: Dict[str, Path] = field(default_factory=dict)
+    # Companion to `prebuilt_sibling_xcframeworks`: maps each product
+    # name to its owning transitive package's SPM identity (e.g.
+    # "IssueReporting" → "xctest-dynamic-overlay"). Populated alongside
+    # the path map; only entries whose owning package is known from
+    # `package.transitive_packages[*].referenced_products` get an
+    # identity. Products auto-injected purely because they were freshly
+    # built as siblings (e.g. `IssueReportingPackageSupport`, which the
+    # umbrella's source never references but appears in the consumed
+    # `IssueReporting.framework`'s swiftinterface as a public re-export)
+    # are absent from this map — Prepare treats that case as "inject the
+    # binaryTarget overlay only; skip `.product()` rewrite and
+    # `.package(url:)` strip for this product, because the strip is
+    # identity-based and a sibling product from the same package
+    # already triggers it".
+    prebuilt_sibling_identities: Dict[str, str] = field(default_factory=dict)
 
     @property
     def is_remote(self) -> bool:

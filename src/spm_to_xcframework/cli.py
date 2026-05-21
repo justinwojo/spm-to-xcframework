@@ -796,6 +796,82 @@ def _make_transitive_child_config(parent: Config, tp, child_work_dir: Path) -> C
     return child
 
 
+def _build_prebuilt_sibling_index(
+    output_dir: Path,
+    entries: Sequence["ManifestEntry"],
+    package: "Package",
+) -> Tuple[Dict[str, Path], Dict[str, str]]:
+    """Build the two indexes the umbrella's planner consumes via
+    `Config.prebuilt_sibling_xcframeworks` and
+    `Config.prebuilt_sibling_identities`.
+
+    Returns `(paths_by_name, identities_by_name)`.
+
+    Inputs:
+      - `entries` is the orchestrator's accumulated transitive run output
+        (only transitive children; the umbrella's entries haven't been
+        produced yet at this call site).
+      - `package` is the parsed umbrella, whose
+        `transitive_packages[*].referenced_products` enumerates every
+        product name the umbrella's REGULAR targets reach via
+        `.product(name: P, package: ident)`.
+
+    Scope:
+      Every freshly-built `<P>.xcframework` in `entries` whose file is
+      on disk under `<output_dir>` ends up in `paths_by_name`. The fresh
+      list is what THIS run produced — so leftover xcframeworks in
+      `--output` from prior unrelated runs aren't included.
+
+      Including products that are NOT in any transitive's
+      `referenced_products` matters because a consumed sibling's
+      `.swiftinterface` can reference modules the umbrella's source
+      never explicitly imports — IssueReporting publicly re-exports
+      `IssueReportingPackageSupport`, so `import IssueReportingPackageSupport`
+      appears in IssueReporting's swiftinterface even though no target
+      in swift-case-paths references it directly. xcodebuild's
+      swiftinterface verifier still needs to resolve that module, so it
+      must be present as a binaryTarget in the umbrella's overlay even
+      though no `.product(name: …, package: …)` rewrite is needed for it.
+
+    `identities_by_name` maps product_name → owning package identity
+    when known (i.e. when that product appears in some transitive's
+    `referenced_products`). For products auto-injected purely on the
+    strength of being a freshly-built sibling, the identity is omitted
+    — the Prepare-time edit applier treats a missing identity as
+    "inject the binaryTarget overlay only; skip the `.product()`
+    rewrite and `.package(url:)` strip steps". This is safe because the
+    strip is identity-based: the referenced products in the same
+    transitive package already trigger the strip, and the unreferenced
+    siblings ride along.
+
+    Returned paths are absolute (resolved). Prepare relativizes them
+    against the staged package root when it writes the overlay block.
+    """
+    paths: Dict[str, Path] = {}
+    identities: Dict[str, str] = {}
+
+    for tp in package.transitive_packages:
+        for prod in tp.referenced_products:
+            identities.setdefault(prod, tp.identity)
+
+    fresh_basenames = {
+        e.name for e in entries if e.name.endswith(".xcframework")
+    }
+    resolved_output = output_dir.resolve()
+    for basename in fresh_basenames:
+        prod = basename[: -len(".xcframework")]
+        xcfx = resolved_output / basename
+        if not xcfx.exists():
+            continue
+        paths[prod] = xcfx
+
+    # Drop identities for products that aren't actually in `paths` (no
+    # corresponding xcframework on disk) — keeps the two indexes
+    # consistent.
+    identities = {k: v for k, v in identities.items() if k in paths}
+    return paths, identities
+
+
 def _run_source_mode_with_transitives(config: Config) -> int:
     """Top-level source-mode entry point with in-process transitive recursion.
 
@@ -990,6 +1066,19 @@ def _run_source_mode_with_transitives(config: Config) -> int:
     bold(f"\n=== umbrella: {package.name} ===")
     config.child_run = True
     config.collected_entries = []
+    # Hand the umbrella's Plan the set of transitive sibling xcframeworks
+    # we just deposited under `--output`. The planner emits one
+    # `consume_external_sibling` edit per transitive product so Prepare
+    # can splice `.binaryTarget(name: P, path: ...)` into the manifest
+    # and collapse `.product(name: P, package: ident)` deps into bare
+    # `"P"` strings — see `Config.prebuilt_sibling_xcframeworks` and
+    # `_plan_external_sibling_consumption` for the full rationale.
+    (
+        config.prebuilt_sibling_xcframeworks,
+        config.prebuilt_sibling_identities,
+    ) = _build_prebuilt_sibling_index(
+        config.output_dir, all_entries, package
+    )
     umbrella_result = _source_mode_after_inspect(
         config, source_dir, staged_dir, package
     )

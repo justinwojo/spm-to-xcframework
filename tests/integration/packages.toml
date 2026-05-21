@@ -271,3 +271,32 @@ exercises = [
     "cross-product-framework-search-path-linkage",  # SwiftParser dyn-links SwiftSyntax via SPM
 ]
 notes = "Canonical try-and-fallback exerciser (2026-05-21). SwiftParser umbrella archive fails on Swift's `may have additional unknown values` diagnostic with dedup-overlap ON; run_unit.py's fallback restores the manifest and re-archives without substitution, producing SwiftParser.xcframework with siblings statically embedded. SwiftSyntax.xcframework reports as [Mixed] because of the _SwiftSyntaxCShims C target embedded into it; SwiftParser and the six SwiftSyntax5XX-603 compat layers are pure [Swift]."
+
+# 13 — Swift macros / compiler plugins. Canonical case where the umbrella
+# library declares `public macro X() = #externalMacro(...)` whose backing
+# target is a `.macro(...)` with `.product(name:, package:)` deps on
+# swift-syntax. xcodebuild's SPM integration drops the macro's external-
+# package deps when generating its workspace, so the macro target's
+# swiftc call fails with "Unable to find module dependency: 'SwiftSyntax'".
+# Tool fix: pre-build the macro plugin via `swift build -c release
+# --product <name>` (host-arch executable, swift-syntax resolved
+# natively), strip the macro name from regular targets' dependency
+# arrays in the active Package.swift, and inject
+# `-Xfrontend -load-plugin-executable -Xfrontend <abs-path>#<module>`
+# into per-unit OTHER_SWIFT_FLAGS so swiftc can expand `#externalMacro`
+# references against the pre-built plugin at archive time.
+[[package]]
+name = "swift-case-paths"
+url = "https://github.com/pointfreeco/swift-case-paths"
+version = "1.7.3"
+min_versions = { ios = "13.0" }
+args = ["--product", "CasePaths"]
+expected_products = ["CasePaths", "CasePathsCore"]
+exercises = [
+    "macro-plugin-prebuild",  # swift build -c release --product CasePathsMacros
+    "macro-dep-strip",  # `"CasePathsMacros"` stripped from CasePaths.dependencies
+    "load-plugin-executable-flag-injection",  # -Xfrontend -load-plugin-executable
+    "conditional-test-target-preserved",  # `if OMIT_MACRO_TESTS == nil` block intact
+    "auto-synth-sibling-xcframeworks",  # CasePathsCore auto-promoted alongside umbrella
+]
+notes = "swift-case-paths declares but does not USE @CasePathable inside the runtime library — Sources/CasePaths/Macros.swift only contains the public macro declaration. Macro EXPANSION happens at consumer build time; this entry exercises the build-time plugin loading required to compile the macro declaration itself."
