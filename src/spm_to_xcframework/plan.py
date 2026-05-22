@@ -1050,15 +1050,27 @@ def _plan_external_sibling_consumption(
     # swiftinterface verifier can resolve it; no `.product()` rewrite
     # or `.package(url:)` strip is needed (the source never named M, and
     # M's owning package is already being stripped via a Phase 1 edit).
+    #
+    # When this planner runs for a transitive child, the sibling map
+    # carries every freshly-built sibling — including products owned by
+    # packages that aren't in THIS child's dependency graph. Filter
+    # those out: a product whose owner is known via `identity_map` and
+    # whose owner is NOT in the child's transitives is irrelevant to
+    # this manifest and would only bloat the overlay. Products with an
+    # unknown owner fall through as the re-export safety net.
+    child_tp_identities = {tp.identity for tp in package.transitive_packages}
     for product_name, xcfx in sibling_map.items():
         if product_name in seen_products:
+            continue
+        owner = identity_map.get(product_name)
+        if owner is not None and owner not in child_tp_identities:
             continue
         seen_products.add(product_name)
         plan.package_swift_edits.append(
             PackageSwiftEdit(
                 kind="consume_external_sibling",
                 product_name=product_name,
-                package_identity=identity_map.get(product_name),
+                package_identity=owner,
                 xcframework_path=xcfx,
             )
         )

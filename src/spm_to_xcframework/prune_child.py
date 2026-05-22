@@ -270,6 +270,148 @@ def _find_dependencies_array_in_package_call(
 
 _PACKAGE_ENTRY_URL_RE = re.compile(r'url\s*:\s*"([^"]+)"')
 
+_TARGET_NAME_RE = re.compile(r'name\s*:\s*"([^"]+)"')
+
+
+def _find_targets_array_in_package_call(
+    source: str,
+) -> Optional[Tuple[int, int]]:
+    """Within the top-level `Package(...)`, find the `targets: [...]`
+    argument array. Returns (open_bracket_idx, close_bracket_idx_inclusive)
+    or None if the argument isn't a literal array (e.g. a manifest that
+    writes `targets: libraryTargets + testTargets`).
+    """
+    pkg_call = _find_package_call(source)
+    if not pkg_call:
+        return None
+    open_paren, close_paren = pkg_call
+    view = _make_code_token_view(source)
+    inside_start = open_paren + 1
+    inside_end = close_paren
+    depth = 0
+    i = inside_start
+    while i < inside_end:
+        c = view[i]
+        if c in "({[":
+            depth += 1
+            i += 1
+            continue
+        if c in ")}]":
+            depth -= 1
+            i += 1
+            continue
+        if depth == 0:
+            if (
+                view.startswith("targets", i)
+                and (i + 7 >= inside_end or not (view[i + 7].isalnum() or view[i + 7] == "_"))
+            ):
+                j = i + 7
+                while j < inside_end and view[j] in " \t\r\n":
+                    j += 1
+                if j < inside_end and view[j] == ":":
+                    j += 1
+                    while j < inside_end and view[j] in " \t\r\n":
+                        j += 1
+                    if j < inside_end and view[j] == "[":
+                        close = _balanced_close(source, j)
+                        if close == -1:
+                            return None
+                        return (j, close)
+                    return None
+        i += 1
+    return None
+
+
+def _strip_test_targets(source: str) -> Tuple[str, List[str]]:
+    """Pass B: in the top-level `Package(...) targets: [...]` array,
+    drop every `.testTarget(...)` entry. Test targets are never built
+    for xcframework production, and they're the most common source of
+    stray dev-only deps (swift-macro-testing, snapshot-testing) that
+    pollute the dependency closure and break `swift package dump-package`
+    after Pass C prunes their backing `.package(url:)` entries.
+
+    Surfaced by swift-perception (transitive of TCA): its
+    `PerceptionMacrosTests` referenced `.product(name: "MacroTesting",
+    package: "swift-macro-testing")`, and Pass C dropped the
+    `swift-macro-testing` package, leaving a dangling reference that
+    invalidated the manifest.
+    """
+    arr = _find_targets_array_in_package_call(source)
+    if not arr:
+        return source, []
+    open_b, close_b = arr
+    view = _make_code_token_view(source)
+    inside_start = open_b + 1
+    inside_end = close_b
+
+    spans: List[Tuple[int, int, str]] = []
+    depth = 0
+    i = inside_start
+    while i < inside_end:
+        c = view[i]
+        if c in "({[":
+            depth += 1
+            i += 1
+            continue
+        if c in ")}]":
+            depth -= 1
+            i += 1
+            continue
+        if depth == 0 and c == ".":
+            j = i + 1
+            while j < inside_end and view[j] in " \t\r\n":
+                j += 1
+            if view.startswith("testTarget", j) and (
+                j + 10 >= inside_end
+                or not (view[j + 10].isalnum() or view[j + 10] == "_")
+            ):
+                k = j + 10
+                while k < inside_end and view[k] in " \t\r\n":
+                    k += 1
+                if k < inside_end and view[k] == "(":
+                    close_paren = _balanced_close(source, k)
+                    if close_paren == -1 or close_paren >= inside_end:
+                        i += 1
+                        continue
+                    entry_src = source[i : close_paren + 1]
+                    name_match = _TARGET_NAME_RE.search(entry_src)
+                    target_name = name_match.group(1) if name_match else "?"
+                    entry_end = close_paren + 1
+                    scan = entry_end
+                    while scan < inside_end and source[scan] in " \t":
+                        scan += 1
+                    if scan < inside_end and source[scan] == ",":
+                        entry_end = scan + 1
+                    scan2 = entry_end
+                    while scan2 < inside_end and source[scan2] in " \t":
+                        scan2 += 1
+                    if scan2 < inside_end and source[scan2] == "\n":
+                        entry_end = scan2 + 1
+                    line_start = source.rfind("\n", inside_start, i) + 1
+                    if source[line_start:i].strip() == "":
+                        entry_start = line_start
+                    else:
+                        entry_start = i
+                    spans.append(
+                        (entry_start, entry_end, f".testTarget({target_name})")
+                    )
+                    i = close_paren + 1
+                    continue
+        i += 1
+
+    if not spans:
+        return source, []
+
+    out_parts: List[str] = []
+    reasons: List[str] = []
+    cursor = 0
+    for start, end, reason in spans:
+        out_parts.append(source[cursor:start])
+        cursor = end
+        reasons.append(reason)
+    out_parts.append(source[cursor:])
+    return "".join(out_parts), reasons
+
 
 def _prune_top_level_package_entries(
     source: str, needed_identities: Set[str]
@@ -502,16 +644,33 @@ def prune_child_manifest_for_products(
     else:
         raw_dump = _dump_package_json(pre_staged_dir)
 
+    # Pass B: strip .testTarget(...) declarations from the targets array.
+    # Test targets are never built for xcframework production, and dropping
+    # them upfront prevents Pass C from leaving dangling .product(...)
+    # references when it prunes test-only deps.
+    after_b, reasons_b = _strip_test_targets(after_a)
+    if reasons_b:
+        pkg_swift.write_text(after_b)
+        try:
+            raw_dump = _dump_package_json(pre_staged_dir)
+        except PrepareUserError:
+            pkg_swift.write_text(after_a)
+            raise
+        for r in reasons_b:
+            verbose_log(verbose, f"  prune-child: pass-B stripped {r}")
+    else:
+        after_b = after_a
+
     # Pass C: drop unused .package(url:) entries.
     needed = _collect_needed_identities(raw_dump, allowed_products)
-    after_c, reasons_c = _prune_top_level_package_entries(after_a, needed)
+    after_c, reasons_c = _prune_top_level_package_entries(after_b, needed)
     if reasons_c:
         pkg_swift.write_text(after_c)
         try:
             _dump_package_json(pre_staged_dir)
         except PrepareUserError:
-            # Roll back to the Pass-A result, since that one validated.
-            pkg_swift.write_text(after_a)
+            # Roll back to Pass-B's output (last validated state).
+            pkg_swift.write_text(after_b)
             raise
         for r in reasons_c:
             verbose_log(verbose, f"  prune-child: pass-C stripped {r}")

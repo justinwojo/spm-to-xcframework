@@ -300,3 +300,119 @@ exercises = [
     "auto-synth-sibling-xcframeworks",  # CasePathsCore auto-promoted alongside umbrella
 ]
 notes = "swift-case-paths declares but does not USE @CasePathable inside the runtime library — Sources/CasePaths/Macros.swift only contains the public macro declaration. Macro EXPANSION happens at consumer build time; this entry exercises the build-time plugin loading required to compile the macro declaration itself."
+
+# 14 — Pure-Swift baseline with multi-product (library + command plugins).
+# swift-argument-parser declares three products: one .library(ArgumentParser)
+# and two .plugin(...) command plugins (GenerateDoccReference, GenerateManual).
+# Plan must filter out plugin products (they're build-tool commands, not
+# library/binary artifacts shipped to consumers). Also exercises executable
+# target filtering (Tools/{generate-docc-reference,generate-manual} +
+# Examples/{roll,math,repeat,color}) which Plan should skip.
+[[package]]
+name = "swift-argument-parser"
+url = "https://github.com/apple/swift-argument-parser"
+version = "1.7.1"
+min_versions = { ios = "13.0" }
+args = ["--product", "ArgumentParser"]
+expected_products = ["ArgumentParser", "ArgumentParserToolInfo"]
+exercises = [
+    "pure-swift-multi-product-with-plugins",
+    "plugin-product-filtering",  # .plugin(...) products dropped from build
+    "executable-target-filtering",  # Tools/* + Examples/* executableTargets skipped
+    "auto-synth-sibling-xcframeworks",  # ArgumentParserToolInfo (internal-only) promoted
+]
+notes = "Smallest/fastest pure-Swift smoke entry beyond snapkit. Hits the plugin-product filter path — first matrix entry with .plugin(...) products in the umbrella manifest."
+
+# 15 — Traits + experimental swift settings + transitive dep via
+# --include-deps. swift-async-algorithms uses the SPM `traits:` API
+# (added in swift-tools-version 6.0), `AvailabilityMacro` experimental
+# feature, and `StrictConcurrency=complete`. AsyncAlgorithms depends on
+# .product(OrderedCollections, DequeModule, package: "swift-collections"),
+# so --include-deps pulls swift-collections in as a sibling package and
+# the transitive deps surface as separate xcframeworks. AsyncStreaming
+# (also a product) requires the BasicContainers / ContainersPreview
+# products of swift-collections which only exist on its main branch — we
+# build AsyncAlgorithms only.
+#
+# KNOWN_BROKEN: swift-collections 1.5.x's InternalCollectionsUtilities
+# uses `@_lifetime` and `~Escapable` annotations gated by
+# `#if compiler(>=6.2)`. The package declares
+# `.enableExperimentalFeature("Lifetimes")` in swiftSettings, and the
+# resulting swiftc command line under xcodebuild archive does include
+# `-enable-experimental-feature Lifetimes` (verified in build log).
+# Standalone `xcrun swiftc -typecheck` with that exact flag accepts
+# `@_lifetime`, but xcodebuild's library-evolution archive (EmitSwiftModule
+# phase) on Xcode 26.3 rejects it anyway. Reproduces with a vanilla
+# `xcodebuild archive -scheme AsyncAlgorithms BUILD_LIBRARY_FOR_DISTRIBUTION=YES`
+# against a fresh git clone with zero spm-to-xcframework involvement, so
+# this is an Xcode SPM-integration limitation, not a tool bug. Revisit
+# when a newer Xcode lands (or when swift-collections 1.6 lifts the
+# experimental gating).
+[[package]]
+name = "swift-async-algorithms"
+url = "https://github.com/apple/swift-async-algorithms"
+version = "1.1.4"
+min_versions = { ios = "13.0" }
+args = ["--include-deps", "--product", "AsyncAlgorithms"]
+expected_products = [
+    "AsyncAlgorithms",
+    "DequeModule",
+    "OrderedCollections",
+    "InternalCollectionsUtilities",
+]
+exercises = [
+    "include-deps-transitive",
+    "traits-api",  # swift-tools-version 6.2 traits: [...] block
+    "experimental-swift-settings",  # AvailabilityMacro + StrictConcurrency=complete
+    "transitive-sibling-xcframeworks",  # swift-collections built alongside AsyncAlgorithms
+    "selective-product-filter",  # AsyncStreaming product excluded via --product
+]
+known_broken = true
+broken_signature = "'@_lifetime' attribute is only valid when experimental feature Lifetimes is enabled"
+broken_reason = "Xcode 26.3 + swift-collections 1.5.x interaction. The InternalCollectionsUtilities target's `@_lifetime`-annotated `~Escapable` helpers (LifetimeOverride.swift, #if compiler(>=6.2)) are rejected by xcodebuild's library-evolution EmitSwiftModule phase even though swiftSettings enable the Lifetimes experimental feature and the flag is passed on the swiftc command line. Reproduces with a vanilla `xcodebuild archive` against a fresh swift-async-algorithms checkout — no tool involvement — so this is an Xcode SPM-integration limitation, not a spm-to-xcframework bug. Re-test on Xcode 26.4 / swift-collections 1.6."
+notes = "First matrix entry exercising the SPM traits API and AvailabilityMacro experimental feature. Currently known_broken — see broken_reason. AsyncStreaming is intentionally NOT built — it depends on BasicContainers/ContainersPreview which are post-1.x swift-collections targets."
+
+# 16 — Two products backing the same target. Alamofire ships both
+# `.library(name: "Alamofire", targets: ["Alamofire"])` (implicit static)
+# AND `.library(name: "AlamofireDynamic", type: .dynamic, targets:
+# ["Alamofire"])` — same target, two product faces. Filtering to a single
+# product (`--product Alamofire`) forces the planner to synth a dynamic
+# sibling even though the SAME target is already exposed as a dynamic
+# product via `AlamofireDynamic`. Also stress-tests the upcoming-feature
+# swift setting (`ExistentialAny`) and `swiftLanguageModes: [.v5]`.
+[[package]]
+name = "alamofire"
+url = "https://github.com/Alamofire/Alamofire"
+version = "5.10.2"
+min_versions = { ios = "13.0" }
+args = ["--product", "Alamofire"]
+expected_products = ["Alamofire"]
+exercises = [
+    "pure-swift-single-product",
+    "two-products-same-target",  # `Alamofire` + `AlamofireDynamic` share target
+    "synth_dynamic_library",  # static-default product needs synth dynamic sibling
+    "upcoming-feature-swift-setting",  # .enableUpcomingFeature("ExistentialAny")
+    "swift-language-modes",  # swiftLanguageModes: [.v5]
+    "inject_resource_bundles",  # PrivacyInfo.xcprivacy
+    "linker-settings-platform-gated",  # .when(platforms: [...]) on linkedFramework
+    "popular-consumer-library",
+]
+notes = "Real-world popular HTTP library. The dual-product / single-target manifest shape is unique in the matrix — Plan must not get confused by the sibling `AlamofireDynamic` product when the user requests `Alamofire`. ExistentialAny upcoming-feature gate is a hard error at archive time if not propagated correctly."
+
+# 17 — Older swift-tools-version (5.1) single-product pure-Swift consumer
+# library. Kingfisher is the canonical popular-package smoke entry — wide
+# real-world usage, simple manifest, exercises the tools-version-bump
+# path on the lowest end of the supported swift-tools-version range.
+[[package]]
+name = "kingfisher"
+url = "https://github.com/onevcat/Kingfisher"
+version = "8.9.0"
+min_versions = { ios = "13.0" }
+expected_products = ["Kingfisher"]
+exercises = [
+    "pure-swift-single-product",
+    "tools-version-bump",  # swift-tools-version 5.1 → bumped for library-evolution
+    "inject_swiftmodule",
+    "popular-consumer-library",
+]
+notes = "Lowest swift-tools-version (5.1) in the matrix. Simple Package.swift — single .target with custom path. Real-world smoke test for the most common SPM shape (one library, one target)."

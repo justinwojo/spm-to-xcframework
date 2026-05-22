@@ -171,6 +171,7 @@ def _apply_dedup_overlap_substitutions(
         _OVERLAY_SENTINEL_BEGIN,
         _patch_sibling_swiftinterfaces_for_package_access,
         _select_active_manifest,
+        edit_guard_target_loops_from_overlay,
         edit_inject_or_extend_overlay_binary_targets,
         edit_replace_with_binary_target,
     )
@@ -200,10 +201,11 @@ def _apply_dedup_overlap_substitutions(
     # would have run it during Prepare — but only if the planner emitted at least
     # one edit. When Prepare takes its no-op path (no package_swift_edits), the
     # guard is skipped, and an Execute-time dedup edit on a manifest with
-    # triple-quoted strings, `#"..."#` raw strings, or `\(...)` interpolation
-    # would silently mis-parse via `_make_code_token_view` (which only tracks
-    # `"..."` strings). Running the guard here closes that gap.
-    # (Codex P2 round-4 regression.)
+    # `#"..."#` raw strings would silently mis-parse via `_make_code_token_view`
+    # (which tracks `"..."` and `"""..."""` strings but not raw delimiters).
+    # Running the guard here closes that gap. (Codex P2 round-4 regression.
+    # Triple-quoted strings and `\(...)` interpolation used to be in this guard;
+    # the walker now handles both.)
     try:
         _assert_no_unsupported_swift_constructs(text)
     except PrepareUserError as exc:
@@ -273,6 +275,13 @@ def _apply_dedup_overlap_substitutions(
                 f"dedup-overlap substitution failed for unit {unit_name!r}: "
                 f"{exc}"
             ) from exc
+        # Post-init loops like `for target in package.targets where ... { target.swiftSettings += ... }`
+        # mutate every non-system target; the freshly-injected binaryTargets would
+        # be hit too and SPM rejects `settings are not accepted for the binary
+        # target type`. Guard runs unconditionally — it's a no-op when the
+        # overlay sentinel is absent and idempotent when the where clause is
+        # already augmented from a prior pass.
+        edited = edit_guard_target_loops_from_overlay(edited)
         if edited != text:
             manifest_path.write_text(edited)
             applied = [f"{name} -> {abs_path.name}" for name, abs_path, _ in rel_subs]

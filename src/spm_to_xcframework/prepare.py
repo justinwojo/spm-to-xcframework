@@ -41,18 +41,57 @@ from .model import (
 )
 
 
+def _skip_triple_quoted_string(text: str, start: int) -> int:
+    """Given `start` pointing at the first `"` of a triple-quote opener,
+    return the index one past the closing triple-quote. Returns -1 if
+    no matching closer is found.
+
+    Caller must verify `text[start:start+3] == chr(34)*3` before calling.
+
+    Handles `\\<x>` escape sequences. For `\\(...)` interpolation we
+    recurse through `_balanced_close` to find the matching `)` — the
+    embedded expression is arbitrary Swift, including its own string
+    literals (single- or triple-quoted), and Swift legally allows a
+    nested `\"\"\"...\"\"\"` literal inside the interpolation. Naively
+    treating `\\(` as a 2-char escape would let a nested triple-quote
+    masquerade as the outer closer.
+
+    On a sequence of four or more consecutive `"`, the first three are
+    the closer per Swift's lexer; the trailing quote belongs to
+    whatever follows the multi-line string.
+    """
+    n = len(text)
+    i = start + 3  # Skip opening `"""`.
+    while i < n:
+        c = text[i]
+        if c == "\\" and i + 1 < n:
+            if text[i + 1] == "(":
+                close_idx = _balanced_close(text, i + 1)
+                if close_idx == -1:
+                    return -1
+                i = close_idx + 1
+                continue
+            i += 2
+            continue
+        if c == '"' and i + 2 < n and text[i + 1] == '"' and text[i + 2] == '"':
+            return i + 3
+        i += 1
+    return -1
+
+
 def _strip_swift_comments(text: str) -> str:
     """Return `text` with `//` line comments and `/* */` block comments
     replaced by equal-length spans of spaces (preserving newlines). The
     length/offset preservation keeps any downstream index math valid,
     and preserving newlines keeps line-counting error messages honest.
 
-    This is NOT a full Swift tokenizer — it only tracks double-quoted
-    string state so comment markers inside a regular string literal
-    don't trigger. The file-wide `_assert_no_unsupported_swift_constructs`
-    gate runs AFTER this stripper and guards against the advanced
-    string shapes (raw strings, triple-quotes, interpolation) that
-    could otherwise fool the state machine.
+    This is NOT a full Swift tokenizer — it tracks double-quoted and
+    triple-quoted string state so comment markers inside a string
+    literal don't trigger. The file-wide
+    `_assert_no_unsupported_swift_constructs` gate runs AFTER this
+    stripper and guards against the remaining advanced string shapes
+    (raw strings, interpolation) that could otherwise fool the state
+    machine.
 
     Behavior on unterminated comments / strings: we stop stripping at
     the unterminated boundary and keep the rest of the text verbatim.
@@ -66,6 +105,21 @@ def _strip_swift_comments(text: str) -> str:
     i = 0
     while i < n:
         c = text[i]
+        # Triple-quoted multi-line string: copy entire span verbatim.
+        # MUST be checked before the single-quote handler since `"""`
+        # begins with `"`. The body is real Swift source and the
+        # stripper preserves source positions, so we keep every byte.
+        if c == '"' and i + 2 < n and text[i + 1] == '"' and text[i + 2] == '"':
+            close_idx = _skip_triple_quoted_string(text, i)
+            if close_idx == -1:
+                # Unterminated — copy the rest verbatim, matching the
+                # block-comment fallthrough.
+                out.append(text[i:])
+                i = n
+                break
+            out.append(text[i:close_idx])
+            i = close_idx
+            continue
         # Double-quoted string: copy verbatim, honoring `\\` escapes.
         if c == '"':
             out.append(c)
@@ -147,9 +201,10 @@ def _make_code_token_view(text: str) -> str:
     real call, and the user sees a spurious PrepareUserError on a
     well-formed manifest.
 
-    Limitations match `_strip_swift_comments`: only `"..."` strings are
-    tracked. `#\"...\"#` raw strings and `\"\"\"...\"\"\"` multi-line
-    strings aren't supported here — they would be rejected upstream by
+    Limitations match `_strip_swift_comments`: double-quoted (`"..."`)
+    and triple-quoted multi-line strings are tracked. `#"..."#` raw
+    strings aren't supported here
+    — they would be rejected upstream by
     `_assert_no_unsupported_swift_constructs` before any prepare-time
     edit runs. `\\(...)` string interpolation IS handled by recursing
     through `_balanced_close` to find the closing `)` of the embedded
@@ -168,6 +223,19 @@ def _make_code_token_view(text: str) -> str:
     i = 0
     while i < n:
         c = text[i]
+        # Triple-quoted multi-line string: blank delimiters + body with
+        # spaces, preserve newlines. MUST be checked before the
+        # single-quote handler since `"""` begins with `"`.
+        if c == '"' and i + 2 < n and text[i + 1] == '"' and text[i + 2] == '"':
+            close_idx = _skip_triple_quoted_string(text, i)
+            if close_idx == -1:
+                out.append(text[i:])
+                i = n
+                break
+            for ch in text[i:close_idx]:
+                out.append("\n" if ch == "\n" else " ")
+            i = close_idx
+            continue
         # Double-quoted string: blank delimiters + body with spaces, keep newlines.
         # Honors `\(...)` interpolation via recursion through `_balanced_close`,
         # so a string like `"Sources/\(name + "Tests")"` doesn't mis-terminate
@@ -243,62 +311,202 @@ def _make_code_token_view(text: str) -> str:
     return "".join(out)
 
 
+def _blank_triple_quoted_bodies(text: str) -> str:
+    # Return `text` with the PROSE inside every ordinary triple-quoted
+    # multi-line string span replaced by spaces (newlines preserved).
+    # "Prose" means the body chars between the triple-quote delimiters
+    # AND outside any `\(...)` interpolation expression — interpolation
+    # bodies are real Swift code and are preserved verbatim so the
+    # downstream raw-string guard can still observe `#"` markers
+    # nested inside them. The triple-quote delimiters themselves
+    # (opener and closer) are also blanked.
+    #
+    # Raw triples (`#"""..."""#`, `##"""..."""##`, …) are left
+    # ENTIRELY intact so the guard sees the leading `#"` and rejects
+    # them — the helper can't safely walk a raw triple's body anyway
+    # (raw strings close at `"""#` matching the leading hash count,
+    # not at the first bare `"""`).
+    #
+    # Used by `_assert_no_unsupported_swift_constructs` so a `#"`
+    # mention inside a legitimate `traits:` description (or any other
+    # multi-line string body) does not trip the raw-string guard.
+    # Single-quoted strings are intentionally left intact — the guard
+    # still flags raw-string-shaped content inside them, matching the
+    # documented heuristic.
+    n = len(text)
+    out = list(text)
+
+    def _blank(k: int) -> None:
+        if out[k] != "\n":
+            out[k] = " "
+
+    # Walker state stack. Each frame is one of:
+    #   ("code", None)        — top-level or nested non-string code
+    #   ("code", exit_at)     — code inside `\(...)` interpolation; on
+    #                            entering an index > exit_at we pop back
+    #                            to the enclosing prose context
+    #   ("prose", None)       — body of an ordinary triple-quoted string
+    stack: List[Tuple[str, Optional[int]]] = [("code", None)]
+
+    i = 0
+    while i < n:
+        # Pop expired interpolation frames first.
+        while True:
+            mode, exit_at = stack[-1]
+            if mode == "code" and exit_at is not None and i > exit_at:
+                stack.pop()
+                continue
+            break
+
+        mode, exit_at = stack[-1]
+        c = text[i]
+
+        if mode == "code":
+            if c == '"' and i + 2 < n and text[i + 1] == '"' and text[i + 2] == '"':
+                # Raw triple opener — leave the entire raw span intact
+                # so the downstream `#"` scan sees the leading hash +
+                # quote and rejects. Swift's raw-string rule: opener
+                # `<N hashes>"""` matches closer `"""<N hashes>`. We
+                # count the preceding hash run, scan forward for the
+                # matching closer, and skip past the whole span.
+                if i > 0 and text[i - 1] == "#":
+                    hashes = 0
+                    j = i - 1
+                    while j >= 0 and text[j] == "#":
+                        hashes += 1
+                        j -= 1
+                    end = -1
+                    k = i + 3
+                    while k + 2 + hashes < n:
+                        if (
+                            text[k] == '"'
+                            and text[k + 1] == '"'
+                            and text[k + 2] == '"'
+                        ):
+                            ok = True
+                            for h in range(hashes):
+                                if text[k + 3 + h] != "#":
+                                    ok = False
+                                    break
+                            if ok:
+                                end = k + 3 + hashes
+                                break
+                        k += 1
+                    if end == -1:
+                        # Unterminated raw triple — bail. The opening
+                        # `#"` is still visible to the guard, so the
+                        # manifest will be rejected anyway.
+                        break
+                    i = end
+                    continue
+                # Ordinary triple opener — blank the delimiters and
+                # enter prose mode.
+                _blank(i)
+                _blank(i + 1)
+                _blank(i + 2)
+                stack.append(("prose", None))
+                i += 3
+                continue
+            # Any other char in code mode is preserved as-is.
+            i += 1
+            continue
+
+        # prose mode
+        if c == "\\" and i + 1 < n:
+            if text[i + 1] == "(":
+                # Interpolation — preserve text from `\(` through the
+                # matching `)` so any code (including `#"..."#`) stays
+                # visible to the raw-string guard. We push a code
+                # frame whose `exit_at` is the matching close paren;
+                # the frame pops automatically on the next iteration
+                # once `i` advances past it.
+                close_idx = _balanced_close(text, i + 1)
+                if close_idx == -1:
+                    return "".join(out)
+                stack.append(("code", close_idx))
+                # The `\(` chars themselves are part of prose syntax
+                # but we leave them in `out` verbatim — they don't
+                # affect the `#"` scan and preserving them keeps the
+                # source positions aligned with the original for
+                # debugging.
+                i += 2
+                continue
+            # Any other escape (e.g. `\"`, `\n`, `\u{...}`) is prose —
+            # blank both characters.
+            _blank(i)
+            _blank(i + 1)
+            i += 2
+            continue
+        if c == '"' and i + 2 < n and text[i + 1] == '"' and text[i + 2] == '"':
+            # Closing triple of the current prose region.
+            _blank(i)
+            _blank(i + 1)
+            _blank(i + 2)
+            stack.pop()
+            i += 3
+            continue
+        # Plain prose char.
+        _blank(i)
+        i += 1
+    return "".join(out)
+
+
 def _assert_no_unsupported_swift_constructs(text: str) -> None:
     """Fail loudly if `text` contains Swift constructs the balanced-paren
     walker can't reason about.
 
     The walker handles double-quoted strings (with backslash escapes),
-    line comments (//), block comments, and string interpolation
-    (`\\(...)` via recursion through the walker). It does NOT handle
-    Swift raw strings (`#"..."#`) or multi-line triple-quoted strings:
-    unescaped quotes inside a raw string would confuse the string-skip
-    state, and triple-quotes use a different terminator.
+    triple-quoted multi-line strings, line comments (//), block
+    comments, and string interpolation (`\\(...)` via recursion
+    through the walker). It does NOT handle Swift raw strings
+    (`#"..."#`): unescaped quotes inside a raw string would confuse
+    the string-skip state and the raw-delimiter terminator (`"#`)
+    isn't tracked.
 
     To avoid flagging false positives on doc comments that legitimately
-    mention these constructs (e.g. `/// Uses #"..."# internally`), we
+    mention this construct (e.g. `/// Uses #"..."# internally`), we
     scan a comment-stripped view of the manifest. Real code uses of
-    the constructs still fire; mentions inside `//`, `/* */`, or `///`
-    doc comments pass through untouched.
+    the construct still fire; mentions inside `//`, `/* */`, or `///`
+    doc comments pass through untouched. We also blank triple-quoted
+    multi-line string bodies before scanning so a `traits:` description
+    that legitimately mentions raw-string syntax in prose (e.g. a
+    multi-line description containing the text `#"..."#`) doesn't
+    falsely trigger.
 
     The check remains a heuristic gate, not a full parser. Known
     limitations:
       - Doc comments inside regular strings are stripped, since the
         stripper follows the string-state machine. This is the same
         behavior as the downstream `_balanced_close` walker.
-      - A string literal like `let s = "#\\"hi\\"#"` looks the same
-        to the scanner as a real raw-string use, so the check will
-        reject it. Real manifests don't write strings like this.
+      - A single-quoted string literal like `let s = "#\\"hi\\"#"` looks
+        the same to the scanner as a real raw-string use, so the check
+        will reject it. Real manifests don't write strings like this.
     """
-    scanned = _strip_swift_comments(text)
+    scanned = _blank_triple_quoted_bodies(_strip_swift_comments(text))
     if '#"' in scanned:
         raise PrepareUserError(
             "Package.swift uses Swift raw string literals (`#\"...\"#`), "
             "which the balanced-paren walker doesn't understand. "
             "File a bug if this needs to be supported."
         )
-    if '"""' in scanned:
-        raise PrepareUserError(
-            "Package.swift uses Swift triple-quoted strings (`\"\"\"`), "
-            "which the balanced-paren walker doesn't understand. "
-            "File a bug if this needs to be supported."
-        )
-    # Swift string interpolation (`\\(...)`) used to be rejected here but
-    # the walker now handles it via recursion through itself in the
-    # string-skip path. Real-world manifests use it heavily (e.g.
-    # swift-collections' Package.swift builds path strings from target
-    # names via `"Sources/\\(name)"`).
+    # Triple-quoted strings (`"""..."""`) and `\\(...)` string interpolation
+    # are both handled by the walker (the former via `_skip_triple_quoted_string`,
+    # the latter via recursion through `_balanced_close`). Real-world manifests
+    # use both heavily — swift-collections's traits carry `"""` description bodies
+    # and its `Sources/\\(name)` path building uses interpolation.
 
 
 def _balanced_close(text: str, open_idx: int) -> int:
     """Walk text from `open_idx` (which must point at one of `(`, `[`, `{`)
     to the matching closing bracket, returning its index. Skips over Swift
-    string literals (`"..."` with `\\"` escapes), `// ...` line comments, and
-    `/* ... */` block comments. Returns -1 if no matching close is found.
+    string literals (double-quoted with `\\"` escapes, plus triple-quoted
+    multi-line strings), `// ...` line comments, and `/* ... */` block
+    comments. Returns -1 if no matching close is found.
 
-    Does NOT handle Swift multi-line triple-quoted strings or raw
-    strings. `\\(...)` string interpolation IS handled by recursing
-    through this same walker to find the closing `)` of the interpolation
-    expression, then resuming string mode. Callers should still run
+    Does NOT handle Swift raw strings (`#"..."#`). `\\(...)` string
+    interpolation IS handled by recursing through this same walker to
+    find the closing `)` of the interpolation expression, then resuming
+    string mode. Callers should still run
     `_assert_no_unsupported_swift_constructs` on the full manifest text
     so the unsupported constructs that remain fail loudly with a targeted
     PrepareError instead of being silently mis-parsed.
@@ -341,6 +549,16 @@ def _balanced_close(text: str, open_idx: int) -> int:
                 i += 1
             if block_depth > 0:
                 return -1
+            continue
+        # Triple-quoted multi-line string: skip to one past the closing
+        # `"""`. MUST be checked before the single-quote handler since
+        # `"""` begins with `"`. The interior is opaque text — we only
+        # need to find the closer to resume bracket-balancing.
+        if c == '"' and i + 2 < n and text[i + 1] == '"' and text[i + 2] == '"':
+            close_idx = _skip_triple_quoted_string(text, i)
+            if close_idx == -1:
+                return -1
+            i = close_idx
             continue
         # String literal: skip to closing quote, honoring `\\"` escapes
         # and `\(...)` interpolation. Interpolation embeds an arbitrary
@@ -437,6 +655,15 @@ def _flatten_to_top_level(span: str) -> str:
                     i += 2
                     continue
                 i += 1
+            continue
+        # Triple-quoted multi-line string: copy verbatim. MUST be checked
+        # before the single-quote handler since `"""` begins with `"`.
+        if c == '"' and i + 2 < n and span[i + 1] == '"' and span[i + 2] == '"':
+            close_idx = _skip_triple_quoted_string(span, i)
+            if close_idx == -1:
+                break
+            out.append(span[i:close_idx])
+            i = close_idx
             continue
         if c == '"':
             j = i + 1
@@ -961,6 +1188,131 @@ def edit_inject_or_extend_overlay_binary_targets(
     )
 
 
+_TARGET_LOOP_RE = re.compile(
+    r"\bfor\s+(\w+)\s+in\s+package\.targets\b"
+)
+
+
+def edit_guard_target_loops_from_overlay(manifest_text: str) -> str:
+    """Augment any top-level `for <var> in package.targets [where <expr>]`
+    loop with a `_SPM2XC_OVERLAY_NAMES.contains(<var>.name)` exclusion,
+    so overlay-injected binaryTargets aren't subjected to settings
+    mutations the post-loop applies to "all" non-system targets.
+
+    Real-world trigger: swift-perception 1.6.0 ends its manifest with
+
+        for target in package.targets where target.type != .system {
+          target.swiftSettings = target.swiftSettings ?? []
+          target.swiftSettings?.append(contentsOf: [
+            .enableExperimentalFeature("StrictConcurrency"),
+          ])
+        }
+
+    Once the dedup-overlap overlay injects `Target.binaryTarget(...)`
+    entries into the targets array, this loop applies `swiftSettings`
+    to them too. SPM rejects swiftSettings on binaryTargets — the round-
+    trip validator fails with: "target 'P' is assigned a property
+    'settings' which is not accepted for the binary target type".
+
+    Behaviour:
+      - No-op if the manifest has no overlay sentinel (no overlay block
+        present → nothing to guard).
+      - For each matched loop, AND `!_SPM2XC_OVERLAY_NAMES.contains(<var>.name)`
+        into the existing `where` clause, or insert the clause when no
+        `where` is present.
+      - Idempotent: a loop whose `where` clause already mentions
+        `_SPM2XC_OVERLAY_NAMES` is left untouched.
+      - Skips matches inside strings or comments (uses
+        `_make_code_token_view`).
+      - Conservatively skips matches whose loop body opener can't be
+        located (depth-tracked search for `{` past the loop header).
+    """
+    if _OVERLAY_SENTINEL_BEGIN not in manifest_text:
+        return manifest_text
+
+    code = _make_code_token_view(manifest_text)
+    n = len(code)
+
+    edits: List[Tuple[int, int, str]] = []
+    for m in _TARGET_LOOP_RE.finditer(code):
+        var_name = m.group(1)
+        if var_name == _OVERLAY_NAMES_VAR:
+            continue
+        cursor = m.end()
+        while cursor < n and code[cursor] in " \t\n":
+            cursor += 1
+        has_where = False
+        where_expr_start = -1
+        where_expr_end = -1
+        if (
+            code[cursor : cursor + 5] == "where"
+            and (
+                cursor + 5 == n
+                or not (code[cursor + 5].isalnum() or code[cursor + 5] == "_")
+            )
+        ):
+            has_where = True
+            where_expr_start = cursor + 5
+            while (
+                where_expr_start < n and code[where_expr_start] in " \t\n"
+            ):
+                where_expr_start += 1
+            scan = where_expr_start
+            depth_paren = 0
+            depth_bracket = 0
+            brace_idx = -1
+            while scan < n:
+                ch = code[scan]
+                if ch == "(":
+                    depth_paren += 1
+                elif ch == ")":
+                    depth_paren -= 1
+                elif ch == "[":
+                    depth_bracket += 1
+                elif ch == "]":
+                    depth_bracket -= 1
+                elif (
+                    ch == "{" and depth_paren == 0 and depth_bracket == 0
+                ):
+                    brace_idx = scan
+                    break
+                scan += 1
+            if brace_idx == -1:
+                continue
+            where_expr_end = brace_idx
+            while (
+                where_expr_end > where_expr_start
+                and code[where_expr_end - 1] in " \t\n"
+            ):
+                where_expr_end -= 1
+            existing_expr = manifest_text[where_expr_start:where_expr_end]
+            if _OVERLAY_NAMES_VAR in existing_expr:
+                continue
+            replacement = (
+                f"({existing_expr.strip()})"
+                f" && !{_OVERLAY_NAMES_VAR}.contains({var_name}.name)"
+            )
+            edits.append((where_expr_start, where_expr_end, replacement))
+        else:
+            insert_at = m.end()
+            replacement = (
+                f" where !{_OVERLAY_NAMES_VAR}.contains({var_name}.name)"
+            )
+            edits.append((insert_at, insert_at, replacement))
+
+    if not edits:
+        return manifest_text
+
+    out_parts: List[str] = []
+    last = 0
+    for start, end, text in edits:
+        out_parts.append(manifest_text[last:start])
+        out_parts.append(text)
+        last = end
+    out_parts.append(manifest_text[last:])
+    return "".join(out_parts)
+
+
 _DEPENDENCIES_LABEL_RE = re.compile(r"\bdependencies\s*:")
 
 
@@ -1007,6 +1359,16 @@ def _strip_comments_to_spaces(span: str) -> str:
                 if out[k] != "\n":
                     out[k] = " "
             i = j
+            continue
+        # Triple-quoted multi-line string: skip past via the dedicated
+        # helper so a `"""` opener isn't misread as an empty single-quoted
+        # string followed by code. Body stays verbatim in `out` (which
+        # was initialised from `list(span)`).
+        if c == '"' and i + 2 < n and span[i + 1] == '"' and span[i + 2] == '"':
+            close_idx = _skip_triple_quoted_string(span, i)
+            if close_idx == -1:
+                break
+            i = close_idx
             continue
         if c == '"':
             # Skip past string literals so a // or /* inside a string
@@ -1087,6 +1449,18 @@ def _collect_depth_zero_string_literals(span: str) -> set:
                     continue
                 j += 1
             i = j
+            continue
+        # Triple-quoted multi-line strings are NOT collected as dep-name
+        # candidates: their bodies are arbitrary multi-line text, not
+        # identifiers. Skip past via the dedicated helper so a `"""`
+        # opener isn't misread as an empty single-quoted string followed
+        # by code (which could then leak in-body characters into the
+        # next round of state).
+        if c == '"' and i + 2 < n and span[i + 1] == '"' and span[i + 2] == '"':
+            close_idx = _skip_triple_quoted_string(span, i)
+            if close_idx == -1:
+                break
+            i = close_idx
             continue
         if c == '"':
             j = i + 1
@@ -1331,6 +1705,16 @@ def _find_depth_zero_string_literal_positions(
                     continue
                 j += 1
             i = j
+            continue
+        # Triple-quoted multi-line strings: not eligible matches for a
+        # single-line `target_value`. Skip past via the dedicated helper
+        # so a `"""` opener isn't misread as an empty single-quoted
+        # string followed by code.
+        if c == '"' and i + 2 < end and body[i + 1] == '"' and body[i + 2] == '"':
+            close_idx = _skip_triple_quoted_string(body, i)
+            if close_idx == -1 or close_idx > end:
+                break
+            i = close_idx
             continue
         if c == '"':
             lit_start = i
@@ -1624,6 +2008,15 @@ def _depth_zero_product_calls_with_name_and_package(
                 j += 1
             i = j
             continue
+        # Triple-quoted multi-line string: skip past via the dedicated
+        # helper. MUST be checked before the single-quote handler since
+        # `"""` begins with `"`.
+        if c == '"' and i + 2 < interior_end and body[i + 1] == '"' and body[i + 2] == '"':
+            close_idx = _skip_triple_quoted_string(body, i)
+            if close_idx == -1 or close_idx > interior_end:
+                break
+            i = close_idx
+            continue
         # String literal — skip over it without changing depth. Handles
         # `\(...)` interpolation the same way the other walkers do.
         if c == '"':
@@ -1865,6 +2258,15 @@ def _collect_depth_zero_target_or_byname_call_names(span: str) -> Set[str]:
                 j += 1
             i = j
             continue
+        # Triple-quoted multi-line string: skip past via the dedicated
+        # helper. MUST be checked before the single-quote handler since
+        # `"""` begins with `"`.
+        if c == '"' and i + 2 < n and span[i + 1] == '"' and span[i + 2] == '"':
+            close_idx = _skip_triple_quoted_string(span, i)
+            if close_idx == -1:
+                break
+            i = close_idx
+            continue
         if c == '"':
             j = i + 1
             while j < n:
@@ -2035,6 +2437,15 @@ def _depth_zero_product_calls_with_package_in_set(
                     continue
                 j += 1
             i = j
+            continue
+        # Triple-quoted multi-line string: skip past via the dedicated
+        # helper. MUST be checked before the single-quote handler since
+        # `"""` begins with `"`.
+        if c == '"' and i + 2 < interior_end and body[i + 1] == '"' and body[i + 2] == '"':
+            close_idx = _skip_triple_quoted_string(body, i)
+            if close_idx == -1 or close_idx > interior_end:
+                break
+            i = close_idx
             continue
         if c == '"':
             j = i + 1
@@ -2666,6 +3077,18 @@ def _depth_zero_view(span: str) -> str:
             for k in range(i, j):
                 out[k] = " "
             i = j
+            continue
+        # Triple-quoted multi-line string: blank the entire span (matches
+        # single-quoted handling here). MUST be checked before the
+        # single-quote handler since `"""` begins with `"`.
+        if c == '"' and i + 2 < n and span[i + 1] == '"' and span[i + 2] == '"':
+            close_idx = _skip_triple_quoted_string(span, i)
+            if close_idx == -1:
+                break
+            for k in range(i, close_idx):
+                if out[k] != "\n":
+                    out[k] = " "
+            i = close_idx
             continue
         if c == '"':
             j = i + 1
@@ -3673,6 +4096,14 @@ def _apply_consume_external_sibling_edits(
     edited = edit_strip_package_deps_for_identities(
         edited, identities_to_strip
     )
+
+    # Last edit step: guard any `for target in package.targets where ...`
+    # loop the manifest emits after the Package(...) call. Once the
+    # overlay injects binaryTargets into `package.targets`, a settings-
+    # mutation loop that touches "all non-system targets" hits them
+    # too and dump-package rejects the manifest because SPM doesn't
+    # allow swiftSettings on binaryTargets. See swift-perception 1.6.0.
+    edited = edit_guard_target_loops_from_overlay(edited)
 
     if edited != text:
         manifest_path.write_text(edited)

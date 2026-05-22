@@ -448,6 +448,23 @@ _SYSTEM_MODULE_ALLOWLIST: set[str] = {
     "OSLog", "Observation", "Synchronization",
     "MachO", "MetricKit", "PDFKit",
     "XCTest", "Testing",
+    # iOS / macOS frameworks Kingfisher-class consumer libraries reach for.
+    "CarPlay",  # Driving-mode UI; conditionally imported by media-display libs.
+    "MobileCoreServices",  # Pre-iOS-14 UTI/MIME constants. Deprecated but still imported.
+    "UniformTypeIdentifiers",  # iOS 14+ replacement for MobileCoreServices.
+    "VisionKit", "Vision", "NaturalLanguage", "Speech", "SoundAnalysis",
+    "Intents", "IntentsUI", "WidgetKit", "ActivityKit",
+    "HomeKit", "HealthKit", "ARKit",
+    "AdSupport", "AppTrackingTransparency",
+    "CallKit", "PushKit", "FileProvider", "FileProviderUI",
+    "WatchConnectivity", "ExternalAccessory", "MultipeerConnectivity",
+    "NetworkExtension", "LinkPresentation", "QuickLook", "QuickLookThumbnailing",
+    "VideoToolbox", "AudioToolbox", "AudioUnit",
+    "ServiceManagement", "DeviceCheck",
+    "ClockKit",  # WatchKit complications API
+    "TVServices", "TVMLKit", "TVUIKit",  # tvOS
+    "Translation", "Charts",  # Newer iOS/macOS additions
+    "ScreenCaptureKit",
     # System C / Darwin modules Apple ships via SDK module maps.
     "SQLite3", "sqlite3", "zlib", "bzip2", "iconv", "libxml2", "libcurl",
     "pthread", "dispatch", "objc", "mach", "mach_o", "dyld", "dlfcn",

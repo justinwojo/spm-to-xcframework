@@ -2321,6 +2321,454 @@ let package = Package(name: "x", products: [], dependencies: [])
     _assert(raised, "expected PrepareUserError when targets: arg is absent")
 
 
+def _selftest_cross_sibling_product_expansion(tmp_root: Path) -> None:
+    """Sibling A references product P of sibling B via `.product(...)`,
+    but the umbrella never names P. The orchestrator's
+    `_expand_cross_sibling_referenced_products` must merge P into B's
+    `referenced_products` so the orchestrator builds B's
+    P.xcframework — without it, A.swiftinterface dangles on `import P`
+    when consumed downstream.
+    """
+    work = tmp_root / "cross-sibling"
+    work.mkdir(parents=True, exist_ok=True)
+    sibling_a_dir = work / "swift-case-paths"
+    sibling_b_dir = work / "xctest-dynamic-overlay"
+    sibling_a_dir.mkdir(parents=True, exist_ok=True)
+    sibling_b_dir.mkdir(parents=True, exist_ok=True)
+    # A imports both `IssueReporting` and `XCTestDynamicOverlay` from B.
+    (sibling_a_dir / "Package.swift").write_text(
+        '''// swift-tools-version: 5.9
+import PackageDescription
+let package = Package(
+  name: "swift-case-paths",
+  products: [.library(name: "CasePaths", targets: ["CasePaths"])],
+  dependencies: [
+    .package(url: "https://github.com/pointfreeco/xctest-dynamic-overlay", from: "1.2.2"),
+  ],
+  targets: [
+    .target(
+      name: "CasePaths",
+      dependencies: [
+        .product(name: "IssueReporting", package: "xctest-dynamic-overlay"),
+        .product(name: "XCTestDynamicOverlay", package: "xctest-dynamic-overlay"),
+      ]
+    ),
+  ]
+)
+'''
+    )
+    (sibling_b_dir / "Package.swift").write_text(
+        '''// swift-tools-version: 5.9
+import PackageDescription
+let package = Package(
+  name: "xctest-dynamic-overlay",
+  products: [
+    .library(name: "IssueReporting", targets: ["IssueReporting"]),
+    .library(name: "XCTestDynamicOverlay", targets: ["XCTestDynamicOverlay"]),
+  ],
+  targets: [
+    .target(name: "IssueReporting"),
+    .target(name: "XCTestDynamicOverlay"),
+  ]
+)
+'''
+    )
+
+    Tp = tool.TransitivePackageInfo
+    Product = tool.Product
+    tp_a = Tp(
+        identity="swift-case-paths",
+        checkout_path=sibling_a_dir,
+        products=[
+            Product(name="CasePaths", linkage="automatic", targets=["CasePaths"]),
+        ],
+        tools_version="5.9",
+        referenced_products=["CasePaths"],
+    )
+    tp_b = Tp(
+        identity="xctest-dynamic-overlay",
+        checkout_path=sibling_b_dir,
+        products=[
+            Product(name="IssueReporting", linkage="automatic", targets=["IssueReporting"]),
+            Product(name="XCTestDynamicOverlay", linkage="automatic", targets=["XCTestDynamicOverlay"]),
+        ],
+        tools_version="5.9",
+        referenced_products=["IssueReporting"],  # umbrella only references IssueReporting
+    )
+
+    expanded = tool._expand_cross_sibling_referenced_products([tp_a, tp_b])
+    by_ident = {tp.identity: tp for tp in expanded}
+    _assert(
+        sorted(by_ident["xctest-dynamic-overlay"].referenced_products)
+        == ["IssueReporting", "XCTestDynamicOverlay"],
+        f"expected XCTestDynamicOverlay added to xctest-dynamic-overlay; "
+        f"got {by_ident['xctest-dynamic-overlay'].referenced_products}",
+    )
+    # The sibling A's products should be untouched (no other sibling refs A).
+    _assert(
+        by_ident["swift-case-paths"].referenced_products == ["CasePaths"],
+        f"unexpected change to swift-case-paths: "
+        f"{by_ident['swift-case-paths'].referenced_products}",
+    )
+
+    # Idempotency: re-running on the already-expanded list should be stable.
+    again = tool._expand_cross_sibling_referenced_products(expanded)
+    again_by_ident = {tp.identity: tp for tp in again}
+    _assert(
+        sorted(again_by_ident["xctest-dynamic-overlay"].referenced_products)
+        == ["IssueReporting", "XCTestDynamicOverlay"],
+        "expansion is not idempotent",
+    )
+
+
+def _selftest_cross_sibling_expansion_ignores_unknown_packages(
+    tmp_root: Path,
+) -> None:
+    """A `.product(name: X, package: Y)` ref whose Y is NOT in our
+    transitives must be ignored — we only build siblings we already
+    know about; foreign refs are SPM's job to resolve.
+    """
+    work = tmp_root / "cross-sibling-unknown"
+    work.mkdir(parents=True, exist_ok=True)
+    only_dir = work / "swift-case-paths"
+    only_dir.mkdir(parents=True, exist_ok=True)
+    (only_dir / "Package.swift").write_text(
+        '''import PackageDescription
+let package = Package(
+  name: "swift-case-paths",
+  targets: [
+    .target(
+      name: "CasePaths",
+      dependencies: [
+        .product(name: "Unknown", package: "some-foreign-package"),
+      ]
+    ),
+  ]
+)
+'''
+    )
+    Tp = tool.TransitivePackageInfo
+    Product = tool.Product
+    only = Tp(
+        identity="swift-case-paths",
+        checkout_path=only_dir,
+        products=[
+            Product(name="CasePaths", linkage="automatic", targets=["CasePaths"]),
+        ],
+        tools_version="5.9",
+        referenced_products=["CasePaths"],
+    )
+    expanded = tool._expand_cross_sibling_referenced_products([only])
+    _assert(
+        len(expanded) == 1
+        and expanded[0].referenced_products == ["CasePaths"],
+        f"foreign package ref leaked into expansion: "
+        f"{expanded[0].referenced_products}",
+    )
+
+
+def _selftest_cross_sibling_expansion_chains_to_fixpoint(
+    tmp_root: Path,
+) -> None:
+    """A → B → C chain: A references B's product, and B references C's
+    product. After A → B adds something, the next iteration must pick
+    up B → C too.
+    """
+    work = tmp_root / "cross-sibling-chain"
+    work.mkdir(parents=True, exist_ok=True)
+    a = work / "a"; a.mkdir(parents=True, exist_ok=True)
+    b = work / "b"; b.mkdir(parents=True, exist_ok=True)
+    c = work / "c"; c.mkdir(parents=True, exist_ok=True)
+    (a / "Package.swift").write_text(
+        '''import PackageDescription
+let package = Package(
+  name: "a",
+  targets: [.target(name: "A", dependencies: [.product(name: "B1", package: "b")])]
+)
+'''
+    )
+    (b / "Package.swift").write_text(
+        '''import PackageDescription
+let package = Package(
+  name: "b",
+  targets: [
+    .target(name: "B1"),
+    .target(name: "B2", dependencies: [.product(name: "C1", package: "c")]),
+  ]
+)
+'''
+    )
+    (c / "Package.swift").write_text("// minimal\n")
+    Tp = tool.TransitivePackageInfo
+    Product = tool.Product
+    tp_a = Tp(
+        identity="a", checkout_path=a,
+        products=[Product(name="A", linkage="automatic", targets=["A"])],
+        tools_version="5.9",
+        referenced_products=["A"],
+    )
+    tp_b = Tp(
+        identity="b", checkout_path=b,
+        products=[
+            Product(name="B1", linkage="automatic", targets=["B1"]),
+            Product(name="B2", linkage="automatic", targets=["B2"]),
+        ],
+        tools_version="5.9",
+        referenced_products=["B1"],
+    )
+    tp_c = Tp(
+        identity="c", checkout_path=c,
+        products=[Product(name="C1", linkage="automatic", targets=["C1"])],
+        tools_version="5.9",
+        referenced_products=[],
+    )
+    expanded = tool._expand_cross_sibling_referenced_products([tp_a, tp_b, tp_c])
+    by_ident = {tp.identity: tp for tp in expanded}
+    # B1 was already referenced; nothing to add for B from A's ref.
+    # B's manifest references C's C1; expansion should add C1 to C.
+    _assert(
+        by_ident["c"].referenced_products == ["C1"],
+        f"chained expansion failed; got c.referenced_products="
+        f"{by_ident['c'].referenced_products}",
+    )
+
+
+def _selftest_cross_sibling_expansion_ignores_strings_and_comments(
+    tmp_root: Path,
+) -> None:
+    """Cross-sibling expansion must NOT trigger on `.product(...)` text that
+    appears inside string literals or comments. Without the code-token-view
+    filter, a docstring or test fixture containing `.product(name: ...,
+    package: ...)` would inject a non-existent product name into the
+    target's `referenced_products` — and Plan would later reject it as an
+    unmatched product filter.
+    """
+    work = tmp_root / "cross-sibling-strings"
+    work.mkdir(parents=True, exist_ok=True)
+    a_dir = work / "a"; a_dir.mkdir(parents=True, exist_ok=True)
+    b_dir = work / "b"; b_dir.mkdir(parents=True, exist_ok=True)
+    # A's manifest mentions a `.product(name: "Fake", package: "b")` ref but
+    # ONLY inside a comment and a string literal. The real targets only
+    # reference "Real".
+    (a_dir / "Package.swift").write_text(
+        '''// swift-tools-version: 5.9
+import PackageDescription
+// Example of a cross-sibling ref: .product(name: "Fake", package: "b")
+let docs = """
+  Use .product(name: "AlsoFake", package: "b") to import sibling products.
+"""
+let package = Package(
+  name: "a",
+  targets: [
+    .target(name: "A", dependencies: [
+      .product(name: "Real", package: "b"),
+    ]),
+  ]
+)
+'''
+    )
+    (b_dir / "Package.swift").write_text(
+        '''import PackageDescription
+let package = Package(
+  name: "b",
+  products: [.library(name: "Real", targets: ["Real"])],
+  targets: [.target(name: "Real")]
+)
+'''
+    )
+    Tp = tool.TransitivePackageInfo
+    Product = tool.Product
+    tp_a = Tp(
+        identity="a", checkout_path=a_dir,
+        products=[Product(name="A", linkage="automatic", targets=["A"])],
+        tools_version="5.9", referenced_products=["A"],
+    )
+    tp_b = Tp(
+        identity="b", checkout_path=b_dir,
+        products=[
+            Product(name="Real", linkage="automatic", targets=["Real"]),
+            # "Fake" / "AlsoFake" are intentionally NOT declared so the
+            # validation arm would also reject them — but the primary
+            # defense is the code-token view skipping the matches.
+        ],
+        tools_version="5.9", referenced_products=[],
+    )
+    expanded = tool._expand_cross_sibling_referenced_products([tp_a, tp_b])
+    b_after = next(t for t in expanded if t.identity == "b")
+    _assert(
+        b_after.referenced_products == ["Real"],
+        f"strings/comments leaked into cross-sibling expansion; "
+        f"b.referenced_products={b_after.referenced_products}",
+    )
+
+
+def _selftest_cross_sibling_expansion_drops_undeclared_products(
+    tmp_root: Path,
+) -> None:
+    """If a sibling's manifest references `.product(name: X, package: Y)`
+    but Y's actual product list does not include X (drifted manifest,
+    aliased target name, etc.), the expansion must NOT add X to Y's
+    `referenced_products`. Plan would otherwise reject X as an unmatched
+    product filter when the child config runs.
+    """
+    work = tmp_root / "cross-sibling-undeclared"
+    work.mkdir(parents=True, exist_ok=True)
+    a_dir = work / "a"; a_dir.mkdir(parents=True, exist_ok=True)
+    b_dir = work / "b"; b_dir.mkdir(parents=True, exist_ok=True)
+    (a_dir / "Package.swift").write_text(
+        '''import PackageDescription
+let package = Package(
+  name: "a",
+  targets: [
+    .target(name: "A", dependencies: [
+      .product(name: "Ghost", package: "b"),
+    ]),
+  ]
+)
+'''
+    )
+    (b_dir / "Package.swift").write_text("// trivial\n")
+    Tp = tool.TransitivePackageInfo
+    Product = tool.Product
+    tp_a = Tp(
+        identity="a", checkout_path=a_dir,
+        products=[Product(name="A", linkage="automatic", targets=["A"])],
+        tools_version="5.9", referenced_products=["A"],
+    )
+    tp_b = Tp(
+        identity="b", checkout_path=b_dir,
+        # B does NOT declare "Ghost" as a product.
+        products=[Product(name="Real", linkage="automatic", targets=["Real"])],
+        tools_version="5.9", referenced_products=[],
+    )
+    expanded = tool._expand_cross_sibling_referenced_products([tp_a, tp_b])
+    b_after = next(t for t in expanded if t.identity == "b")
+    _assert(
+        b_after.referenced_products == [],
+        f"undeclared product Ghost leaked into b.referenced_products="
+        f"{b_after.referenced_products}",
+    )
+
+
+def _selftest_overlay_guard_target_loops_swift_perception_shape() -> None:
+    """swift-perception 1.6.0 ends with `for target in package.targets
+    where target.type != .system { ... swiftSettings += ... }` — once
+    the overlay injects binaryTargets the post-loop tries to apply
+    settings to them and SPM refuses. The guard augments the `where`
+    clause so binaryTargets are skipped.
+    """
+    pre = '''import PackageDescription
+
+let package = Package(
+  name: "swift-perception",
+  products: [.library(name: "Perception", targets: ["Perception"])],
+  dependencies: [],
+  targets: [
+    .target(name: "Perception"),
+  ]
+)
+
+for target in package.targets where target.type != .system {
+  target.swiftSettings = target.swiftSettings ?? []
+  target.swiftSettings?.append(contentsOf: [
+    .enableExperimentalFeature("StrictConcurrency"),
+  ])
+}
+'''
+    # First inject an overlay block (otherwise guard is a no-op).
+    with_overlay = edit_inject_or_extend_overlay_binary_targets(
+        pre, [("Perception", "./Perception.xcframework")]
+    )
+    out = edit_guard_target_loops_from_overlay(with_overlay)
+    _assert(
+        "where (target.type != .system) && !_SPM2XC_OVERLAY_NAMES.contains(target.name)"
+        in out,
+        f"guard did not augment the where clause as expected:\n{out}",
+    )
+    # Idempotency: re-running must not double-augment.
+    twice = edit_guard_target_loops_from_overlay(out)
+    _assert(
+        twice == out,
+        f"guard is not idempotent — second pass mutated the manifest:\n{twice}",
+    )
+
+
+def _selftest_overlay_guard_no_overlay_is_noop() -> None:
+    """The guard is a no-op when no overlay sentinel is present — no
+    binaryTargets are injected, so the post-loop has nothing to guard
+    against."""
+    pre = '''import PackageDescription
+let package = Package(name: "x", products: [], dependencies: [], targets: [])
+for target in package.targets where target.type != .system {
+  target.swiftSettings = []
+}
+'''
+    out = edit_guard_target_loops_from_overlay(pre)
+    _assert(out == pre, f"expected no-op without overlay sentinel; got:\n{out}")
+
+
+def _selftest_overlay_guard_inserts_where_when_absent() -> None:
+    """`for target in package.targets { ... }` (no where clause) should
+    have a fresh where clause inserted that excludes overlay names."""
+    pre = '''import PackageDescription
+
+let package = Package(
+  name: "x",
+  products: [.library(name: "Foo", targets: ["Foo"])],
+  dependencies: [],
+  targets: [.target(name: "Foo")]
+)
+
+for target in package.targets {
+  target.swiftSettings = []
+}
+'''
+    with_overlay = edit_inject_or_extend_overlay_binary_targets(
+        pre, [("Foo", "./Foo.xcframework")]
+    )
+    out = edit_guard_target_loops_from_overlay(with_overlay)
+    _assert(
+        "for target in package.targets where !_SPM2XC_OVERLAY_NAMES.contains(target.name) {"
+        in out,
+        f"guard did not insert where clause as expected:\n{out}",
+    )
+
+
+def _selftest_overlay_guard_skips_already_guarded() -> None:
+    """A where clause that already references `_SPM2XC_OVERLAY_NAMES`
+    must be left untouched — supports running the guard multiple times
+    safely AND lets users hand-edit the manifest without us clobbering
+    them."""
+    pre = '''import PackageDescription
+let package = Package(name: "x", products: [], dependencies: [], targets: [])
+// spm-to-xcframework dedup-overlap overlay — begin (auto-generated, do not edit)
+let _SPM2XC_OVERLAY_TARGETS: [Target] = []
+let _SPM2XC_OVERLAY_NAMES: Set<String> = Set(_SPM2XC_OVERLAY_TARGETS.map { $0.name })
+// spm-to-xcframework dedup-overlap overlay — end
+for target in package.targets where target.type != .system && !_SPM2XC_OVERLAY_NAMES.contains(target.name) {
+  target.swiftSettings = []
+}
+'''
+    out = edit_guard_target_loops_from_overlay(pre)
+    _assert(out == pre, f"guard mutated already-guarded loop:\n{out}")
+
+
+def _selftest_overlay_guard_skips_string_literals() -> None:
+    """A `for target in package.targets` substring inside a string or
+    comment must not be matched — the code-token view should mask it
+    out."""
+    pre = '''import PackageDescription
+let package = Package(name: "x", products: [], dependencies: [], targets: [])
+// spm-to-xcframework dedup-overlap overlay — begin (auto-generated, do not edit)
+let _SPM2XC_OVERLAY_TARGETS: [Target] = []
+let _SPM2XC_OVERLAY_NAMES: Set<String> = Set(_SPM2XC_OVERLAY_TARGETS.map { $0.name })
+// spm-to-xcframework dedup-overlap overlay — end
+let doc = "for target in package.targets where target.type != .system { stuff }"
+'''
+    out = edit_guard_target_loops_from_overlay(pre)
+    _assert(out == pre, f"guard matched inside a string literal:\n{out}")
+
+
 def _selftest_overlay_resulting_manifest_only_one_set_decl() -> None:
     """The overlay block's `let _SPM2XC_OVERLAY_NAMES = Set(...)`
     declaration must appear exactly once even after several extension
@@ -3720,24 +4168,84 @@ def _selftest_apply_dedup_overlap_substitutions_guards_unsupported_constructs(tm
     skipped — and with it the
     `_assert_no_unsupported_swift_constructs` guard. Execute-time
     dedup substitutions must therefore re-assert the guard themselves;
-    otherwise a manifest containing a triple-quoted string or `#"..."#`
-    raw string that happens to mention `.target(name: "Foo", ...)`
-    would be silently mis-parsed by `_make_code_token_view` (which only
-    tracks `"..."` strings) and the dedup edit would land inside the
-    string body.
+    otherwise a manifest containing a `#"..."#` raw string that happens
+    to mention `.target(name: "Foo", ...)` would be silently mis-parsed
+    by `_make_code_token_view` (which doesn't track raw strings) and
+    the dedup edit would land inside the string body.
 
-    Two fixtures: triple-quoted string and raw string. Each must raise
-    ExecuteError before any disk write happens. (`\\(...)` interpolation
-    is now handled by the walker via recursion, so it's no longer a
-    guarded construct — `_make_code_token_view`'s own unit test covers
-    the positive case.)
+    Raw strings remain the only construct in this guard's scope.
+    Triple-quoted strings and `\\(...)` interpolation are both
+    handled by the walker now — see
+    `_selftest_apply_dedup_overlap_substitutions_handles_triple_quoted`
+    for the positive triple-quoted case, and
+    `_selftest_make_code_token_view_blanks_strings_and_comments` for
+    interpolation coverage.
     """
     base = tmp_root / "p2_r4_dedup_guard"
     base.mkdir(parents=True, exist_ok=True)
 
-    fixtures = [
-        # Triple-quoted string carrying example .target text.
-        ('triple_quoted', '''// swift-tools-version:5.7
+    src = '''// swift-tools-version:5.7
+import PackageDescription
+
+let docs = #".target(name: "Foo", path: "OldFoo")"#
+
+let p = Package(
+    name: "x",
+    targets: [
+        .target(
+            name: "Foo",
+            path: "RealFoo"
+        ),
+    ]
+)
+'''
+    staged = base / "raw_string"
+    staged.mkdir(parents=True, exist_ok=True)
+    manifest = staged / "Package.swift"
+    manifest.write_text(src)
+    original_bytes = manifest.read_bytes()
+    try:
+        _apply_dedup_overlap_substitutions(
+            staged_dir=staged,
+            substitutions=[("Foo", Path("/build/Foo.xcframework"))],
+            unit_name="UnitX",
+            verbose=False,
+        )
+        _assert(False,
+                f"expected ExecuteError; manifest was rewritten:\n"
+                f"{manifest.read_text()}")
+    except tool.ExecuteError as exc:
+        msg = str(exc)
+        _assert("dedup-overlap" in msg,
+                f"error message missing dedup context: {msg!r}")
+        _assert(
+            "Swift" in msg or "raw string" in msg,
+            f"error message doesn't name the Swift construct: {msg!r}",
+        )
+        _assert("--no-dedup-overlap" in msg,
+                f"error message missing escape hatch hint: {msg!r}")
+    # Manifest on disk must be byte-identical to the original.
+    _assert(manifest.read_bytes() == original_bytes,
+            f"manifest was mutated despite the guard:\n"
+            f"{manifest.read_text()}")
+
+
+def _selftest_apply_dedup_overlap_substitutions_handles_triple_quoted(tmp_root: Path) -> None:
+    """A manifest with a triple-quoted multi-line string that *happens
+    to contain* `.target(name: "Foo", ...)` text must NOT cause the
+    dedup-overlap edit to land inside the string body. The real
+    `.target(...)` outside the string is rewritten to `.binaryTarget`;
+    the triple-quoted body is preserved byte-for-byte.
+
+    This is the positive counterpart to the raw-string guard test
+    above — once `_skip_triple_quoted_string` taught the walker to
+    treat `\"\"\"...\"\"\"` as opaque, the dedup edit can run safely
+    on manifests like swift-collections's where multi-line strings
+    appear in `traits:` descriptions.
+    """
+    base = tmp_root / "dedup_triple_quoted"
+    base.mkdir(parents=True, exist_ok=True)
+    src = '''// swift-tools-version:5.7
 import PackageDescription
 
 let docs = """
@@ -3753,56 +4261,366 @@ let p = Package(
         ),
     ]
 )
-'''),
-        # Raw string with the same payload.
-        ('raw_string', '''// swift-tools-version:5.7
-import PackageDescription
+'''
+    staged = base
+    manifest = staged / "Package.swift"
+    manifest.write_text(src)
 
-let docs = #".target(name: "Foo", path: "OldFoo")"#
+    _apply_dedup_overlap_substitutions(
+        staged_dir=staged,
+        substitutions=[("Foo", Path("/build/Foo.xcframework"))],
+        unit_name="UnitX",
+        verbose=False,
+    )
+    after = manifest.read_text()
+    # The triple-quoted docstring body must be byte-identical — no
+    # in-string `.target` text was touched.
+    _assert(
+        '.target(name: "Foo", path: "OldFoo")' in after,
+        f"in-string `.target` text was incorrectly rewritten:\n{after}",
+    )
+    # The real `.target(...)` call (the one with path: "RealFoo") was
+    # rewritten to `.binaryTarget(...)`.
+    _assert(
+        '.binaryTarget' in after,
+        f"expected real .target call to be rewritten to .binaryTarget:\n{after}",
+    )
+    _assert(
+        'path: "RealFoo"' not in after,
+        f"original `path: \"RealFoo\"` should be replaced by the binary path:\n{after}",
+    )
 
-let p = Package(
-    name: "x",
-    targets: [
-        .target(
-            name: "Foo",
-            path: "RealFoo"
-        ),
-    ]
-)
-'''),
-    ]
 
-    for slug, src in fixtures:
-        staged = base / slug
-        staged.mkdir(parents=True, exist_ok=True)
-        manifest = staged / "Package.swift"
-        manifest.write_text(src)
-        original_bytes = manifest.read_bytes()
-        try:
-            _apply_dedup_overlap_substitutions(
-                staged_dir=staged,
-                substitutions=[("Foo", Path("/build/Foo.xcframework"))],
-                unit_name="UnitX",
-                verbose=False,
-            )
-            _assert(False,
-                    f"[{slug}] expected ExecuteError; manifest was rewritten:\n"
-                    f"{manifest.read_text()}")
-        except tool.ExecuteError as exc:
-            msg = str(exc)
-            _assert("dedup-overlap" in msg,
-                    f"[{slug}] error message missing dedup context: {msg!r}")
-            _assert(
-                "Swift" in msg or "interpolation" in msg
-                or "raw string" in msg or "triple-quoted" in msg,
-                f"[{slug}] error message doesn't name the Swift construct: {msg!r}",
-            )
-            _assert("--no-dedup-overlap" in msg,
-                    f"[{slug}] error message missing escape hatch hint: {msg!r}")
-        # Manifest on disk must be byte-identical to the original.
-        _assert(manifest.read_bytes() == original_bytes,
-                f"[{slug}] manifest was mutated despite the guard:\n"
-                f"{manifest.read_text()}")
+def _selftest_skip_triple_quoted_string_handles_interpolation() -> None:
+    """[codex-review r1 Medium] `_skip_triple_quoted_string` must recurse
+    through `\\(...)` interpolation. Swift legally allows a nested
+    triple-quoted string literal inside the interpolation expression of
+    an outer triple-quoted string. The naive 2-char-escape treatment of
+    `\\(` would let that nested `\"\"\"` masquerade as the outer closer
+    and cause the walker to think the outer string ends prematurely.
+    """
+    triple = chr(34) * 3
+    # Case 1: nested triple-quoted string inside interpolation.
+    text = f'let x = {triple}\nA \\({triple}\ninner\n{triple}) B\n{triple}\nrest'
+    open_idx = text.index(triple)
+    close_idx = tool._skip_triple_quoted_string(text, open_idx)
+    _assert(close_idx != -1, "interpolation-bearing triple-quoted string was reported unterminated")
+    # The closer must be the OUTER triple-quote (the one before "rest"),
+    # not the nested one inside the interpolation.
+    expected_close = text.rindex(triple) + 3
+    _assert(close_idx == expected_close,
+            f"expected outer closer at {expected_close} (start of 'rest'); got {close_idx}")
+    # Case 2: interpolation with non-string content (sanity).
+    text2 = f'let y = {triple}\nA \\(1 + 2) B\n{triple}\n'
+    open2 = text2.index(triple)
+    close2 = tool._skip_triple_quoted_string(text2, open2)
+    _assert(close2 != -1, "simple interpolation case reported unterminated")
+    _assert(close2 == text2.rindex(triple) + 3,
+            f"plain interpolation close mismatch: got {close2}")
+    # Case 3: interpolation with unmatched paren → conservative -1.
+    text3 = f'let z = {triple}\n\\(unmatched\n{triple}\n'
+    open3 = text3.index(triple)
+    close3 = tool._skip_triple_quoted_string(text3, open3)
+    _assert(close3 == -1, f"expected -1 on unmatched interpolation paren; got {close3}")
+
+
+def _selftest_apply_dedup_overlap_substitutions_triple_quoted_interpolation(tmp_root: Path) -> None:
+    """[codex-review r1 Medium] Integration-flavored case: a triple-quoted
+    string whose `\\(...)` interpolation contains a nested triple-quoted
+    string with a `.target(name: "Foo", ...)` literal. The outer string
+    must be treated as opaque end-to-end so the real `.target(...)`
+    call below it is the one rewritten.
+    """
+    base = tmp_root / "dedup_triple_quoted_interp"
+    base.mkdir(parents=True, exist_ok=True)
+    triple = chr(34) * 3
+    src = (
+        '// swift-tools-version:5.7\n'
+        'import PackageDescription\n'
+        '\n'
+        f'let docs = {triple}\n'
+        f'prefix \\({triple}\n'
+        '.target(name: "Foo", path: "InsideInterpolation")\n'
+        f'{triple}.uppercased()) suffix\n'
+        f'{triple}\n'
+        '\n'
+        'let p = Package(\n'
+        '    name: "x",\n'
+        '    targets: [\n'
+        '        .target(\n'
+        '            name: "Foo",\n'
+        '            path: "RealFoo"\n'
+        '        ),\n'
+        '    ]\n'
+        ')\n'
+    )
+    staged = base
+    manifest = staged / "Package.swift"
+    manifest.write_text(src)
+
+    _apply_dedup_overlap_substitutions(
+        staged_dir=staged,
+        substitutions=[("Foo", Path("/build/Foo.xcframework"))],
+        unit_name="UnitX",
+        verbose=False,
+    )
+    after = manifest.read_text()
+    _assert(
+        '.target(name: "Foo", path: "InsideInterpolation")' in after,
+        f"nested-interpolation in-string `.target` was incorrectly rewritten:\n{after}",
+    )
+    _assert(
+        '.binaryTarget' in after,
+        f"expected real .target call to be rewritten to .binaryTarget:\n{after}",
+    )
+    _assert(
+        'path: "RealFoo"' not in after,
+        f"original `path: \"RealFoo\"` should be replaced by the binary path:\n{after}",
+    )
+
+
+def _selftest_unsupported_swift_constructs_allows_rawstring_mention_in_triple_quoted_body() -> None:
+    # [codex-review r1 Low] A `traits:` description (or any other
+    # multi-line string body) that legitimately mentions raw-string
+    # syntax in prose must NOT trip the raw-string guard. Triple-quoted
+    # bodies are blanked before the `#"` scan; single-quoted strings
+    # are still scanned (matching the documented heuristic).
+    triple = chr(34) * 3
+    src = (
+        '// swift-tools-version:5.7\n'
+        'import PackageDescription\n'
+        f'let docs = {triple}\n'
+        'See also `#"some raw text"#` — Swift docs say this is a raw string.\n'
+        f'{triple}\n'
+        'let p = Package(name: "x")\n'
+    )
+    # Should NOT raise.
+    tool._assert_no_unsupported_swift_constructs(src)
+    # Sanity: a REAL #" outside a triple-quoted string still raises.
+    bad = '// swift-tools-version:5.7\nlet s = #"hello"#\n'
+    try:
+        tool._assert_no_unsupported_swift_constructs(bad)
+    except tool.PrepareUserError as exc:
+        _assert("raw string" in str(exc),
+                f"expected raw-string error; got: {exc}")
+    else:
+        _assert(False, "expected PrepareUserError on real raw-string use")
+    # [codex-review r2 Medium] A RAW triple-quoted string (`#"""..."""#`)
+    # must still be rejected. The selective blanker must NOT hide the
+    # `#"` opener when it's the start of a raw triple-quoted literal,
+    # otherwise the raw-string guard silently passes a construct the
+    # walker can't handle.
+    raw_triple = (
+        '// swift-tools-version:5.7\n'
+        'let s = #' + chr(34) * 3 + '\nhello\n' + chr(34) * 3 + '#\n'
+    )
+    try:
+        tool._assert_no_unsupported_swift_constructs(raw_triple)
+    except tool.PrepareUserError as exc:
+        _assert("raw string" in str(exc),
+                f"expected raw-string error on raw triple; got: {exc}")
+    else:
+        _assert(False, "expected PrepareUserError on raw triple-quoted string")
+    # [codex-review r3 Medium] A raw string `#"..."#` embedded inside an
+    # interpolation expression `\(...)` of an ORDINARY triple-quoted
+    # string is real Swift code and must still trip the guard. The
+    # selective blanker must preserve interpolation expression text
+    # so the `#"` scan sees the raw literal nested inside `\(...)`.
+    embedded_raw = (
+        '// swift-tools-version:5.7\n'
+        'let s = ' + chr(34) * 3 + '\n\\(#"raw"#)\n' + chr(34) * 3 + '\n'
+    )
+    try:
+        tool._assert_no_unsupported_swift_constructs(embedded_raw)
+    except tool.PrepareUserError as exc:
+        _assert("raw string" in str(exc),
+                f"expected raw-string error on interpolation-embedded raw; got: {exc}")
+    else:
+        _assert(False,
+                "expected PrepareUserError on raw string inside triple-quoted interpolation")
+    # [grok-cli-review r3 Low] Once a raw triple-quoted span is
+    # detected, the helper must skip past the WHOLE span (opener +
+    # body + closer, with matching hash count) — not just one
+    # character past the opener. Otherwise the closer's `"""` is
+    # mis-parsed as an ordinary triple opener, pushing a phantom
+    # prose frame that blanks every char after the raw triple.
+    # Without this property the helper's behavior diverges from
+    # its documented contract ("raw triples are left ENTIRELY
+    # intact") even though the guard's safety property still holds.
+    raw_then_code = (
+        'let s = #' + chr(34) * 3 + '\nhello\n' + chr(34) * 3 + '#\nlet x = 1\n'
+    )
+    blanked = tool._blank_triple_quoted_bodies(raw_then_code)
+    _assert(blanked == raw_then_code,
+            "raw triple span must be preserved verbatim; "
+            f"got divergence at idx {next((i for i,(a,b) in enumerate(zip(blanked, raw_then_code)) if a != b), -1)}")
+    # And with a 2-hash raw triple (`##\"\"\"...\"\"\"##`), same property:
+    raw2 = (
+        'let s = ##' + chr(34) * 3 + '\nbody\n' + chr(34) * 3 + '##\nlet y = 2\n'
+    )
+    blanked2 = tool._blank_triple_quoted_bodies(raw2)
+    _assert(blanked2 == raw2,
+            "2-hash raw triple span must be preserved verbatim")
+
+
+def _selftest_prune_child_strips_test_targets() -> None:
+    # Surfaced by swift-perception (TCA transitive, 2026-05-21): the
+    # package's `PerceptionMacrosTests` testTarget referenced
+    # `.product(name: "MacroTesting", package: "swift-macro-testing")`.
+    # Pass C correctly identified `swift-macro-testing` as unused by any
+    # library product and pruned it from the dependencies array, but the
+    # dangling `.product()` reference inside the testTarget then made
+    # `swift package dump-package` reject the pruned manifest.
+    # Pass B (`_strip_test_targets`) drops `.testTarget(...)` entries
+    # from the `targets:` array upfront so Pass C runs on a manifest
+    # where no testTarget references survive to dangle.
+    src = (
+        '// swift-tools-version: 5.9\n'
+        'import PackageDescription\n'
+        'let package = Package(\n'
+        '  name: "swift-perception",\n'
+        '  products: [.library(name: "Perception", targets: ["Perception"])],\n'
+        '  dependencies: [\n'
+        '    .package(url: "https://github.com/pointfreeco/swift-macro-testing", from: "0.1.0"),\n'
+        '    .package(url: "https://github.com/swiftlang/swift-syntax", from: "509.0.0"),\n'
+        '  ],\n'
+        '  targets: [\n'
+        '    .target(name: "Perception", dependencies: ["PerceptionMacros"]),\n'
+        '    .testTarget(name: "PerceptionTests", dependencies: ["Perception"]),\n'
+        '    .macro(name: "PerceptionMacros", dependencies: [\n'
+        '      .product(name: "SwiftSyntaxMacros", package: "swift-syntax"),\n'
+        '    ]),\n'
+        '    .testTarget(name: "PerceptionMacrosTests", dependencies: [\n'
+        '      "PerceptionMacros",\n'
+        '      .product(name: "MacroTesting", package: "swift-macro-testing"),\n'
+        '    ]),\n'
+        '  ]\n'
+        ')\n'
+    )
+    out, reasons = tool._strip_test_targets(src)
+    _assert(".testTarget(" not in out,
+            f"Pass B should drop every .testTarget(...) entry; got:\n{out}")
+    _assert(".target(name: \"Perception\"" in out,
+            "Pass B must not strip non-test targets")
+    _assert(".macro(name: \"PerceptionMacros\"" in out,
+            "Pass B must not strip macro targets")
+    names = sorted(reasons)
+    _assert(names == [
+        ".testTarget(PerceptionMacrosTests)",
+        ".testTarget(PerceptionTests)",
+    ], f"unexpected removal reasons: {reasons}")
+    # No-op case: a manifest with no testTargets is byte-identical.
+    no_tests = (
+        'let package = Package(\n'
+        '  name: "x",\n'
+        '  targets: [.target(name: "X")]\n'
+        ')\n'
+    )
+    out2, reasons2 = tool._strip_test_targets(no_tests)
+    _assert(out2 == no_tests and not reasons2,
+            "Pass B must no-op when no testTargets present")
+    # Non-literal `targets:` (e.g., `targets: libTargets + testTargets`)
+    # must safely no-op rather than mangle.
+    non_literal = (
+        'let testTargets: [Target] = [.testTarget(name: "T")]\n'
+        'let libTargets: [Target] = [.target(name: "L")]\n'
+        'let package = Package(\n'
+        '  name: "x",\n'
+        '  targets: libTargets + testTargets\n'
+        ')\n'
+    )
+    out3, reasons3 = tool._strip_test_targets(non_literal)
+    _assert(out3 == non_literal and not reasons3,
+            "Pass B must no-op on non-literal targets: expression")
+
+
+def _selftest_walkers_dispatch_triple_quoted_before_single_quoted() -> None:
+    # [grok-cli-review r1 Medium] Every depth-aware walker in prepare.py
+    # that has its own string-skipping state machine must detect a
+    # triple-quote opener BEFORE falling into the single-quote handler.
+    # Otherwise the first quote of the opener is treated as an empty
+    # single-quoted string and the body becomes "code" to the rest of
+    # the walker — enabling false-match of .target(...) literals inside
+    # what is actually opaque multi-line text.
+    #
+    # Test strategy: build a span containing a triple-quoted literal
+    # whose body holds tokens each walker would otherwise latch onto,
+    # plus a real depth-0 token outside the string. Assert the walker
+    # returns only the real token / position / collection.
+    triple = chr(34) * 3
+    # `_flatten_to_top_level`: a triple-quoted literal at depth-0 must
+    # appear verbatim in the flattened output (like a single-quoted
+    # literal at depth-0 would). Anything inside paren-nested scope is
+    # collapsed to a single space by design — so the test stages the
+    # triple-quoted at depth-0.
+    flat_in = f'let docs = {triple}\n.target(name: "Inside")\n{triple}\nlet a = b'
+    flat = tool._flatten_to_top_level(flat_in)
+    _assert(triple in flat,
+            f"_flatten_to_top_level lost triple-quoted span: {flat!r}")
+    _assert('.target(name: "Inside")' in flat,
+            f"_flatten_to_top_level lost triple-quoted body: {flat!r}")
+
+    # `_strip_comments_to_spaces`: triple-quoted body must round-trip
+    # byte-identical (no comments to strip; string preserved).
+    src1 = f'let d = {triple}\n.target(name: "Inside") // not a comment\n/* nor this */\n{triple}\nlet real = 1\n'
+    stripped = tool._strip_comments_to_spaces(src1)
+    _assert(len(stripped) == len(src1),
+            "_strip_comments_to_spaces changed length")
+    _assert(triple in stripped,
+            "_strip_comments_to_spaces destroyed triple-quoted delimiters")
+    _assert(".target(name:" in stripped,
+            "_strip_comments_to_spaces should preserve string body verbatim")
+
+    # `_collect_depth_zero_string_literals`: triple-quoted body must NOT
+    # be collected (it's not a single-line dep name). A real depth-0
+    # single-quoted string outside it must be collected. Both staged
+    # at depth-0 to match the function's contract.
+    src2 = f'{triple}\nFakeName\n{triple} "RealName"'
+    lits = tool._collect_depth_zero_string_literals(src2)
+    _assert("RealName" in lits,
+            f"_collect_depth_zero_string_literals missed real literal: {lits!r}")
+    _assert("FakeName" not in lits and "\nFakeName\n" not in lits,
+            f"_collect_depth_zero_string_literals leaked triple-quoted body: {lits!r}")
+
+    # `_find_depth_zero_string_literal_positions`: same shape, position API.
+    src3 = f'{triple}\nGhost\n{triple} "Marker"'
+    positions = tool._find_depth_zero_string_literal_positions(
+        src3, 0, len(src3), "Marker"
+    )
+    _assert(len(positions) == 1,
+            f"expected exactly one 'Marker' match; got {positions!r}")
+    _assert(src3[positions[0][0]:positions[0][1]] == '"Marker"',
+            f"position span mismatch: {src3[positions[0][0]:positions[0][1]]!r}")
+    positions_ghost = tool._find_depth_zero_string_literal_positions(
+        src3, 0, len(src3), "Ghost"
+    )
+    _assert(positions_ghost == [],
+            f"should not match 'Ghost' inside a triple-quoted body: {positions_ghost!r}")
+
+    # `_collect_depth_zero_target_or_byname_call_names`: a `.target(name:...)`
+    # literal embedded inside a triple-quoted body must NOT be collected.
+    src4 = (
+        f'let pkg = Package(targets: [{triple}\n'
+        '.target(name: "Phantom")\n'
+        f'{triple}, .target(name: "Real")])'
+    )
+    # The function operates on the body inside `targets:[...]`. Build that span.
+    open_idx = src4.index("[", src4.index("targets:"))
+    close_idx = tool._balanced_close(src4, open_idx)
+    body = src4[open_idx + 1:close_idx]
+    names = tool._collect_depth_zero_target_or_byname_call_names(body)
+    _assert("Real" in names,
+            f"missed real .target name: {names!r}")
+    _assert("Phantom" not in names,
+            f"leaked .target name from inside triple-quoted body: {names!r}")
+
+    # `_depth_zero_view`: the triple-quoted span must be blanked.
+    src5 = f'let pkg = Package(targets: [{triple}\n.target(name: "Phantom")\n{triple}])'
+    view = tool._depth_zero_view(src5)
+    _assert(len(view) == len(src5),
+            "_depth_zero_view length must match input")
+    _assert("Phantom" not in view,
+            f"_depth_zero_view leaked triple-quoted body: {view!r}")
 
 
 def _selftest_make_code_token_view_blanks_strings_and_comments() -> None:
@@ -3962,15 +4780,18 @@ def _selftest_parse_xcresult_build_results() -> None:
 
 def _selftest_unsupported_swift_constructs() -> None:
     """The Prepare safety net rejects Package.swift files containing Swift
-    constructs the balanced-paren walker can't reason about: raw strings
-    and triple-quoted strings. Each variant should raise PrepareUserError
-    (clean message path — the user's manifest, not a tool bug) with a
-    targeted message rather than allowing the walker to silently
-    mis-parse.
+    constructs the balanced-paren walker can't reason about: raw strings.
+    These raise PrepareUserError (clean message path — the user's
+    manifest, not a tool bug) with a targeted message rather than
+    allowing the walker to silently mis-parse.
 
-    `\\(...)` string interpolation is intentionally NOT rejected — the
-    walker handles it via recursion through itself in the string-skip
-    path (real manifests like swift-collections use it heavily).
+    `\\(...)` string interpolation and `\"\"\"...\"\"\"` triple-quoted
+    multi-line strings are intentionally NOT rejected — the walker
+    handles interpolation via recursion through itself, and triple-
+    quoted strings via the `_skip_triple_quoted_string` helper (real
+    manifests like swift-collections use both heavily — its `traits:`
+    block uses multi-line descriptions, and its target paths use
+    `"Sources/\\(name)"` interpolation).
     """
     # Plain manifests pass through.
     _assert_no_unsupported_swift_constructs(
@@ -3980,6 +4801,12 @@ def _selftest_unsupported_swift_constructs() -> None:
     # close paren of the embedded expression and resumes string mode.
     _assert_no_unsupported_swift_constructs(
         '// swift-tools-version:5.7\nlet x = "name=\\(foo)"\n'
+    )
+    # Triple-quoted multi-line string pass-through: walker skips to the
+    # closing `"""`. swift-collections's `.trait(description: """...""")`
+    # block is the canonical real-world case.
+    _assert_no_unsupported_swift_constructs(
+        '// swift-tools-version:5.7\nlet x = """\nhi\n"""\n'
     )
 
     def _expect_raise(text: str, hint: str) -> None:
@@ -3995,7 +4822,6 @@ def _selftest_unsupported_swift_constructs() -> None:
         raise AssertionError(f"expected PrepareUserError for {hint!r}")
 
     _expect_raise('let x = #"hi"#\n', "raw string")
-    _expect_raise('let x = """\nhi\n"""\n', "triple-quoted")
 
 
 def _selftest_unsupported_swift_constructs_comment_aware() -> None:
@@ -4053,10 +4879,12 @@ def _selftest_unsupported_swift_constructs_comment_aware() -> None:
         'let x = #"actual raw"#\n',
         "raw string",
     )
-    _expect_reject(
+    # A real triple-quoted string is no longer a rejected construct —
+    # the walker handles it via `_skip_triple_quoted_string`. Verify
+    # the safety net leaves it alone even after a comment-aware strip.
+    _assert_no_unsupported_swift_constructs(
         '/* safe comment */\n'
-        'let x = """\nreal triple\n"""\n',
-        "triple-quoted",
+        'let x = """\nreal triple\n"""\n'
     )
     # `\(...)` interpolation is no longer a guarded construct: the walker
     # handles it via recursion. Verify the safety net leaves it alone
@@ -9265,6 +10093,26 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          _selftest_overlay_missing_targets_arg_raises, False),
         ("dedup-overlap overlay: only ONE Set/array decl after 5 extension calls",
          _selftest_overlay_resulting_manifest_only_one_set_decl, False),
+        ("cross-sibling expansion: adds re-exported product (XCTestDynamicOverlay case)",
+         lambda: _selftest_cross_sibling_product_expansion(tmp_root), False),
+        ("cross-sibling expansion: ignores refs to unknown packages",
+         lambda: _selftest_cross_sibling_expansion_ignores_unknown_packages(tmp_root), False),
+        ("cross-sibling expansion: chains to fixpoint (A→B→C)",
+         lambda: _selftest_cross_sibling_expansion_chains_to_fixpoint(tmp_root), False),
+        ("cross-sibling expansion: ignores matches inside strings + comments",
+         lambda: _selftest_cross_sibling_expansion_ignores_strings_and_comments(tmp_root), False),
+        ("cross-sibling expansion: drops products the owner doesn't declare",
+         lambda: _selftest_cross_sibling_expansion_drops_undeclared_products(tmp_root), False),
+        ("overlay guard: augments `for target in package.targets where ...` (swift-perception shape)",
+         _selftest_overlay_guard_target_loops_swift_perception_shape, False),
+        ("overlay guard: no-op without overlay sentinel",
+         _selftest_overlay_guard_no_overlay_is_noop, False),
+        ("overlay guard: inserts `where` clause when loop has none",
+         _selftest_overlay_guard_inserts_where_when_absent, False),
+        ("overlay guard: skips already-guarded loops (idempotency)",
+         _selftest_overlay_guard_skips_already_guarded, False),
+        ("overlay guard: ignores matches inside string literals",
+         _selftest_overlay_guard_skips_string_literals, False),
         ("dedup-overlap routing: wrapper-style manifest routed through overlay edit",
          lambda: _selftest_dedup_routes_wrapper_manifest_through_overlay(tmp_root), False),
         ("phantom-helper: edit_augment_target_dependencies appends to nonempty array",
@@ -9325,8 +10173,20 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          _selftest_edit_replace_with_binary_target_skips_string_literal, False),
         ("dedup-overlap [Codex P2 r3]: _make_code_token_view blanks strings + comments, preserves offsets",
          _selftest_make_code_token_view_blanks_strings_and_comments, False),
-        ("dedup-overlap [Codex P2 r4]: _apply_dedup_overlap_substitutions guards triple-quoted/raw/interpolation",
+        ("dedup-overlap [Codex P2 r4]: _apply_dedup_overlap_substitutions guards raw-string constructs",
          lambda: _selftest_apply_dedup_overlap_substitutions_guards_unsupported_constructs(tmp_root), False),
+        ("dedup-overlap: _apply_dedup_overlap_substitutions handles triple-quoted strings",
+         lambda: _selftest_apply_dedup_overlap_substitutions_handles_triple_quoted(tmp_root), False),
+        ("prepare: _skip_triple_quoted_string handles \\(...) interpolation (codex-review r1)",
+         _selftest_skip_triple_quoted_string_handles_interpolation, False),
+        ("dedup-overlap: triple-quoted interpolation nested triple-quoted (codex-review r1)",
+         lambda: _selftest_apply_dedup_overlap_substitutions_triple_quoted_interpolation(tmp_root), False),
+        ("prepare: depth-aware walkers dispatch triple-quoted before single-quoted (grok-cli-review r1)",
+         _selftest_walkers_dispatch_triple_quoted_before_single_quoted, False),
+        ("prepare: rawstring guard ignores #\" mention inside triple-quoted body (codex-review r1)",
+         _selftest_unsupported_swift_constructs_allows_rawstring_mention_in_triple_quoted_body, False),
+        ("prune-child: Pass B strips .testTarget(...) entries (TCA → swift-perception, 2026-05-21)",
+         _selftest_prune_child_strips_test_targets, False),
         ("dedup-overlap [Codex r3]: edit_demote_synthetic_product strips type: .dynamic (SPM multiline shape)",
          _selftest_edit_demote_synthetic_product_spm_multiline, False),
         ("dedup-overlap [Codex r3]: edit_demote_synthetic_product handles single-line library",

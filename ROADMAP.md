@@ -1,6 +1,6 @@
 # Roadmap
 
-Date: 2026-05-21
+Date: 2026-05-21 (last updated after `28863d1`)
 
 Forward-looking work plan for `spm-to-xcframework`. The mission: **95%+ of arbitrary SPM packages produce a valid xcframework on the first try**, with a UX that lets a first-time user succeed without reading the source.
 
@@ -26,16 +26,11 @@ This doc supersedes the forward-looking sections of [REFACTOR_PROPOSAL.md](REFAC
 
 ## P0 — Must-have for the mission
 
-### Swift macros / compiler plugins
+### ~~Swift macros / compiler plugins~~ — Shipped 2026-05-21
 
-Modern SPM packages increasingly ship Swift macros (`@Observable`, `@Model`, swift-syntax consumers, point-free libraries, etc.). These are declared as `.macro(...)` targets and `.plugin(...)` build-tool plugins, which the current tool doesn't model. Almost certainly the **#1 reason a 2025-era SPM package fails today** if it's not already in our matrix.
+**Shipped in `28863d1`.** `.macro` targets are pre-built host-side as executable plugins, and `-load-plugin-executable` flags are routed into the consumer's build so the umbrella module compiles against macro-expanded source. The same commit closed the transitive-sibling gap that swift-syntax-class packages depend on: external packages reachable via `.product(...)` are now built as sibling xcframeworks alongside the primary, `.product` deps are rewritten to bare-string refs against the injected binaryTargets, and `package`-scoped decls / `package import` lines in sibling swiftinterfaces are promoted to `public` so cross-binaryTarget resolution works. Matrix grew from 10/10 → 12/12 with `swift-syntax` and `swift-case-paths` added as canonical macro-consuming cases.
 
-What's involved:
-- Recognise `.macro` and `.plugin` targets in Inspect / Plan
-- Decide what shipping them means in the xcframework output — macros are host-architecture compiler plugins, not iOS/macOS runtime artifacts; they probably need to be either built-and-bundled-as-tools or surfaced as a "this package needs a macro plugin at build time" constraint on the consumer
-- The consumer's `.swiftinterface` references the macro module, so the slice-set has to satisfy whatever the bindings tooling expects
-
-Risk: deep. Likely a multi-day investigation before code lands. Spike first.
+Follow-on risks to watch as more macro-using packages land in the matrix: build-tool plugins (`.plugin(...)`, distinct from `.macro`) are not yet exercised, and macros that themselves depend on transitive binary frameworks haven't been stress-tested.
 
 ### Actionable error messages
 
@@ -54,12 +49,13 @@ Risk: moderate. Touches many code paths but each touch is small. Iterative.
 
 ### Stress-test matrix expansion
 
-Add packages that exercise paths the current 10-entry matrix doesn't reach. Candidates ordered by ROI:
+Add packages that exercise paths the current 12-entry matrix doesn't reach. Candidates ordered by ROI:
 
-1. **`apple/swift-syntax`** — ~31 internal targets. **Added 2026-05-21**; surfaced the resilience boundary issue and now passes flag-free via the try-and-fallback shipped below.
-2. **`apple/swift-async-algorithms`** — depends on swift-collections, validates `--include-deps` chain into the recent fix transitively.
-3. **`onevcat/Kingfisher`** — popular pure-Swift image library; broadens "common consumer packages" coverage.
-4. **`apple/swift-argument-parser`** — small, common, fast smoke test that pure-Swift baseline still works.
+1. ~~**`apple/swift-syntax`**~~ — ~31 internal targets. **Added 2026-05-21**; surfaced the resilience boundary issue and now passes flag-free via the try-and-fallback shipped below.
+2. ~~**`pointfreeco/swift-case-paths`**~~ — **Added in `28863d1`** as a canonical macro-consuming package.
+3. **`apple/swift-async-algorithms`** — depends on swift-collections, validates `--include-deps` chain into the recent fix transitively.
+4. **`onevcat/Kingfisher`** — popular pure-Swift image library; broadens "common consumer packages" coverage.
+5. **`apple/swift-argument-parser`** — small, common, fast smoke test that pure-Swift baseline still works.
 
 Each follows the policy in INTEGRATION_TESTING.md: earns a slot only if it exercises a path the matrix doesn't.
 
@@ -122,6 +118,6 @@ Risk: zero unless triggered by external demand.
 
 ## Suggested sequencing
 
-Greedy: start with **P0 actionable error messages** (cheap, iterative, immediate user-visible improvement) while spiking **Swift macros** in parallel. Land **stress-test additions** as the spike runs — they're cheap and may surface adjacent gaps. **Serializable plan / `--dry-run`** lands next as a UX capstone. **Nightly CI** turns on after a few weeks of green matrix runs. P2 items wait for either external demand or genuine free cycles.
+With macros shipped, the remaining P0 is **actionable error messages** — cheap, iterative, immediate user-visible improvement. Land **stress-test additions** alongside it; they're cheap and may surface adjacent gaps now that the macro / sibling-xcframework paths are live. **Serializable plan / `--dry-run`** lands next as a UX capstone. **Nightly CI** turns on after a few weeks of green matrix runs. P2 items wait for either external demand or genuine free cycles.
 
-When picking up: confirm the matrix is still 10/10 first (`python3 tests/integration/run_integration.py`) so the baseline is known-green before adding scope.
+When picking up: confirm the matrix is still 12/12 first (`python3 tests/integration/run_integration.py`) so the baseline is known-green before adding scope.

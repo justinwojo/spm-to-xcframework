@@ -3234,15 +3234,27 @@ def _plan_external_sibling_consumption(
     # swiftinterface verifier can resolve it; no `.product()` rewrite
     # or `.package(url:)` strip is needed (the source never named M, and
     # M's owning package is already being stripped via a Phase 1 edit).
+    #
+    # When this planner runs for a transitive child, the sibling map
+    # carries every freshly-built sibling — including products owned by
+    # packages that aren't in THIS child's dependency graph. Filter
+    # those out: a product whose owner is known via `identity_map` and
+    # whose owner is NOT in the child's transitives is irrelevant to
+    # this manifest and would only bloat the overlay. Products with an
+    # unknown owner fall through as the re-export safety net.
+    child_tp_identities = {tp.identity for tp in package.transitive_packages}
     for product_name, xcfx in sibling_map.items():
         if product_name in seen_products:
+            continue
+        owner = identity_map.get(product_name)
+        if owner is not None and owner not in child_tp_identities:
             continue
         seen_products.add(product_name)
         plan.package_swift_edits.append(
             PackageSwiftEdit(
                 kind="consume_external_sibling",
                 product_name=product_name,
-                package_identity=identity_map.get(product_name),
+                package_identity=owner,
                 xcframework_path=xcfx,
             )
         )
@@ -3452,18 +3464,57 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 
 
+def _skip_triple_quoted_string(text: str, start: int) -> int:
+    """Given `start` pointing at the first `"` of a triple-quote opener,
+    return the index one past the closing triple-quote. Returns -1 if
+    no matching closer is found.
+
+    Caller must verify `text[start:start+3] == chr(34)*3` before calling.
+
+    Handles `\\<x>` escape sequences. For `\\(...)` interpolation we
+    recurse through `_balanced_close` to find the matching `)` — the
+    embedded expression is arbitrary Swift, including its own string
+    literals (single- or triple-quoted), and Swift legally allows a
+    nested `\"\"\"...\"\"\"` literal inside the interpolation. Naively
+    treating `\\(` as a 2-char escape would let a nested triple-quote
+    masquerade as the outer closer.
+
+    On a sequence of four or more consecutive `"`, the first three are
+    the closer per Swift's lexer; the trailing quote belongs to
+    whatever follows the multi-line string.
+    """
+    n = len(text)
+    i = start + 3  # Skip opening `"""`.
+    while i < n:
+        c = text[i]
+        if c == "\\" and i + 1 < n:
+            if text[i + 1] == "(":
+                close_idx = _balanced_close(text, i + 1)
+                if close_idx == -1:
+                    return -1
+                i = close_idx + 1
+                continue
+            i += 2
+            continue
+        if c == '"' and i + 2 < n and text[i + 1] == '"' and text[i + 2] == '"':
+            return i + 3
+        i += 1
+    return -1
+
+
 def _strip_swift_comments(text: str) -> str:
     """Return `text` with `//` line comments and `/* */` block comments
     replaced by equal-length spans of spaces (preserving newlines). The
     length/offset preservation keeps any downstream index math valid,
     and preserving newlines keeps line-counting error messages honest.
 
-    This is NOT a full Swift tokenizer — it only tracks double-quoted
-    string state so comment markers inside a regular string literal
-    don't trigger. The file-wide `_assert_no_unsupported_swift_constructs`
-    gate runs AFTER this stripper and guards against the advanced
-    string shapes (raw strings, triple-quotes, interpolation) that
-    could otherwise fool the state machine.
+    This is NOT a full Swift tokenizer — it tracks double-quoted and
+    triple-quoted string state so comment markers inside a string
+    literal don't trigger. The file-wide
+    `_assert_no_unsupported_swift_constructs` gate runs AFTER this
+    stripper and guards against the remaining advanced string shapes
+    (raw strings, interpolation) that could otherwise fool the state
+    machine.
 
     Behavior on unterminated comments / strings: we stop stripping at
     the unterminated boundary and keep the rest of the text verbatim.
@@ -3477,6 +3528,21 @@ def _strip_swift_comments(text: str) -> str:
     i = 0
     while i < n:
         c = text[i]
+        # Triple-quoted multi-line string: copy entire span verbatim.
+        # MUST be checked before the single-quote handler since `"""`
+        # begins with `"`. The body is real Swift source and the
+        # stripper preserves source positions, so we keep every byte.
+        if c == '"' and i + 2 < n and text[i + 1] == '"' and text[i + 2] == '"':
+            close_idx = _skip_triple_quoted_string(text, i)
+            if close_idx == -1:
+                # Unterminated — copy the rest verbatim, matching the
+                # block-comment fallthrough.
+                out.append(text[i:])
+                i = n
+                break
+            out.append(text[i:close_idx])
+            i = close_idx
+            continue
         # Double-quoted string: copy verbatim, honoring `\\` escapes.
         if c == '"':
             out.append(c)
@@ -3558,9 +3624,10 @@ def _make_code_token_view(text: str) -> str:
     real call, and the user sees a spurious PrepareUserError on a
     well-formed manifest.
 
-    Limitations match `_strip_swift_comments`: only `"..."` strings are
-    tracked. `#\"...\"#` raw strings and `\"\"\"...\"\"\"` multi-line
-    strings aren't supported here — they would be rejected upstream by
+    Limitations match `_strip_swift_comments`: double-quoted (`"..."`)
+    and triple-quoted multi-line strings are tracked. `#"..."#` raw
+    strings aren't supported here
+    — they would be rejected upstream by
     `_assert_no_unsupported_swift_constructs` before any prepare-time
     edit runs. `\\(...)` string interpolation IS handled by recursing
     through `_balanced_close` to find the closing `)` of the embedded
@@ -3579,6 +3646,19 @@ def _make_code_token_view(text: str) -> str:
     i = 0
     while i < n:
         c = text[i]
+        # Triple-quoted multi-line string: blank delimiters + body with
+        # spaces, preserve newlines. MUST be checked before the
+        # single-quote handler since `"""` begins with `"`.
+        if c == '"' and i + 2 < n and text[i + 1] == '"' and text[i + 2] == '"':
+            close_idx = _skip_triple_quoted_string(text, i)
+            if close_idx == -1:
+                out.append(text[i:])
+                i = n
+                break
+            for ch in text[i:close_idx]:
+                out.append("\n" if ch == "\n" else " ")
+            i = close_idx
+            continue
         # Double-quoted string: blank delimiters + body with spaces, keep newlines.
         # Honors `\(...)` interpolation via recursion through `_balanced_close`,
         # so a string like `"Sources/\(name + "Tests")"` doesn't mis-terminate
@@ -3654,62 +3734,202 @@ def _make_code_token_view(text: str) -> str:
     return "".join(out)
 
 
+def _blank_triple_quoted_bodies(text: str) -> str:
+    # Return `text` with the PROSE inside every ordinary triple-quoted
+    # multi-line string span replaced by spaces (newlines preserved).
+    # "Prose" means the body chars between the triple-quote delimiters
+    # AND outside any `\(...)` interpolation expression — interpolation
+    # bodies are real Swift code and are preserved verbatim so the
+    # downstream raw-string guard can still observe `#"` markers
+    # nested inside them. The triple-quote delimiters themselves
+    # (opener and closer) are also blanked.
+    #
+    # Raw triples (`#"""..."""#`, `##"""..."""##`, …) are left
+    # ENTIRELY intact so the guard sees the leading `#"` and rejects
+    # them — the helper can't safely walk a raw triple's body anyway
+    # (raw strings close at `"""#` matching the leading hash count,
+    # not at the first bare `"""`).
+    #
+    # Used by `_assert_no_unsupported_swift_constructs` so a `#"`
+    # mention inside a legitimate `traits:` description (or any other
+    # multi-line string body) does not trip the raw-string guard.
+    # Single-quoted strings are intentionally left intact — the guard
+    # still flags raw-string-shaped content inside them, matching the
+    # documented heuristic.
+    n = len(text)
+    out = list(text)
+
+    def _blank(k: int) -> None:
+        if out[k] != "\n":
+            out[k] = " "
+
+    # Walker state stack. Each frame is one of:
+    #   ("code", None)        — top-level or nested non-string code
+    #   ("code", exit_at)     — code inside `\(...)` interpolation; on
+    #                            entering an index > exit_at we pop back
+    #                            to the enclosing prose context
+    #   ("prose", None)       — body of an ordinary triple-quoted string
+    stack: List[Tuple[str, Optional[int]]] = [("code", None)]
+
+    i = 0
+    while i < n:
+        # Pop expired interpolation frames first.
+        while True:
+            mode, exit_at = stack[-1]
+            if mode == "code" and exit_at is not None and i > exit_at:
+                stack.pop()
+                continue
+            break
+
+        mode, exit_at = stack[-1]
+        c = text[i]
+
+        if mode == "code":
+            if c == '"' and i + 2 < n and text[i + 1] == '"' and text[i + 2] == '"':
+                # Raw triple opener — leave the entire raw span intact
+                # so the downstream `#"` scan sees the leading hash +
+                # quote and rejects. Swift's raw-string rule: opener
+                # `<N hashes>"""` matches closer `"""<N hashes>`. We
+                # count the preceding hash run, scan forward for the
+                # matching closer, and skip past the whole span.
+                if i > 0 and text[i - 1] == "#":
+                    hashes = 0
+                    j = i - 1
+                    while j >= 0 and text[j] == "#":
+                        hashes += 1
+                        j -= 1
+                    end = -1
+                    k = i + 3
+                    while k + 2 + hashes < n:
+                        if (
+                            text[k] == '"'
+                            and text[k + 1] == '"'
+                            and text[k + 2] == '"'
+                        ):
+                            ok = True
+                            for h in range(hashes):
+                                if text[k + 3 + h] != "#":
+                                    ok = False
+                                    break
+                            if ok:
+                                end = k + 3 + hashes
+                                break
+                        k += 1
+                    if end == -1:
+                        # Unterminated raw triple — bail. The opening
+                        # `#"` is still visible to the guard, so the
+                        # manifest will be rejected anyway.
+                        break
+                    i = end
+                    continue
+                # Ordinary triple opener — blank the delimiters and
+                # enter prose mode.
+                _blank(i)
+                _blank(i + 1)
+                _blank(i + 2)
+                stack.append(("prose", None))
+                i += 3
+                continue
+            # Any other char in code mode is preserved as-is.
+            i += 1
+            continue
+
+        # prose mode
+        if c == "\\" and i + 1 < n:
+            if text[i + 1] == "(":
+                # Interpolation — preserve text from `\(` through the
+                # matching `)` so any code (including `#"..."#`) stays
+                # visible to the raw-string guard. We push a code
+                # frame whose `exit_at` is the matching close paren;
+                # the frame pops automatically on the next iteration
+                # once `i` advances past it.
+                close_idx = _balanced_close(text, i + 1)
+                if close_idx == -1:
+                    return "".join(out)
+                stack.append(("code", close_idx))
+                # The `\(` chars themselves are part of prose syntax
+                # but we leave them in `out` verbatim — they don't
+                # affect the `#"` scan and preserving them keeps the
+                # source positions aligned with the original for
+                # debugging.
+                i += 2
+                continue
+            # Any other escape (e.g. `\"`, `\n`, `\u{...}`) is prose —
+            # blank both characters.
+            _blank(i)
+            _blank(i + 1)
+            i += 2
+            continue
+        if c == '"' and i + 2 < n and text[i + 1] == '"' and text[i + 2] == '"':
+            # Closing triple of the current prose region.
+            _blank(i)
+            _blank(i + 1)
+            _blank(i + 2)
+            stack.pop()
+            i += 3
+            continue
+        # Plain prose char.
+        _blank(i)
+        i += 1
+    return "".join(out)
+
+
 def _assert_no_unsupported_swift_constructs(text: str) -> None:
     """Fail loudly if `text` contains Swift constructs the balanced-paren
     walker can't reason about.
 
     The walker handles double-quoted strings (with backslash escapes),
-    line comments (//), block comments, and string interpolation
-    (`\\(...)` via recursion through the walker). It does NOT handle
-    Swift raw strings (`#"..."#`) or multi-line triple-quoted strings:
-    unescaped quotes inside a raw string would confuse the string-skip
-    state, and triple-quotes use a different terminator.
+    triple-quoted multi-line strings, line comments (//), block
+    comments, and string interpolation (`\\(...)` via recursion
+    through the walker). It does NOT handle Swift raw strings
+    (`#"..."#`): unescaped quotes inside a raw string would confuse
+    the string-skip state and the raw-delimiter terminator (`"#`)
+    isn't tracked.
 
     To avoid flagging false positives on doc comments that legitimately
-    mention these constructs (e.g. `/// Uses #"..."# internally`), we
+    mention this construct (e.g. `/// Uses #"..."# internally`), we
     scan a comment-stripped view of the manifest. Real code uses of
-    the constructs still fire; mentions inside `//`, `/* */`, or `///`
-    doc comments pass through untouched.
+    the construct still fire; mentions inside `//`, `/* */`, or `///`
+    doc comments pass through untouched. We also blank triple-quoted
+    multi-line string bodies before scanning so a `traits:` description
+    that legitimately mentions raw-string syntax in prose (e.g. a
+    multi-line description containing the text `#"..."#`) doesn't
+    falsely trigger.
 
     The check remains a heuristic gate, not a full parser. Known
     limitations:
       - Doc comments inside regular strings are stripped, since the
         stripper follows the string-state machine. This is the same
         behavior as the downstream `_balanced_close` walker.
-      - A string literal like `let s = "#\\"hi\\"#"` looks the same
-        to the scanner as a real raw-string use, so the check will
-        reject it. Real manifests don't write strings like this.
+      - A single-quoted string literal like `let s = "#\\"hi\\"#"` looks
+        the same to the scanner as a real raw-string use, so the check
+        will reject it. Real manifests don't write strings like this.
     """
-    scanned = _strip_swift_comments(text)
+    scanned = _blank_triple_quoted_bodies(_strip_swift_comments(text))
     if '#"' in scanned:
         raise PrepareUserError(
             "Package.swift uses Swift raw string literals (`#\"...\"#`), "
             "which the balanced-paren walker doesn't understand. "
             "File a bug if this needs to be supported."
         )
-    if '"""' in scanned:
-        raise PrepareUserError(
-            "Package.swift uses Swift triple-quoted strings (`\"\"\"`), "
-            "which the balanced-paren walker doesn't understand. "
-            "File a bug if this needs to be supported."
-        )
-    # Swift string interpolation (`\\(...)`) used to be rejected here but
-    # the walker now handles it via recursion through itself in the
-    # string-skip path. Real-world manifests use it heavily (e.g.
-    # swift-collections' Package.swift builds path strings from target
-    # names via `"Sources/\\(name)"`).
+    # Triple-quoted strings (`"""..."""`) and `\\(...)` string interpolation
+    # are both handled by the walker (the former via `_skip_triple_quoted_string`,
+    # the latter via recursion through `_balanced_close`). Real-world manifests
+    # use both heavily — swift-collections's traits carry `"""` description bodies
+    # and its `Sources/\\(name)` path building uses interpolation.
 
 
 def _balanced_close(text: str, open_idx: int) -> int:
     """Walk text from `open_idx` (which must point at one of `(`, `[`, `{`)
     to the matching closing bracket, returning its index. Skips over Swift
-    string literals (`"..."` with `\\"` escapes), `// ...` line comments, and
-    `/* ... */` block comments. Returns -1 if no matching close is found.
+    string literals (double-quoted with `\\"` escapes, plus triple-quoted
+    multi-line strings), `// ...` line comments, and `/* ... */` block
+    comments. Returns -1 if no matching close is found.
 
-    Does NOT handle Swift multi-line triple-quoted strings or raw
-    strings. `\\(...)` string interpolation IS handled by recursing
-    through this same walker to find the closing `)` of the interpolation
-    expression, then resuming string mode. Callers should still run
+    Does NOT handle Swift raw strings (`#"..."#`). `\\(...)` string
+    interpolation IS handled by recursing through this same walker to
+    find the closing `)` of the interpolation expression, then resuming
+    string mode. Callers should still run
     `_assert_no_unsupported_swift_constructs` on the full manifest text
     so the unsupported constructs that remain fail loudly with a targeted
     PrepareError instead of being silently mis-parsed.
@@ -3752,6 +3972,16 @@ def _balanced_close(text: str, open_idx: int) -> int:
                 i += 1
             if block_depth > 0:
                 return -1
+            continue
+        # Triple-quoted multi-line string: skip to one past the closing
+        # `"""`. MUST be checked before the single-quote handler since
+        # `"""` begins with `"`. The interior is opaque text — we only
+        # need to find the closer to resume bracket-balancing.
+        if c == '"' and i + 2 < n and text[i + 1] == '"' and text[i + 2] == '"':
+            close_idx = _skip_triple_quoted_string(text, i)
+            if close_idx == -1:
+                return -1
+            i = close_idx
             continue
         # String literal: skip to closing quote, honoring `\\"` escapes
         # and `\(...)` interpolation. Interpolation embeds an arbitrary
@@ -3848,6 +4078,15 @@ def _flatten_to_top_level(span: str) -> str:
                     i += 2
                     continue
                 i += 1
+            continue
+        # Triple-quoted multi-line string: copy verbatim. MUST be checked
+        # before the single-quote handler since `"""` begins with `"`.
+        if c == '"' and i + 2 < n and span[i + 1] == '"' and span[i + 2] == '"':
+            close_idx = _skip_triple_quoted_string(span, i)
+            if close_idx == -1:
+                break
+            out.append(span[i:close_idx])
+            i = close_idx
             continue
         if c == '"':
             j = i + 1
@@ -4372,6 +4611,131 @@ def edit_inject_or_extend_overlay_binary_targets(
     )
 
 
+_TARGET_LOOP_RE = re.compile(
+    r"\bfor\s+(\w+)\s+in\s+package\.targets\b"
+)
+
+
+def edit_guard_target_loops_from_overlay(manifest_text: str) -> str:
+    """Augment any top-level `for <var> in package.targets [where <expr>]`
+    loop with a `_SPM2XC_OVERLAY_NAMES.contains(<var>.name)` exclusion,
+    so overlay-injected binaryTargets aren't subjected to settings
+    mutations the post-loop applies to "all" non-system targets.
+
+    Real-world trigger: swift-perception 1.6.0 ends its manifest with
+
+        for target in package.targets where target.type != .system {
+          target.swiftSettings = target.swiftSettings ?? []
+          target.swiftSettings?.append(contentsOf: [
+            .enableExperimentalFeature("StrictConcurrency"),
+          ])
+        }
+
+    Once the dedup-overlap overlay injects `Target.binaryTarget(...)`
+    entries into the targets array, this loop applies `swiftSettings`
+    to them too. SPM rejects swiftSettings on binaryTargets — the round-
+    trip validator fails with: "target 'P' is assigned a property
+    'settings' which is not accepted for the binary target type".
+
+    Behaviour:
+      - No-op if the manifest has no overlay sentinel (no overlay block
+        present → nothing to guard).
+      - For each matched loop, AND `!_SPM2XC_OVERLAY_NAMES.contains(<var>.name)`
+        into the existing `where` clause, or insert the clause when no
+        `where` is present.
+      - Idempotent: a loop whose `where` clause already mentions
+        `_SPM2XC_OVERLAY_NAMES` is left untouched.
+      - Skips matches inside strings or comments (uses
+        `_make_code_token_view`).
+      - Conservatively skips matches whose loop body opener can't be
+        located (depth-tracked search for `{` past the loop header).
+    """
+    if _OVERLAY_SENTINEL_BEGIN not in manifest_text:
+        return manifest_text
+
+    code = _make_code_token_view(manifest_text)
+    n = len(code)
+
+    edits: List[Tuple[int, int, str]] = []
+    for m in _TARGET_LOOP_RE.finditer(code):
+        var_name = m.group(1)
+        if var_name == _OVERLAY_NAMES_VAR:
+            continue
+        cursor = m.end()
+        while cursor < n and code[cursor] in " \t\n":
+            cursor += 1
+        has_where = False
+        where_expr_start = -1
+        where_expr_end = -1
+        if (
+            code[cursor : cursor + 5] == "where"
+            and (
+                cursor + 5 == n
+                or not (code[cursor + 5].isalnum() or code[cursor + 5] == "_")
+            )
+        ):
+            has_where = True
+            where_expr_start = cursor + 5
+            while (
+                where_expr_start < n and code[where_expr_start] in " \t\n"
+            ):
+                where_expr_start += 1
+            scan = where_expr_start
+            depth_paren = 0
+            depth_bracket = 0
+            brace_idx = -1
+            while scan < n:
+                ch = code[scan]
+                if ch == "(":
+                    depth_paren += 1
+                elif ch == ")":
+                    depth_paren -= 1
+                elif ch == "[":
+                    depth_bracket += 1
+                elif ch == "]":
+                    depth_bracket -= 1
+                elif (
+                    ch == "{" and depth_paren == 0 and depth_bracket == 0
+                ):
+                    brace_idx = scan
+                    break
+                scan += 1
+            if brace_idx == -1:
+                continue
+            where_expr_end = brace_idx
+            while (
+                where_expr_end > where_expr_start
+                and code[where_expr_end - 1] in " \t\n"
+            ):
+                where_expr_end -= 1
+            existing_expr = manifest_text[where_expr_start:where_expr_end]
+            if _OVERLAY_NAMES_VAR in existing_expr:
+                continue
+            replacement = (
+                f"({existing_expr.strip()})"
+                f" && !{_OVERLAY_NAMES_VAR}.contains({var_name}.name)"
+            )
+            edits.append((where_expr_start, where_expr_end, replacement))
+        else:
+            insert_at = m.end()
+            replacement = (
+                f" where !{_OVERLAY_NAMES_VAR}.contains({var_name}.name)"
+            )
+            edits.append((insert_at, insert_at, replacement))
+
+    if not edits:
+        return manifest_text
+
+    out_parts: List[str] = []
+    last = 0
+    for start, end, text in edits:
+        out_parts.append(manifest_text[last:start])
+        out_parts.append(text)
+        last = end
+    out_parts.append(manifest_text[last:])
+    return "".join(out_parts)
+
+
 _DEPENDENCIES_LABEL_RE = re.compile(r"\bdependencies\s*:")
 
 
@@ -4418,6 +4782,16 @@ def _strip_comments_to_spaces(span: str) -> str:
                 if out[k] != "\n":
                     out[k] = " "
             i = j
+            continue
+        # Triple-quoted multi-line string: skip past via the dedicated
+        # helper so a `"""` opener isn't misread as an empty single-quoted
+        # string followed by code. Body stays verbatim in `out` (which
+        # was initialised from `list(span)`).
+        if c == '"' and i + 2 < n and span[i + 1] == '"' and span[i + 2] == '"':
+            close_idx = _skip_triple_quoted_string(span, i)
+            if close_idx == -1:
+                break
+            i = close_idx
             continue
         if c == '"':
             # Skip past string literals so a // or /* inside a string
@@ -4498,6 +4872,18 @@ def _collect_depth_zero_string_literals(span: str) -> set:
                     continue
                 j += 1
             i = j
+            continue
+        # Triple-quoted multi-line strings are NOT collected as dep-name
+        # candidates: their bodies are arbitrary multi-line text, not
+        # identifiers. Skip past via the dedicated helper so a `"""`
+        # opener isn't misread as an empty single-quoted string followed
+        # by code (which could then leak in-body characters into the
+        # next round of state).
+        if c == '"' and i + 2 < n and span[i + 1] == '"' and span[i + 2] == '"':
+            close_idx = _skip_triple_quoted_string(span, i)
+            if close_idx == -1:
+                break
+            i = close_idx
             continue
         if c == '"':
             j = i + 1
@@ -4742,6 +5128,16 @@ def _find_depth_zero_string_literal_positions(
                     continue
                 j += 1
             i = j
+            continue
+        # Triple-quoted multi-line strings: not eligible matches for a
+        # single-line `target_value`. Skip past via the dedicated helper
+        # so a `"""` opener isn't misread as an empty single-quoted
+        # string followed by code.
+        if c == '"' and i + 2 < end and body[i + 1] == '"' and body[i + 2] == '"':
+            close_idx = _skip_triple_quoted_string(body, i)
+            if close_idx == -1 or close_idx > end:
+                break
+            i = close_idx
             continue
         if c == '"':
             lit_start = i
@@ -5035,6 +5431,15 @@ def _depth_zero_product_calls_with_name_and_package(
                 j += 1
             i = j
             continue
+        # Triple-quoted multi-line string: skip past via the dedicated
+        # helper. MUST be checked before the single-quote handler since
+        # `"""` begins with `"`.
+        if c == '"' and i + 2 < interior_end and body[i + 1] == '"' and body[i + 2] == '"':
+            close_idx = _skip_triple_quoted_string(body, i)
+            if close_idx == -1 or close_idx > interior_end:
+                break
+            i = close_idx
+            continue
         # String literal — skip over it without changing depth. Handles
         # `\(...)` interpolation the same way the other walkers do.
         if c == '"':
@@ -5276,6 +5681,15 @@ def _collect_depth_zero_target_or_byname_call_names(span: str) -> Set[str]:
                 j += 1
             i = j
             continue
+        # Triple-quoted multi-line string: skip past via the dedicated
+        # helper. MUST be checked before the single-quote handler since
+        # `"""` begins with `"`.
+        if c == '"' and i + 2 < n and span[i + 1] == '"' and span[i + 2] == '"':
+            close_idx = _skip_triple_quoted_string(span, i)
+            if close_idx == -1:
+                break
+            i = close_idx
+            continue
         if c == '"':
             j = i + 1
             while j < n:
@@ -5446,6 +5860,15 @@ def _depth_zero_product_calls_with_package_in_set(
                     continue
                 j += 1
             i = j
+            continue
+        # Triple-quoted multi-line string: skip past via the dedicated
+        # helper. MUST be checked before the single-quote handler since
+        # `"""` begins with `"`.
+        if c == '"' and i + 2 < interior_end and body[i + 1] == '"' and body[i + 2] == '"':
+            close_idx = _skip_triple_quoted_string(body, i)
+            if close_idx == -1 or close_idx > interior_end:
+                break
+            i = close_idx
             continue
         if c == '"':
             j = i + 1
@@ -6077,6 +6500,18 @@ def _depth_zero_view(span: str) -> str:
             for k in range(i, j):
                 out[k] = " "
             i = j
+            continue
+        # Triple-quoted multi-line string: blank the entire span (matches
+        # single-quoted handling here). MUST be checked before the
+        # single-quote handler since `"""` begins with `"`.
+        if c == '"' and i + 2 < n and span[i + 1] == '"' and span[i + 2] == '"':
+            close_idx = _skip_triple_quoted_string(span, i)
+            if close_idx == -1:
+                break
+            for k in range(i, close_idx):
+                if out[k] != "\n":
+                    out[k] = " "
+            i = close_idx
             continue
         if c == '"':
             j = i + 1
@@ -7084,6 +7519,14 @@ def _apply_consume_external_sibling_edits(
         edited, identities_to_strip
     )
 
+    # Last edit step: guard any `for target in package.targets where ...`
+    # loop the manifest emits after the Package(...) call. Once the
+    # overlay injects binaryTargets into `package.targets`, a settings-
+    # mutation loop that touches "all non-system targets" hits them
+    # too and dump-package rejects the manifest because SPM doesn't
+    # allow swiftSettings on binaryTargets. See swift-perception 1.6.0.
+    edited = edit_guard_target_loops_from_overlay(edited)
+
     if edited != text:
         manifest_path.write_text(edited)
         info(
@@ -7712,6 +8155,148 @@ def _find_dependencies_array_in_package_call(
 
 _PACKAGE_ENTRY_URL_RE = re.compile(r'url\s*:\s*"([^"]+)"')
 
+_TARGET_NAME_RE = re.compile(r'name\s*:\s*"([^"]+)"')
+
+
+def _find_targets_array_in_package_call(
+    source: str,
+) -> Optional[Tuple[int, int]]:
+    """Within the top-level `Package(...)`, find the `targets: [...]`
+    argument array. Returns (open_bracket_idx, close_bracket_idx_inclusive)
+    or None if the argument isn't a literal array (e.g. a manifest that
+    writes `targets: libraryTargets + testTargets`).
+    """
+    pkg_call = _find_package_call(source)
+    if not pkg_call:
+        return None
+    open_paren, close_paren = pkg_call
+    view = _make_code_token_view(source)
+    inside_start = open_paren + 1
+    inside_end = close_paren
+    depth = 0
+    i = inside_start
+    while i < inside_end:
+        c = view[i]
+        if c in "({[":
+            depth += 1
+            i += 1
+            continue
+        if c in ")}]":
+            depth -= 1
+            i += 1
+            continue
+        if depth == 0:
+            if (
+                view.startswith("targets", i)
+                and (i + 7 >= inside_end or not (view[i + 7].isalnum() or view[i + 7] == "_"))
+            ):
+                j = i + 7
+                while j < inside_end and view[j] in " \t\r\n":
+                    j += 1
+                if j < inside_end and view[j] == ":":
+                    j += 1
+                    while j < inside_end and view[j] in " \t\r\n":
+                        j += 1
+                    if j < inside_end and view[j] == "[":
+                        close = _balanced_close(source, j)
+                        if close == -1:
+                            return None
+                        return (j, close)
+                    return None
+        i += 1
+    return None
+
+
+def _strip_test_targets(source: str) -> Tuple[str, List[str]]:
+    """Pass B: in the top-level `Package(...) targets: [...]` array,
+    drop every `.testTarget(...)` entry. Test targets are never built
+    for xcframework production, and they're the most common source of
+    stray dev-only deps (swift-macro-testing, snapshot-testing) that
+    pollute the dependency closure and break `swift package dump-package`
+    after Pass C prunes their backing `.package(url:)` entries.
+
+    Surfaced by swift-perception (transitive of TCA): its
+    `PerceptionMacrosTests` referenced `.product(name: "MacroTesting",
+    package: "swift-macro-testing")`, and Pass C dropped the
+    `swift-macro-testing` package, leaving a dangling reference that
+    invalidated the manifest.
+    """
+    arr = _find_targets_array_in_package_call(source)
+    if not arr:
+        return source, []
+    open_b, close_b = arr
+    view = _make_code_token_view(source)
+    inside_start = open_b + 1
+    inside_end = close_b
+
+    spans: List[Tuple[int, int, str]] = []
+    depth = 0
+    i = inside_start
+    while i < inside_end:
+        c = view[i]
+        if c in "({[":
+            depth += 1
+            i += 1
+            continue
+        if c in ")}]":
+            depth -= 1
+            i += 1
+            continue
+        if depth == 0 and c == ".":
+            j = i + 1
+            while j < inside_end and view[j] in " \t\r\n":
+                j += 1
+            if view.startswith("testTarget", j) and (
+                j + 10 >= inside_end
+                or not (view[j + 10].isalnum() or view[j + 10] == "_")
+            ):
+                k = j + 10
+                while k < inside_end and view[k] in " \t\r\n":
+                    k += 1
+                if k < inside_end and view[k] == "(":
+                    close_paren = _balanced_close(source, k)
+                    if close_paren == -1 or close_paren >= inside_end:
+                        i += 1
+                        continue
+                    entry_src = source[i : close_paren + 1]
+                    name_match = _TARGET_NAME_RE.search(entry_src)
+                    target_name = name_match.group(1) if name_match else "?"
+                    entry_end = close_paren + 1
+                    scan = entry_end
+                    while scan < inside_end and source[scan] in " \t":
+                        scan += 1
+                    if scan < inside_end and source[scan] == ",":
+                        entry_end = scan + 1
+                    scan2 = entry_end
+                    while scan2 < inside_end and source[scan2] in " \t":
+                        scan2 += 1
+                    if scan2 < inside_end and source[scan2] == "\n":
+                        entry_end = scan2 + 1
+                    line_start = source.rfind("\n", inside_start, i) + 1
+                    if source[line_start:i].strip() == "":
+                        entry_start = line_start
+                    else:
+                        entry_start = i
+                    spans.append(
+                        (entry_start, entry_end, f".testTarget({target_name})")
+                    )
+                    i = close_paren + 1
+                    continue
+        i += 1
+
+    if not spans:
+        return source, []
+
+    out_parts: List[str] = []
+    reasons: List[str] = []
+    cursor = 0
+    for start, end, reason in spans:
+        out_parts.append(source[cursor:start])
+        cursor = end
+        reasons.append(reason)
+    out_parts.append(source[cursor:])
+    return "".join(out_parts), reasons
+
 
 def _prune_top_level_package_entries(
     source: str, needed_identities: Set[str]
@@ -7944,16 +8529,33 @@ def prune_child_manifest_for_products(
     else:
         raw_dump = _dump_package_json(pre_staged_dir)
 
+    # Pass B: strip .testTarget(...) declarations from the targets array.
+    # Test targets are never built for xcframework production, and dropping
+    # them upfront prevents Pass C from leaving dangling .product(...)
+    # references when it prunes test-only deps.
+    after_b, reasons_b = _strip_test_targets(after_a)
+    if reasons_b:
+        pkg_swift.write_text(after_b)
+        try:
+            raw_dump = _dump_package_json(pre_staged_dir)
+        except PrepareUserError:
+            pkg_swift.write_text(after_a)
+            raise
+        for r in reasons_b:
+            verbose_log(verbose, f"  prune-child: pass-B stripped {r}")
+    else:
+        after_b = after_a
+
     # Pass C: drop unused .package(url:) entries.
     needed = _collect_needed_identities(raw_dump, allowed_products)
-    after_c, reasons_c = _prune_top_level_package_entries(after_a, needed)
+    after_c, reasons_c = _prune_top_level_package_entries(after_b, needed)
     if reasons_c:
         pkg_swift.write_text(after_c)
         try:
             _dump_package_json(pre_staged_dir)
         except PrepareUserError:
-            # Roll back to the Pass-A result, since that one validated.
-            pkg_swift.write_text(after_a)
+            # Roll back to Pass-B's output (last validated state).
+            pkg_swift.write_text(after_b)
             raise
         for r in reasons_c:
             verbose_log(verbose, f"  prune-child: pass-C stripped {r}")
@@ -10270,10 +10872,11 @@ def _apply_dedup_overlap_substitutions(
     # would have run it during Prepare — but only if the planner emitted at least
     # one edit. When Prepare takes its no-op path (no package_swift_edits), the
     # guard is skipped, and an Execute-time dedup edit on a manifest with
-    # triple-quoted strings, `#"..."#` raw strings, or `\(...)` interpolation
-    # would silently mis-parse via `_make_code_token_view` (which only tracks
-    # `"..."` strings). Running the guard here closes that gap.
-    # (Codex P2 round-4 regression.)
+    # `#"..."#` raw strings would silently mis-parse via `_make_code_token_view`
+    # (which tracks `"..."` and `"""..."""` strings but not raw delimiters).
+    # Running the guard here closes that gap. (Codex P2 round-4 regression.
+    # Triple-quoted strings and `\(...)` interpolation used to be in this guard;
+    # the walker now handles both.)
     try:
         _assert_no_unsupported_swift_constructs(text)
     except PrepareUserError as exc:
@@ -10343,6 +10946,13 @@ def _apply_dedup_overlap_substitutions(
                 f"dedup-overlap substitution failed for unit {unit_name!r}: "
                 f"{exc}"
             ) from exc
+        # Post-init loops like `for target in package.targets where ... { target.swiftSettings += ... }`
+        # mutate every non-system target; the freshly-injected binaryTargets would
+        # be hit too and SPM rejects `settings are not accepted for the binary
+        # target type`. Guard runs unconditionally — it's a no-op when the
+        # overlay sentinel is absent and idempotent when the where clause is
+        # already augmented from a prior pass.
+        edited = edit_guard_target_loops_from_overlay(edited)
         if edited != text:
             manifest_path.write_text(edited)
             applied = [f"{name} -> {abs_path.name}" for name, abs_path, _ in rel_subs]
@@ -12289,6 +12899,7 @@ def print_verify_summary(
 
 import argparse
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -13093,6 +13704,149 @@ def _build_prebuilt_sibling_index(
     return paths, identities
 
 
+_CROSS_SIBLING_PRODUCT_RE = re.compile(
+    r"\.product\s*\(\s*name\s*:\s*\"([^\"\\\n]+)\"\s*,\s*package\s*:\s*\"([^\"\\\n]+)\""
+)
+
+
+def _expand_cross_sibling_referenced_products(transitives: List) -> List:
+    """Expand each transitive's `referenced_products` by scanning every
+    other transitive's checkout Package.swift for cross-sibling
+    `.product(name: X, package: Y)` references.
+
+    For every match where Y matches another transitive's identity
+    (case-insensitive), X is added to that transitive's
+    `referenced_products` (if not already present). Iterates to
+    fixpoint so chains (A → B → C) all settle.
+
+    Why this exists: Inspect only walks the umbrella's targets, so
+    `referenced_products` lists products the umbrella's source actually
+    imports. When transitive A's source imports a product X of
+    transitive B but the umbrella never names X, X is missing from B's
+    build set. The orchestrator strips `.package(url:)` for B from A's
+    edited manifest (because *some* product of B is being consumed),
+    which removes X's source-resolution path — and without
+    X.xcframework as a sibling, A's `.swiftinterface` `import X` lines
+    fail to resolve when A is consumed by the umbrella (or by a third
+    transitive). Concrete trigger: swift-case-paths' `CasePaths` uses
+    `.product(name: "XCTestDynamicOverlay", package: "xctest-dynamic-overlay")`;
+    TCA's umbrella only references `IssueReporting` from
+    xctest-dynamic-overlay; without expansion we never build
+    XCTestDynamicOverlay.xcframework and swift-navigation's nested
+    consume fails.
+
+    Scope and safety:
+      - Regex runs on the raw manifest text; each match's start
+        offset is then checked against `_make_code_token_view(text)`
+        (comments and string-literal bodies blanked to spaces) and
+        rejected if the leading `.` of `.product` doesn't survive.
+        A `.product(...)`-shaped token that appears inside a comment
+        or string literal therefore can't drive an expansion.
+      - Each surviving candidate is validated against the owning
+        sibling's known products — a name that doesn't appear there
+        is discarded (Plan would otherwise reject it as an unmatched
+        product filter).
+      - Both `Package.swift` and every version-specific
+        `Package@swift-*.swift` are scanned. This is intentionally
+        broader than Inspect's active-manifest selection: we'd rather
+        build an extra harmless sibling than miss a ref that's only
+        present in the toolchain-gated manifest the child will end
+        up using. The declared-product gate above keeps the breadth
+        safe.
+      - Refs from `.testTarget(...)` blocks are deliberately kept in
+        scope: test targets are stripped at prune-child time, but
+        their product refs are a good signal of "this sibling
+        transitively re-exports module X" — building X errs on the
+        side of completeness.
+      - Returns a fresh list with `_dc_replace`-d transitives whose
+        `referenced_products` changed; transitives with no changes are
+        returned unmodified.
+    """
+    if len(transitives) < 2:
+        return transitives
+
+    from dataclasses import replace as _dc_replace
+
+    by_ident: Dict[str, object] = {
+        tp.identity.lower(): tp for tp in transitives
+    }
+    # Set of product names declared by each sibling, used to reject
+    # cross-sibling refs that the owning sibling doesn't actually expose
+    # (would fail Plan's product-filter match downstream).
+    declared_products: Dict[str, Set[str]] = {
+        tp.identity.lower(): {p.name for p in getattr(tp, "products", [])}
+        for tp in transitives
+    }
+    additions_log: List[Tuple[str, str, str]] = []
+
+    changed = True
+    rounds = 0
+    MAX_ROUNDS = 16
+    while changed and rounds < MAX_ROUNDS:
+        changed = False
+        rounds += 1
+        for tp in list(by_ident.values()):
+            manifest_texts: List[str] = []
+            for manifest_path in sorted(tp.checkout_path.glob("Package*.swift")):
+                try:
+                    manifest_texts.append(manifest_path.read_text())
+                except OSError:
+                    continue
+            for text in manifest_texts:
+                code_view = _make_code_token_view(text)
+                for m in _CROSS_SIBLING_PRODUCT_RE.finditer(text):
+                    # Discard matches that fall inside a comment or string
+                    # literal: in the code view those regions are blanked
+                    # to spaces, so the leading `.` of `.product` won't
+                    # survive.
+                    if code_view[m.start()] != ".":
+                        continue
+                    prod, pkg = m.group(1), m.group(2)
+                    key = pkg.lower()
+                    if key == tp.identity.lower():
+                        # Intra-package `.product()` ref — Inspect already
+                        # accounts for these via the umbrella's own walk.
+                        continue
+                    target = by_ident.get(key)
+                    if target is None:
+                        continue
+                    if prod in target.referenced_products:
+                        continue
+                    # Reject products the owning sibling doesn't declare.
+                    # Plan would otherwise fail later with "no targets
+                    # matched product filter <prod>" when the child config
+                    # passes this name into product_filters.
+                    if prod not in declared_products.get(key, set()):
+                        continue
+                    new_products = list(target.referenced_products) + [prod]
+                    by_ident[key] = _dc_replace(
+                        target, referenced_products=new_products
+                    )
+                    additions_log.append((target.identity, prod, tp.identity))
+                    changed = True
+
+    if additions_log:
+        for owner, prod, importer in additions_log:
+            bold(
+                f"  cross-sibling expansion: {owner!r} += {prod!r} "
+                f"(referenced by {importer!r})"
+            )
+    if changed and rounds >= MAX_ROUNDS:
+        # The fixpoint didn't settle within the cap. Real SPM graphs are
+        # shallow so saturating means something is feeding the expansion
+        # endlessly (cyclic alias, manifest churn). Surface it so the
+        # user can investigate instead of silently shipping a truncated
+        # closure.
+        bold(
+            f"  cross-sibling expansion: bailed after {MAX_ROUNDS} rounds "
+            f"with the closure still growing — please file an issue with "
+            f"the full transitive list."
+        )
+
+    # Preserve original order from `transitives`.
+    return [by_ident[tp.identity.lower()] for tp in transitives]
+
+
 def _run_source_mode_with_transitives(config: Config) -> int:
     """Top-level source-mode entry point with in-process transitive recursion.
 
@@ -13199,6 +13953,25 @@ def _run_source_mode_with_transitives(config: Config) -> int:
                 )
             transitives = kept
 
+    # Cross-sibling product expansion. Inspect populates
+    # `tp.referenced_products` only from the umbrella's targets — so if
+    # transitive A references product X of transitive B but the umbrella
+    # doesn't, X is missing from B's `referenced_products` and we won't
+    # build B's X.xcframework. When the orchestrator then consumes A as
+    # a sibling, A's `.swiftinterface` imports X (because A's source
+    # imports X) and xcodebuild fails to find module X — there's no
+    # sibling overlay for it and `.package(url:)` for B has been
+    # stripped from A's edited manifest (since some OTHER product of B
+    # was consumed). Concrete case: swift-case-paths' `CasePaths`
+    # references `.product(name: "XCTestDynamicOverlay", package:
+    # "xctest-dynamic-overlay")`, but TCA's umbrella only references
+    # `IssueReporting` from that package — without expansion, only
+    # `IssueReporting.xcframework` ships and CasePaths.swiftinterface's
+    # `import XCTestDynamicOverlay` dangles in swift-navigation's nested
+    # build. The expansion runs to fixpoint to cover chains where the
+    # newly-added product's owning package re-exports a third sibling.
+    transitives = _expand_cross_sibling_referenced_products(transitives)
+
     if not transitives:
         # Self-contained package — no recursion needed.
         return _source_mode_after_inspect(config, source_dir, staged_dir, package)
@@ -13250,6 +14023,22 @@ def _run_source_mode_with_transitives(config: Config) -> int:
         # and are attributed to the offending transitive identity.
         try:
             child_config = _make_transitive_child_config(config, tp, child_work_dir)
+            # Make earlier-built transitives visible to this child's planner.
+            # Without this, a transitive whose targets reference another
+            # transitive's product (e.g. swift-navigation imports CasePaths
+            # from swift-case-paths) forces xcodebuild to compile the owning
+            # package's macros from source in the nested workspace — where
+            # swift-syntax is not resolved and the build fails. Refreshing
+            # the index from `all_entries` after each successful iteration
+            # lets the child consume already-built siblings as binaryTarget
+            # overlays, matching what the umbrella does at the end of the
+            # loop.
+            (
+                child_config.prebuilt_sibling_xcframeworks,
+                child_config.prebuilt_sibling_identities,
+            ) = _build_prebuilt_sibling_index(
+                config.output_dir, all_entries, package
+            )
             result = _run_source_mode(child_config)
         except _USER_FACING_ERRORS as exc:
             # Mirror main()'s clean-error path: a child's Fetch / Inspect /

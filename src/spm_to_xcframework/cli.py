@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -872,6 +873,150 @@ def _build_prebuilt_sibling_index(
     return paths, identities
 
 
+_CROSS_SIBLING_PRODUCT_RE = re.compile(
+    r"\.product\s*\(\s*name\s*:\s*\"([^\"\\\n]+)\"\s*,\s*package\s*:\s*\"([^\"\\\n]+)\""
+)
+
+
+def _expand_cross_sibling_referenced_products(transitives: List) -> List:
+    """Expand each transitive's `referenced_products` by scanning every
+    other transitive's checkout Package.swift for cross-sibling
+    `.product(name: X, package: Y)` references.
+
+    For every match where Y matches another transitive's identity
+    (case-insensitive), X is added to that transitive's
+    `referenced_products` (if not already present). Iterates to
+    fixpoint so chains (A → B → C) all settle.
+
+    Why this exists: Inspect only walks the umbrella's targets, so
+    `referenced_products` lists products the umbrella's source actually
+    imports. When transitive A's source imports a product X of
+    transitive B but the umbrella never names X, X is missing from B's
+    build set. The orchestrator strips `.package(url:)` for B from A's
+    edited manifest (because *some* product of B is being consumed),
+    which removes X's source-resolution path — and without
+    X.xcframework as a sibling, A's `.swiftinterface` `import X` lines
+    fail to resolve when A is consumed by the umbrella (or by a third
+    transitive). Concrete trigger: swift-case-paths' `CasePaths` uses
+    `.product(name: "XCTestDynamicOverlay", package: "xctest-dynamic-overlay")`;
+    TCA's umbrella only references `IssueReporting` from
+    xctest-dynamic-overlay; without expansion we never build
+    XCTestDynamicOverlay.xcframework and swift-navigation's nested
+    consume fails.
+
+    Scope and safety:
+      - Regex runs on the raw manifest text; each match's start
+        offset is then checked against `_make_code_token_view(text)`
+        (comments and string-literal bodies blanked to spaces) and
+        rejected if the leading `.` of `.product` doesn't survive.
+        A `.product(...)`-shaped token that appears inside a comment
+        or string literal therefore can't drive an expansion.
+      - Each surviving candidate is validated against the owning
+        sibling's known products — a name that doesn't appear there
+        is discarded (Plan would otherwise reject it as an unmatched
+        product filter).
+      - Both `Package.swift` and every version-specific
+        `Package@swift-*.swift` are scanned. This is intentionally
+        broader than Inspect's active-manifest selection: we'd rather
+        build an extra harmless sibling than miss a ref that's only
+        present in the toolchain-gated manifest the child will end
+        up using. The declared-product gate above keeps the breadth
+        safe.
+      - Refs from `.testTarget(...)` blocks are deliberately kept in
+        scope: test targets are stripped at prune-child time, but
+        their product refs are a good signal of "this sibling
+        transitively re-exports module X" — building X errs on the
+        side of completeness.
+      - Returns a fresh list with `_dc_replace`-d transitives whose
+        `referenced_products` changed; transitives with no changes are
+        returned unmodified.
+    """
+    if len(transitives) < 2:
+        return transitives
+
+    from dataclasses import replace as _dc_replace
+    from .prepare import _make_code_token_view
+
+    by_ident: Dict[str, object] = {
+        tp.identity.lower(): tp for tp in transitives
+    }
+    # Set of product names declared by each sibling, used to reject
+    # cross-sibling refs that the owning sibling doesn't actually expose
+    # (would fail Plan's product-filter match downstream).
+    declared_products: Dict[str, Set[str]] = {
+        tp.identity.lower(): {p.name for p in getattr(tp, "products", [])}
+        for tp in transitives
+    }
+    additions_log: List[Tuple[str, str, str]] = []
+
+    changed = True
+    rounds = 0
+    MAX_ROUNDS = 16
+    while changed and rounds < MAX_ROUNDS:
+        changed = False
+        rounds += 1
+        for tp in list(by_ident.values()):
+            manifest_texts: List[str] = []
+            for manifest_path in sorted(tp.checkout_path.glob("Package*.swift")):
+                try:
+                    manifest_texts.append(manifest_path.read_text())
+                except OSError:
+                    continue
+            for text in manifest_texts:
+                code_view = _make_code_token_view(text)
+                for m in _CROSS_SIBLING_PRODUCT_RE.finditer(text):
+                    # Discard matches that fall inside a comment or string
+                    # literal: in the code view those regions are blanked
+                    # to spaces, so the leading `.` of `.product` won't
+                    # survive.
+                    if code_view[m.start()] != ".":
+                        continue
+                    prod, pkg = m.group(1), m.group(2)
+                    key = pkg.lower()
+                    if key == tp.identity.lower():
+                        # Intra-package `.product()` ref — Inspect already
+                        # accounts for these via the umbrella's own walk.
+                        continue
+                    target = by_ident.get(key)
+                    if target is None:
+                        continue
+                    if prod in target.referenced_products:
+                        continue
+                    # Reject products the owning sibling doesn't declare.
+                    # Plan would otherwise fail later with "no targets
+                    # matched product filter <prod>" when the child config
+                    # passes this name into product_filters.
+                    if prod not in declared_products.get(key, set()):
+                        continue
+                    new_products = list(target.referenced_products) + [prod]
+                    by_ident[key] = _dc_replace(
+                        target, referenced_products=new_products
+                    )
+                    additions_log.append((target.identity, prod, tp.identity))
+                    changed = True
+
+    if additions_log:
+        for owner, prod, importer in additions_log:
+            bold(
+                f"  cross-sibling expansion: {owner!r} += {prod!r} "
+                f"(referenced by {importer!r})"
+            )
+    if changed and rounds >= MAX_ROUNDS:
+        # The fixpoint didn't settle within the cap. Real SPM graphs are
+        # shallow so saturating means something is feeding the expansion
+        # endlessly (cyclic alias, manifest churn). Surface it so the
+        # user can investigate instead of silently shipping a truncated
+        # closure.
+        bold(
+            f"  cross-sibling expansion: bailed after {MAX_ROUNDS} rounds "
+            f"with the closure still growing — please file an issue with "
+            f"the full transitive list."
+        )
+
+    # Preserve original order from `transitives`.
+    return [by_ident[tp.identity.lower()] for tp in transitives]
+
+
 def _run_source_mode_with_transitives(config: Config) -> int:
     """Top-level source-mode entry point with in-process transitive recursion.
 
@@ -978,6 +1123,25 @@ def _run_source_mode_with_transitives(config: Config) -> int:
                 )
             transitives = kept
 
+    # Cross-sibling product expansion. Inspect populates
+    # `tp.referenced_products` only from the umbrella's targets — so if
+    # transitive A references product X of transitive B but the umbrella
+    # doesn't, X is missing from B's `referenced_products` and we won't
+    # build B's X.xcframework. When the orchestrator then consumes A as
+    # a sibling, A's `.swiftinterface` imports X (because A's source
+    # imports X) and xcodebuild fails to find module X — there's no
+    # sibling overlay for it and `.package(url:)` for B has been
+    # stripped from A's edited manifest (since some OTHER product of B
+    # was consumed). Concrete case: swift-case-paths' `CasePaths`
+    # references `.product(name: "XCTestDynamicOverlay", package:
+    # "xctest-dynamic-overlay")`, but TCA's umbrella only references
+    # `IssueReporting` from that package — without expansion, only
+    # `IssueReporting.xcframework` ships and CasePaths.swiftinterface's
+    # `import XCTestDynamicOverlay` dangles in swift-navigation's nested
+    # build. The expansion runs to fixpoint to cover chains where the
+    # newly-added product's owning package re-exports a third sibling.
+    transitives = _expand_cross_sibling_referenced_products(transitives)
+
     if not transitives:
         # Self-contained package — no recursion needed.
         return _source_mode_after_inspect(config, source_dir, staged_dir, package)
@@ -1029,6 +1193,22 @@ def _run_source_mode_with_transitives(config: Config) -> int:
         # and are attributed to the offending transitive identity.
         try:
             child_config = _make_transitive_child_config(config, tp, child_work_dir)
+            # Make earlier-built transitives visible to this child's planner.
+            # Without this, a transitive whose targets reference another
+            # transitive's product (e.g. swift-navigation imports CasePaths
+            # from swift-case-paths) forces xcodebuild to compile the owning
+            # package's macros from source in the nested workspace — where
+            # swift-syntax is not resolved and the build fails. Refreshing
+            # the index from `all_entries` after each successful iteration
+            # lets the child consume already-built siblings as binaryTarget
+            # overlays, matching what the umbrella does at the end of the
+            # loop.
+            (
+                child_config.prebuilt_sibling_xcframeworks,
+                child_config.prebuilt_sibling_identities,
+            ) = _build_prebuilt_sibling_index(
+                config.output_dir, all_entries, package
+            )
             result = _run_source_mode(child_config)
         except _USER_FACING_ERRORS as exc:
             # Mirror main()'s clean-error path: a child's Fetch / Inspect /
