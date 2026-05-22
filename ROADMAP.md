@@ -1,6 +1,6 @@
 # Roadmap
 
-Date: 2026-05-22 (last updated after diagnostics ship — see "Actionable error messages" below)
+Date: 2026-05-22 (last updated after `--dry-run` + wild-sample campaign — see "Serializable Plan + --dry-run" and "Wild-sample campaign" below)
 
 Forward-looking work plan for `spm-to-xcframework`. The mission: **95%+ of arbitrary SPM packages produce a valid xcframework on the first try**, with a UX that lets a first-time user succeed without reading the source.
 
@@ -17,7 +17,7 @@ This doc supersedes the forward-looking sections of [REFACTOR_PROPOSAL.md](REFAC
 | C. SwiftSyntax helper binary | REFACTOR_PROPOSAL.md | **Deferred indefinitely** — per proposal itself, B made it unnecessary |
 | D. Injection passes as separate library | REFACTOR_PROPOSAL.md | Open — see P2 below |
 | E. Content-addressed build cache | REFACTOR_PROPOSAL.md | Open — see P2 below |
-| F. Serializable Plan / `--dry-run` | REFACTOR_PROPOSAL.md | Open — see P1 below |
+| F. Serializable Plan / `--dry-run` | REFACTOR_PROPOSAL.md | **Done** (2026-05-22) — see "Serializable Plan + --dry-run" below |
 | Integration matrix scaffolding | INTEGRATION_TESTING.md | **Done** — 15/15 passing + 2 known_broken pinned to upstream bugs |
 | Nightly CI for integration matrix | INTEGRATION_TESTING.md (Phase 2) | Open — see P1 below |
 | Pre-merge integration check | INTEGRATION_TESTING.md (Phase 3) | Intentionally deferred (cost) |
@@ -76,16 +76,31 @@ Risk: low — additions are cheap to try and reveal information either way.
 
 The flag still exists as the explicit opt-out and silences the per-unit warning.
 
-### Serializable Plan + `--dry-run`
+### ~~Serializable Plan + `--dry-run`~~ — Shipped 2026-05-22
 
 (F from REFACTOR_PROPOSAL.md, merged with the UX `--dry-run` ask.)
 
-`Plan` is already a typed dataclass tree. Add `.to_json()` / `.from_json()` and a `--dry-run` flag that runs Fetch + Inspect + Plan only, prints the resolved plan, and exits before Prepare. Unlocks:
-- A "what's about to happen" preview for first-time users
-- Debugging long-tail packages without burning a 5-minute xcodebuild
-- Replayable / inspectable plans for support requests ("paste your `--dry-run` output")
+`Plan` (and every sub-dataclass that hangs off it: `StageSpec`, `PackageSwiftEdit`, `BuildUnit`, `MacroSupport`) gained `.to_json()` / `.from_json()` round-trip with an explicit `JSON_SCHEMA_VERSION = 1` envelope. `--dry-run` runs Fetch + Inspect + Plan and exits with a human-readable plan render; `--dry-run-json` does the same and writes `{schema_version, package, version, mode, transitive_packages, plan}` to stdout with all log noise routed to stderr — pipe-friendly. The orchestrator skips transitive recursion under any dry-run so no xcodebuild ever fires (was previously broken — child configs reset `dry_run=False`).
 
-Risk: low. ~100 lines + serialization tests.
+Self-tests added: round-trip equality on five representative plan shapes (empty / GRDB synth_dynamic_library / Stripe two-tier / binary-mode Path artifact / synthetic `consume_external_sibling` + `MacroSupport`), schema-version-mismatch raises, `to_json()` is `json.dumps()`-able, plus two end-to-end CLI tests (success path + failure path with `PATH`-shimmed xcodebuild that exits non-zero if invoked). 260/260 self-tests green.
+
+### Wild-sample campaign — first 95% lower-bound data point
+
+`tests/integration/wild_sample.py` (a new harness, separate from the matrix) clones a curated list of 42 SPM packages NOT in the matrix and runs each through `--dry-run-json`. Result: **40/42 plan_ok (95.2%)**, **1 diagnosed_failure**, **1 undiagnosed_failure**, **0 timeout** (90 s per candidate). One pure-noise observation surfaced first: three candidates had bogus version pins in the harness (`swift-crypto 3.16.1`, `PromiseKit 8.1.3`, `SwiftMessages 10.1.1`) — none of which exist upstream; corrected pins resolved cleanly.
+
+Real failures:
+
+- **`apple/swift-protobuf` @ 1.32.0** — `swift package describe` rejects the staged copy with *"executable product 'protoc' expects target 'protoc' to be executable; an executable target requires a 'main.swift' file"*. swift-protobuf 1.32.0 exposes its `protoc` artifact-bundle (`.binaryTarget(url:, checksum:)`) as an `.executable(...)` product; SPM accepts that combination on a vanilla `swift package describe` but rejects it after our staging pass, likely because our exclude-pruning step (which deletes manifest-declared `exclude:` paths from staged) interacts with SPM's product-target resolution for the artifact-bundle. Shipped a `format_swift_package_failure` hint that names the offending product, explains the artifact-bundle/`.executable` root cause, and points at the swift-protobuf-style `PROTOBUF_NO_PROTOC=true` env-var workaround (or `--product` to target a library product instead). Deeper root-cause investigation queued — the hint makes this actionable today without forcing the staging redesign yet.
+
+- **`realm/realm-swift` @ v20.0.3** — `swift package resolve` against the staged copy fails with *"Could not find Package.swift in this directory or any of its parent directories."* The Realm checkout uses git submodules + an unusual layout; our stage walks the source tree but the resolution context appears to land outside the staged root. Realm has historically been complex (C++/ObjC bindings on top of submoduled `realm-core`); classifying as *known-unsupported, documented* until a deliberate effort makes sense. (Lands in `undiagnosed_failure` — a candidate diagnostic pattern for "submoduled Package.swift not found" would help, but is low-priority until a second package hits the same shape.)
+
+Harness improvement on the way through: `_DIAGNOSIS_RE` originally matched only `Diagnosis:`-shaped blocks (xcodebuild-archive failures) and would have miscategorised the new `First error:` / `Try:` blocks (`format_swift_package_failure` output). Widened to anchor on the `Try:` line so any actionable hint, regardless of producer, buckets as `diagnosed_failure`. A bare `First error:` with no `Try:` (unmatched stderr shape) still buckets as `undiagnosed_failure` — exactly the shapes that need a new pattern.
+
+Coverage take-away: **95.2% plan-phase success on an uncurated wild sample** is the first hard number behind the 95% mission gate. Plan-phase success is necessary-but-not-sufficient for archive success, so this is an upper bound on end-to-end success — promoting the 40 wild successes to full archive runs in subsequent sessions will give the actual lower bound.
+
+### Diagnostics alias-import regression — Caught + guarded 2026-05-22
+
+After the diagnostics ship (`fa96866`), the matrix run revealed a `NameError: name '_scan_diagnosis' is not defined` in the single-file artifact's execute path — the build_single_file step strips relative imports wholesale (including the `from ..diagnostics import scan as _scan_diagnosis` line in `execute/archive.py`), but the call site still referenced `_scan_diagnosis`. Modular-mode tests passed (the alias was bound there); only an end-to-end archive on the single-file artifact tripped the bug. Fixed by dropping the aliases in `archive.py` (call `scan(...)` / `format_block(...)` directly), and `build_single_file.py` now rejects any aliased relative import (`from .X import Y as Z`) at build time so this can't recur silently.
 
 ### Nightly integration CI
 

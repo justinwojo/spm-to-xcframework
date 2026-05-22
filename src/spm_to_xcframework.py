@@ -48,10 +48,34 @@ _ANSI = {
 }
 
 
+# When True, `info`/`success`/`dim`/`bold` route to stderr instead of
+# stdout. Used by `--dry-run-json` (set by `cli.main()` before the
+# pipeline runs) so stdout stays a clean JSON document the campaign
+# tooling can pipe straight into `jq`. Read-only outside the CLI entry
+# point.
+_LOG_STDOUT_TO_STDERR = False
+
+
+def set_log_stdout_to_stderr(enabled: bool) -> None:
+    """Route info/success/dim/bold to stderr instead of stdout. The CLI
+    flips this on for --dry-run-json so the only stdout writes are the
+    JSON document at the end. Lives as a setter (not a direct attribute
+    mutation) so it survives the build_single_file.py concatenation step
+    — there is no `log` submodule to reach into in the single-file
+    artifact, but the setter is a module-global function either way.
+    """
+    global _LOG_STDOUT_TO_STDERR
+    _LOG_STDOUT_TO_STDERR = enabled
+
+
+def _stdout() -> "object":
+    return sys.stderr if _LOG_STDOUT_TO_STDERR else sys.stdout
+
+
 def _color_enabled() -> bool:
     if os.environ.get("NO_COLOR"):
         return False
-    return sys.stdout.isatty()
+    return _stdout().isatty()
 
 
 def _wrap(text: str, color: str) -> str:
@@ -60,12 +84,29 @@ def _wrap(text: str, color: str) -> str:
     return f"{_ANSI[color]}{text}{_ANSI['reset']}"
 
 
+def out(msg: str) -> None:
+    """Plain (uncoloured) user-facing output, routed through `_stdout()`.
+
+    Use this when the line is part of a structured human-readable
+    rendering that shouldn't carry inline colour (e.g. `print_package`
+    for `--inspect-only`). The route still respects
+    `set_log_stdout_to_stderr` so `--dry-run-json` keeps stdout clean.
+
+    Codex review P3 catch (2026-05-22): without this helper,
+    `print_package` used raw `print()` and would leak human-readable
+    text onto stdout under `--inspect-only --dry-run-json`, breaking
+    the "stdout is a clean JSON document" contract for that flag
+    combination.
+    """
+    print(msg, file=_stdout())
+
+
 def info(msg: str) -> None:
-    print(_wrap(msg, "cyan"))
+    print(_wrap(msg, "cyan"), file=_stdout())
 
 
 def success(msg: str) -> None:
-    print(_wrap(msg, "green"))
+    print(_wrap(msg, "green"), file=_stdout())
 
 
 def warn(msg: str) -> None:
@@ -73,11 +114,11 @@ def warn(msg: str) -> None:
 
 
 def dim(msg: str) -> None:
-    print(_wrap(msg, "dim"))
+    print(_wrap(msg, "dim"), file=_stdout())
 
 
 def bold(msg: str) -> None:
-    print(_wrap(msg, "bold"))
+    print(_wrap(msg, "bold"), file=_stdout())
 
 
 def die(msg: str) -> NoReturn:
@@ -93,7 +134,7 @@ def die(msg: str) -> NoReturn:
 # Verbose logger — gated on Config.verbose at call sites.
 def verbose_log(verbose: bool, msg: str) -> None:
     if verbose:
-        print(_wrap(msg, "dim"))
+        print(_wrap(msg, "dim"), file=_stdout())
 
 
 # ============================================================================
@@ -374,6 +415,18 @@ _TOOLS_VERSION_REQUIRES = re.compile(
     re.IGNORECASE,
 )
 
+# Manifest declares an executable product whose backing target SPM can't
+# treat as executable — typically a `.binaryTarget(url:, checksum:)`
+# artifact-bundle exposed as `.executable(name: ...)`. swift-protobuf
+# 1.32.0's `protoc` product is the canonical case. Captured via regex
+# (not the substring-matched `_PATTERNS` table) so we can surface the
+# offending product name in the hint.
+_EXECUTABLE_PRODUCT_BAD_BACKING = re.compile(
+    r"executable product '([^']+)' expects target '([^']+)' to be "
+    r"executable; an executable target requires a 'main\.swift' file",
+    re.IGNORECASE,
+)
+
 
 def _first_error_line(stderr: str) -> Optional[str]:
     """Return the first stderr line containing `error:` (case-insensitive),
@@ -444,6 +497,23 @@ def format_swift_package_failure(cmd: str, stderr: str) -> str:
                 "the package's `// swift-tools-version:` line against your "
                 "installed Xcode toolchain."
             )
+        else:
+            m3 = _EXECUTABLE_PRODUCT_BAD_BACKING.search(stderr)
+            if m3:
+                product = m3.group(1)
+                hint = (
+                    f"Try: the package declares an executable product "
+                    f"'{product}' whose backing target SPM doesn't accept as "
+                    f"executable (most often a `.binaryTarget(url:, checksum:)` "
+                    f"artifact bundle exposed via `.executable(name: ...)`). "
+                    f"spm-to-xcframework is library-focused — xcframeworks "
+                    f"can't ship executable products. Check whether the "
+                    f"package gates that product behind an env-var (e.g. "
+                    f"swift-protobuf's `PROTOBUF_NO_PROTOC=true` disables "
+                    f"its `protoc` executable product); otherwise use "
+                    f"--product to select a library product, or skip this "
+                    f"package."
+                )
     if hint:
         lines.append(hint)
 
@@ -511,6 +581,12 @@ class Config:
     binary_mode: bool = False
     verbose: bool = False
     dry_run: bool = False
+    # Companion flag to dry_run: when True, the CLI prints the resolved
+    # Plan as JSON (via `Plan.to_json()`) instead of the human-readable
+    # rendering, and routes informational log messages to stderr so stdout
+    # is a clean JSON document — designed for piping into tooling. Implies
+    # dry_run.
+    dry_run_json: bool = False
     keep_work: bool = False
     inspect_only: bool = False
     # When False (default), Finalize cleans up stale xcframeworks from
@@ -777,6 +853,13 @@ class StageSpec:
 
     exclude_globs: List[str] = field(default_factory=list)
 
+    def to_json(self) -> dict:
+        return {"exclude_globs": list(self.exclude_globs)}
+
+    @classmethod
+    def from_json(cls, d: dict) -> "StageSpec":
+        return cls(exclude_globs=list(d.get("exclude_globs", [])))
+
 
 @dataclass
 class PackageSwiftEdit:
@@ -842,6 +925,30 @@ class PackageSwiftEdit:
     package_identity: Optional[str] = None
     xcframework_path: Optional[Path] = None
 
+    def to_json(self) -> dict:
+        return {
+            "kind": self.kind,
+            "product_name": self.product_name,
+            "targets": list(self.targets),
+            "package_identity": self.package_identity,
+            "xcframework_path": (
+                str(self.xcframework_path)
+                if self.xcframework_path is not None
+                else None
+            ),
+        }
+
+    @classmethod
+    def from_json(cls, d: dict) -> "PackageSwiftEdit":
+        xcfx = d.get("xcframework_path")
+        return cls(
+            kind=d["kind"],
+            product_name=d["product_name"],
+            targets=list(d.get("targets", [])),
+            package_identity=d.get("package_identity"),
+            xcframework_path=Path(xcfx) if xcfx is not None else None,
+        )
+
 
 @dataclass
 class BuildUnit:
@@ -887,6 +994,36 @@ class BuildUnit:
     # `#externalMacro(module: name, ...)` calls.
     macro_deps: List[str] = field(default_factory=list)
 
+    def to_json(self) -> dict:
+        return {
+            "name": self.name,
+            "scheme": self.scheme,
+            "framework_name": self.framework_name,
+            "language": self.language,
+            "archive_strategy": self.archive_strategy,
+            "source_targets": list(self.source_targets),
+            "synthetic": self.synthetic,
+            "artifact_path": (
+                str(self.artifact_path) if self.artifact_path is not None else None
+            ),
+            "macro_deps": list(self.macro_deps),
+        }
+
+    @classmethod
+    def from_json(cls, d: dict) -> "BuildUnit":
+        artifact = d.get("artifact_path")
+        return cls(
+            name=d["name"],
+            scheme=d["scheme"],
+            framework_name=d["framework_name"],
+            language=d["language"],
+            archive_strategy=d["archive_strategy"],
+            source_targets=list(d.get("source_targets", [])),
+            synthetic=bool(d.get("synthetic", False)),
+            artifact_path=Path(artifact) if artifact is not None else None,
+            macro_deps=list(d.get("macro_deps", [])),
+        )
+
 
 @dataclass
 class MacroSupport:
@@ -919,6 +1056,24 @@ class MacroSupport:
 
     macro_target_name: str
     plugin_executable_path: Optional[Path] = None
+
+    def to_json(self) -> dict:
+        return {
+            "macro_target_name": self.macro_target_name,
+            "plugin_executable_path": (
+                str(self.plugin_executable_path)
+                if self.plugin_executable_path is not None
+                else None
+            ),
+        }
+
+    @classmethod
+    def from_json(cls, d: dict) -> "MacroSupport":
+        plugin = d.get("plugin_executable_path")
+        return cls(
+            macro_target_name=d["macro_target_name"],
+            plugin_executable_path=Path(plugin) if plugin is not None else None,
+        )
 
 
 @dataclass
@@ -963,6 +1118,44 @@ class Plan:
     # to thread `-load-plugin-executable` flags into per-unit
     # `OTHER_SWIFT_FLAGS`. See `MacroSupport` for the rationale.
     macros: List["MacroSupport"] = field(default_factory=list)
+
+    # Bump when the JSON shape changes in a way that can't be read back by
+    # the previous shape. Used to fail loudly rather than silently drift.
+    JSON_SCHEMA_VERSION = 1
+
+    def to_json(self) -> dict:
+        return {
+            "schema_version": self.JSON_SCHEMA_VERSION,
+            "stage": self.stage.to_json(),
+            "package_swift_edits": [e.to_json() for e in self.package_swift_edits],
+            "build_units": [bu.to_json() for bu in self.build_units],
+            "skipped": [[name, reason] for name, reason in self.skipped],
+            "warnings": list(self.warnings),
+            "include_deps": self.include_deps,
+            "binary_mode": self.binary_mode,
+            "macros": [m.to_json() for m in self.macros],
+        }
+
+    @classmethod
+    def from_json(cls, d: dict) -> "Plan":
+        sv = d.get("schema_version", 1)
+        if sv != cls.JSON_SCHEMA_VERSION:
+            raise ValueError(
+                f"Plan JSON schema version {sv!r} is not supported "
+                f"(expected {cls.JSON_SCHEMA_VERSION})"
+            )
+        return cls(
+            stage=StageSpec.from_json(d.get("stage", {})),
+            package_swift_edits=[
+                PackageSwiftEdit.from_json(e) for e in d.get("package_swift_edits", [])
+            ],
+            build_units=[BuildUnit.from_json(bu) for bu in d.get("build_units", [])],
+            skipped=[(name, reason) for name, reason in d.get("skipped", [])],
+            warnings=list(d.get("warnings", [])),
+            include_deps=bool(d.get("include_deps", False)),
+            binary_mode=bool(d.get("binary_mode", False)),
+            macros=[MacroSupport.from_json(m) for m in d.get("macros", [])],
+        )
 
 
 @dataclass
@@ -2439,16 +2632,16 @@ def inspect_package(config: Config, staged_dir: Path) -> Package:
 def print_package(pkg: Package) -> None:
     """Human-readable Package summary, used by --inspect-only."""
     bold(f"\n=== {pkg.name} ===")
-    print(f"  tools-version: {pkg.tools_version}")
+    out(f"  tools-version: {pkg.tools_version}")
     if pkg.platforms:
         plats = ", ".join(f"{p.name} {p.version}" for p in pkg.platforms)
-        print(f"  platforms:     {plats}")
-    print(f"  staged dir:    {pkg.staged_dir}")
-    print(f"  schemes:       {', '.join(pkg.schemes) if pkg.schemes else '(none discovered)'}")
+        out(f"  platforms:     {plats}")
+    out(f"  staged dir:    {pkg.staged_dir}")
+    out(f"  schemes:       {', '.join(pkg.schemes) if pkg.schemes else '(none discovered)'}")
 
     bold(f"\nProducts ({len(pkg.products)}):")
     if not pkg.products:
-        print("  (none)")
+        out("  (none)")
     for p in pkg.products:
         # Cross-reference each product's backing targets to flag system /
         # already-dynamic shapes the planner will care about.
@@ -2462,7 +2655,7 @@ def print_package(pkg: Package) -> None:
         if all(k == TargetKind.SYSTEM for k in kinds) and kinds:
             notes.append("system-only — will be skipped")
         note_s = f"  [{', '.join(notes)}]" if notes else ""
-        print(
+        out(
             f"  - {p.name}  linkage={p.linkage}  targets={p.targets}{note_s}"
         )
 
@@ -2470,7 +2663,7 @@ def print_package(pkg: Package) -> None:
     for t in pkg.targets:
         path_disp = t.path or "(default)"
         hdr = f" headers={t.public_headers_path}" if t.public_headers_path else ""
-        print(
+        out(
             f"  - {t.name}  kind={t.kind}  language={t.language}"
             f"  path={path_disp}{hdr}  files={t.source_file_count}"
         )
@@ -9102,10 +9295,10 @@ def _format_execute_error(unit_name: str, log_path: Path, errors: List[dict]) ->
                 haystack_parts.append("".join(f.readlines()[-200:]))
     except OSError:
         pass
-    diag = _scan_diagnosis("\n".join(haystack_parts))
+    diag = scan("\n".join(haystack_parts))
     if diag is not None:
         lines.append("")
-        lines.append(_format_diagnosis_block(diag))
+        lines.append(format_block(diag))
 
     lines.append("")
     if errors:
@@ -13205,6 +13398,7 @@ def print_verify_summary(
 
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -13303,7 +13497,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> Tuple[argparse.Namespace
     parser.add_argument("--verbose", action="store_true",
                         help="Show full build output")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Show what would be built without building")
+                        help="Show what would be built without building. "
+                             "Runs Fetch + Inspect + Plan only; no xcodebuild "
+                             "is invoked (transitive sibling resolution is "
+                             "skipped — the printed plan reflects the umbrella "
+                             "package alone).")
+    parser.add_argument("--dry-run-json", action="store_true",
+                        help="Like --dry-run, but emit the resolved Plan as "
+                             "machine-readable JSON on stdout (informational "
+                             "log messages route to stderr). Implies --dry-run.")
     parser.add_argument("--keep-work", action="store_true",
                         help="Keep temporary work directory (for debugging)")
     parser.add_argument(
@@ -13365,7 +13567,8 @@ def _config_from_args(ns: argparse.Namespace) -> Config:
         include_deps=ns.include_deps,
         binary_mode=ns.binary,
         verbose=ns.verbose,
-        dry_run=ns.dry_run,
+        dry_run=ns.dry_run or ns.dry_run_json,
+        dry_run_json=ns.dry_run_json,
         keep_work=ns.keep_work,
         no_cleanup_stale=ns.no_cleanup_stale,
         no_dedup_overlap=ns.no_dedup_overlap,
@@ -13390,6 +13593,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "Drop one or the other.")
 
     config = _config_from_args(ns)
+    if config.dry_run_json:
+        # Keep stdout clean for the JSON document; all info/bold/dim/success
+        # phase chatter routes to stderr until the final json.dumps call.
+        set_log_stdout_to_stderr(True)
 
     # Argument-injection hardening. Reject shapes that could be
     # misinterpreted by downstream `git` invocations before we do any
@@ -13659,6 +13866,49 @@ def _validate_platforms_post_autodetect(config: Config) -> None:
             )
 
 
+def _emit_dry_run_json(
+    plan,
+    *,
+    package,
+    config: Config,
+) -> None:
+    """Print the resolved Plan as JSON on stdout for `--dry-run-json`.
+
+    The envelope wraps `plan.to_json()` with a small amount of context the
+    campaign tooling wants for free: package label, version, mode, and the
+    list of transitive SPM identities that would be built as siblings if
+    the run weren't a dry-run. The transitive list is purely informational
+    — the plan itself never includes `consume_external_sibling` edits in
+    dry-run mode because no actual sibling xcframeworks exist on disk.
+    """
+    if package is not None:
+        name = package.name
+        transitive_idents = [tp.identity for tp in package.transitive_packages]
+    else:
+        name = _derive_package_label(config.package_source or "(unknown)")
+        transitive_idents = []
+    # Resolved per-platform deployment targets: same source of truth
+    # that `print_plan` renders as "Selected slices" (see
+    # plan.py:1251). Without this, JSON consumers can't recover what
+    # platform set the run will actually drive xcodebuild against —
+    # caught by Codex review on the 2026-05-22 dry-run-json pass.
+    platforms = {
+        p: getattr(config, f"min_{p}")
+        for p in _enabled_platforms(config)
+    }
+    envelope = {
+        "package": name,
+        "version": config.user_version or None,
+        "mode": "binary" if plan.binary_mode else "source",
+        "platforms": platforms,
+        "transitive_packages": transitive_idents,
+        "plan": plan.to_json(),
+    }
+    json.dump(envelope, sys.stdout, indent=2, sort_keys=False)
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
 def _source_mode_inspect(config: Config):
     """Fetch + Stage + Inspect + autodetect + post-autodetect validation.
 
@@ -13750,7 +14000,10 @@ def _source_mode_after_inspect(
     plan = plan_source_build(config, package)
     for w in plan.warnings:
         warn(w)
-    print_plan(plan, package=package, config=config)
+    if config.dry_run_json:
+        _emit_dry_run_json(plan, package=package, config=config)
+    else:
+        print_plan(plan, package=package, config=config)
 
     if config.dry_run:
         return 0
@@ -14188,6 +14441,17 @@ def _run_source_mode_with_transitives(config: Config) -> int:
     if config.no_transitive_products or config.child_run:
         return _run_source_mode(config)
 
+    # Dry-run skips the transitive build loop entirely — emitting a plan
+    # for the umbrella alone is the point of `--dry-run` (no xcodebuild
+    # invocation, no 5-minute archives). The dry-run JSON envelope still
+    # lists the transitive package identities so the campaign tooling can
+    # see what would be built. The umbrella plan in dry-run lacks
+    # `consume_external_sibling` edits because no sibling xcframeworks
+    # exist on disk yet — that's accepted scope; dry-run is a preview, not
+    # a faithful end-state simulation.
+    if config.dry_run:
+        return _run_source_mode(config)
+
     inspect_result = _source_mode_inspect(config)
     if isinstance(inspect_result, int):
         return inspect_result
@@ -14435,7 +14699,10 @@ def _run_binary_mode(config: Config) -> int:
     plan = plan_binary_build(config, artifacts)
     for w in plan.warnings:
         warn(w)
-    print_plan(plan, package=None, config=config)
+    if config.dry_run_json:
+        _emit_dry_run_json(plan, package=None, config=config)
+    else:
+        print_plan(plan, package=None, config=config)
 
     if config.dry_run:
         return 0

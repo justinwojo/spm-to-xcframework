@@ -112,6 +112,26 @@ if __name__ == "__main__":
 # multi-line forms so we can elide them wholesale.
 _RE_REL_IMPORT_START = re.compile(r"^from\s+\.+\w*")
 _RE_FUTURE_IMPORT = re.compile(r"^from\s+__future__\s+import\b")
+# Aliased relative imports (`from .X import Y as Z`) silently break the
+# single-file build: the import line is stripped, but the call sites still
+# reference `Z` — and only `Y` actually exists at module-global scope.
+# Matches the relative-import header on a single line; the alias check
+# (`_check_no_aliased_rel_imports`) collects the full block (single-line
+# or parenthesised continuation) and scans the joined text for an `as`
+# token, so multi-line shapes like
+#     from ..diagnostics import (
+#         format_block as _format_diagnosis_block,
+#         scan,
+#     )
+# are caught too. Reject at build time so a future regression can't
+# slip through (one already cost us a matrix run — see ROADMAP.md /
+# the swift-syntax NameError in the diagnostics rollout).
+# Header regex must accept dotted module paths (`from .foo.bar import …`
+# and `from ..pkg.sub import …`), not just single-segment relatives, or
+# the alias guard silently lets aliased imports from nested modules
+# through. Codex review r2 catch (2026-05-22).
+_RE_REL_IMPORT_HEADER = re.compile(r"^from\s+\.+[\w.]*\s+import\b")
+_RE_IMPORT_ALIAS_TOKEN = re.compile(r"\bas\s+\w+")
 
 
 def _strip_leading_docstring(lines: List[str]) -> List[str]:
@@ -212,6 +232,38 @@ def _paren_delta(line: str) -> int:
     return depth
 
 
+def _strip_inline_comment(line: str) -> str:
+    """Drop everything from the first `#` that is *outside* a string
+    literal on a single line. Mirrors `_paren_delta`'s quote handling.
+
+    Used to sanitize import-block lines before the alias-token scan in
+    `_check_no_aliased_rel_imports` — without this, a benign comment
+    like `Foo,  # use as fallback` inside a parenthesised multi-line
+    relative import would false-trigger the guard. (Grok review r2
+    catch, 2026-05-22.)
+    """
+    quote = ""
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if ch == "#":
+            return line[:i]
+        i += 1
+    return line
+
+
 def _strip_future_imports(lines: List[str]) -> List[str]:
     """Drop every `from __future__ import …` line. The preamble owns
     the single permitted occurrence."""
@@ -227,8 +279,59 @@ def _strip_leading_shebang(lines: List[str]) -> List[str]:
     return lines
 
 
+def _check_no_aliased_rel_imports(path: Path, text: str) -> None:
+    """Reject aliased relative imports (`from .X import Y as Z`).
+
+    The concatenation step strips the import block entirely, but call
+    sites still reference `Z` — and only `Y` ends up in the merged
+    namespace. Both single-line shapes and parenthesised continuations
+    are checked: when a relative-import header is found, we walk the
+    block (tracking paren depth via the same `_paren_delta` helper the
+    stripper uses) and scan the joined text for an `as <name>` token.
+    Caught a real bug once (swift-syntax NameError after the diagnostics
+    rollout); fail-fast at build time so it can't recur silently.
+
+    Codex review P2 catch (2026-05-22): an earlier version only matched
+    `as` on the same physical line as `from ... import`, silently
+    permitting the parenthesised-continuation footgun this guard exists
+    to prevent.
+    """
+    lines = text.splitlines()
+    offending: List[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.lstrip()
+        if not _RE_REL_IMPORT_HEADER.match(stripped):
+            i += 1
+            continue
+        block = [line]
+        depth = _paren_delta(line)
+        i += 1
+        while depth > 0 and i < len(lines):
+            block.append(lines[i])
+            depth += _paren_delta(lines[i])
+            i += 1
+        joined = " ".join(_strip_inline_comment(l) for l in block)
+        if _RE_IMPORT_ALIAS_TOKEN.search(joined):
+            # Surface the entire block in the error so the user sees the
+            # multi-line shape verbatim.
+            offending.append("\n  ".join(block))
+    if offending:
+        body = "\n  ---\n  ".join(offending)
+        raise SystemExit(
+            f"{path}: aliased relative imports are not supported by the "
+            f"single-file build (the alias is dropped along with the "
+            f"import block, leaving call sites referencing an undefined "
+            f"name). Offending block(s):\n  {body}\n"
+            f"Fix: rename the local references to use the imported "
+            f"symbol's original name."
+        )
+
+
 def _process_module(path: Path) -> str:
     text = path.read_text()
+    _check_no_aliased_rel_imports(path, text)
     lines = text.splitlines(keepends=True)
     lines = _strip_leading_shebang(lines)
     lines = _strip_leading_docstring(lines)

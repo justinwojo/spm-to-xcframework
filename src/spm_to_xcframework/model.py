@@ -176,6 +176,13 @@ class StageSpec:
 
     exclude_globs: List[str] = field(default_factory=list)
 
+    def to_json(self) -> dict:
+        return {"exclude_globs": list(self.exclude_globs)}
+
+    @classmethod
+    def from_json(cls, d: dict) -> "StageSpec":
+        return cls(exclude_globs=list(d.get("exclude_globs", [])))
+
 
 @dataclass
 class PackageSwiftEdit:
@@ -241,6 +248,30 @@ class PackageSwiftEdit:
     package_identity: Optional[str] = None
     xcframework_path: Optional[Path] = None
 
+    def to_json(self) -> dict:
+        return {
+            "kind": self.kind,
+            "product_name": self.product_name,
+            "targets": list(self.targets),
+            "package_identity": self.package_identity,
+            "xcframework_path": (
+                str(self.xcframework_path)
+                if self.xcframework_path is not None
+                else None
+            ),
+        }
+
+    @classmethod
+    def from_json(cls, d: dict) -> "PackageSwiftEdit":
+        xcfx = d.get("xcframework_path")
+        return cls(
+            kind=d["kind"],
+            product_name=d["product_name"],
+            targets=list(d.get("targets", [])),
+            package_identity=d.get("package_identity"),
+            xcframework_path=Path(xcfx) if xcfx is not None else None,
+        )
+
 
 @dataclass
 class BuildUnit:
@@ -286,6 +317,36 @@ class BuildUnit:
     # `#externalMacro(module: name, ...)` calls.
     macro_deps: List[str] = field(default_factory=list)
 
+    def to_json(self) -> dict:
+        return {
+            "name": self.name,
+            "scheme": self.scheme,
+            "framework_name": self.framework_name,
+            "language": self.language,
+            "archive_strategy": self.archive_strategy,
+            "source_targets": list(self.source_targets),
+            "synthetic": self.synthetic,
+            "artifact_path": (
+                str(self.artifact_path) if self.artifact_path is not None else None
+            ),
+            "macro_deps": list(self.macro_deps),
+        }
+
+    @classmethod
+    def from_json(cls, d: dict) -> "BuildUnit":
+        artifact = d.get("artifact_path")
+        return cls(
+            name=d["name"],
+            scheme=d["scheme"],
+            framework_name=d["framework_name"],
+            language=d["language"],
+            archive_strategy=d["archive_strategy"],
+            source_targets=list(d.get("source_targets", [])),
+            synthetic=bool(d.get("synthetic", False)),
+            artifact_path=Path(artifact) if artifact is not None else None,
+            macro_deps=list(d.get("macro_deps", [])),
+        )
+
 
 @dataclass
 class MacroSupport:
@@ -318,6 +379,24 @@ class MacroSupport:
 
     macro_target_name: str
     plugin_executable_path: Optional[Path] = None
+
+    def to_json(self) -> dict:
+        return {
+            "macro_target_name": self.macro_target_name,
+            "plugin_executable_path": (
+                str(self.plugin_executable_path)
+                if self.plugin_executable_path is not None
+                else None
+            ),
+        }
+
+    @classmethod
+    def from_json(cls, d: dict) -> "MacroSupport":
+        plugin = d.get("plugin_executable_path")
+        return cls(
+            macro_target_name=d["macro_target_name"],
+            plugin_executable_path=Path(plugin) if plugin is not None else None,
+        )
 
 
 @dataclass
@@ -362,6 +441,44 @@ class Plan:
     # to thread `-load-plugin-executable` flags into per-unit
     # `OTHER_SWIFT_FLAGS`. See `MacroSupport` for the rationale.
     macros: List["MacroSupport"] = field(default_factory=list)
+
+    # Bump when the JSON shape changes in a way that can't be read back by
+    # the previous shape. Used to fail loudly rather than silently drift.
+    JSON_SCHEMA_VERSION = 1
+
+    def to_json(self) -> dict:
+        return {
+            "schema_version": self.JSON_SCHEMA_VERSION,
+            "stage": self.stage.to_json(),
+            "package_swift_edits": [e.to_json() for e in self.package_swift_edits],
+            "build_units": [bu.to_json() for bu in self.build_units],
+            "skipped": [[name, reason] for name, reason in self.skipped],
+            "warnings": list(self.warnings),
+            "include_deps": self.include_deps,
+            "binary_mode": self.binary_mode,
+            "macros": [m.to_json() for m in self.macros],
+        }
+
+    @classmethod
+    def from_json(cls, d: dict) -> "Plan":
+        sv = d.get("schema_version", 1)
+        if sv != cls.JSON_SCHEMA_VERSION:
+            raise ValueError(
+                f"Plan JSON schema version {sv!r} is not supported "
+                f"(expected {cls.JSON_SCHEMA_VERSION})"
+            )
+        return cls(
+            stage=StageSpec.from_json(d.get("stage", {})),
+            package_swift_edits=[
+                PackageSwiftEdit.from_json(e) for e in d.get("package_swift_edits", [])
+            ],
+            build_units=[BuildUnit.from_json(bu) for bu in d.get("build_units", [])],
+            skipped=[(name, reason) for name, reason in d.get("skipped", [])],
+            warnings=list(d.get("warnings", [])),
+            include_deps=bool(d.get("include_deps", False)),
+            binary_mode=bool(d.get("binary_mode", False)),
+            macros=[MacroSupport.from_json(m) for m in d.get("macros", [])],
+        )
 
 
 @dataclass

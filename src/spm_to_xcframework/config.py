@@ -52,6 +52,12 @@ class Config:
     binary_mode: bool = False
     verbose: bool = False
     dry_run: bool = False
+    # Companion flag to dry_run: when True, the CLI prints the resolved
+    # Plan as JSON (via `Plan.to_json()`) instead of the human-readable
+    # rendering, and routes informational log messages to stderr so stdout
+    # is a clean JSON document — designed for piping into tooling. Implies
+    # dry_run.
+    dry_run_json: bool = False
     keep_work: bool = False
     inspect_only: bool = False
     # When False (default), Finalize cleans up stale xcframeworks from

@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import importlib.util
 import io
 import json
+import os
 import plistlib
 import shutil
 import subprocess
@@ -4898,6 +4900,162 @@ def _selftest_diagnostics_format_swift_package_failure_tools_version_too_new() -
     _assert("upgrade xcode" in out.lower(), out)
     _assert("bump the manifest" not in out.lower(),
             f"wrong-direction hint must not fire: {out!r}")
+
+
+def _selftest_build_single_file_rejects_aliased_relative_imports() -> None:
+    """build_single_file.py must reject aliased relative imports — both
+    single-line (`from .X import Y as Z`) and parenthesised multi-line
+    (`from .X import (\\n  Y as Z,\\n  W,\\n)`) — because the
+    concatenation step strips the entire import block, leaving call
+    sites referencing names that don't exist in the merged namespace.
+
+    A non-aliased relative import (single-line or multi-line) must pass
+    so we don't regress everyday `from .errors import FetchError,
+    InspectError` patterns.
+
+    The single-line case is what bit us at the diagnostics rollout
+    (`fa96866`) — a NameError that only surfaced when the concatenated
+    artifact ran the archive path. The multi-line case is the same
+    footgun, caught by Codex/Grok review on the 2026-05-22 dry-run-json
+    pass.
+    """
+    # Import the builder by file path so this test runs against the
+    # actual builder, not a copy.
+    repo_root = Path(__file__).resolve().parent.parent
+    builder_path = repo_root / "src" / "build_single_file.py"
+    spec = importlib.util.spec_from_file_location("_bsf_under_test", builder_path)
+    bsf = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(bsf)
+
+    good_singleline = (
+        "from __future__ import annotations\n"
+        "from .errors import FetchError\n"
+        "from ..diagnostics import scan\n"
+        "x = 1\n"
+    )
+    good_multiline = (
+        "from __future__ import annotations\n"
+        "from .errors import (\n"
+        "    FetchError,\n"
+        "    InspectError,\n"
+        ")\n"
+        "from ..diagnostics import (\n"
+        "    scan,\n"
+        "    format_block,\n"
+        ")\n"
+    )
+    # An `as` token inside a `#` comment in an import block must NOT
+    # trip the guard — earlier versions of `_strip_inline_comment`-less
+    # join-and-scan logic would false-reject this benign shape. (Grok
+    # review r2 catch, 2026-05-22.)
+    good_multiline_with_comment = (
+        "from __future__ import annotations\n"
+        "from .errors import (\n"
+        "    FetchError,  # used as fallback when fetch fails\n"
+        "    InspectError,\n"
+        ")\n"
+    )
+    # Dotted relative modules (`from .pkg.sub import …`) must reach the
+    # alias scanner — earlier header regex anchored only at `\.+\w*`
+    # silently let nested-module aliases through. (Codex review r2
+    # catch, 2026-05-22.)
+    good_dotted = (
+        "from __future__ import annotations\n"
+        "from .pkg.sub import Helper\n"
+    )
+    bad_dotted = (
+        "from __future__ import annotations\n"
+        "from .pkg.sub import Helper as _h\n"
+    )
+    bad_singleline = (
+        "from __future__ import annotations\n"
+        "from ..diagnostics import scan as _scan_diagnosis\n"
+    )
+    bad_multiline = (
+        "from __future__ import annotations\n"
+        "from ..diagnostics import (\n"
+        "    format_block as _format_diagnosis_block,\n"
+        "    scan,\n"
+        ")\n"
+    )
+    # Non-relative aliased imports must NOT be flagged — stdlib aliases
+    # (`import numpy as np` style) survive concatenation since they
+    # aren't stripped.
+    good_stdlib_alias = (
+        "from __future__ import annotations\n"
+        "from typing import Optional as Opt\n"
+    )
+
+    sentinel = Path("dummy-module.py")
+    for label, text in (
+        ("good_singleline", good_singleline),
+        ("good_multiline", good_multiline),
+        ("good_multiline_with_comment", good_multiline_with_comment),
+        ("good_dotted", good_dotted),
+        ("good_stdlib_alias", good_stdlib_alias),
+    ):
+        try:
+            bsf._check_no_aliased_rel_imports(sentinel, text)
+        except SystemExit as exc:
+            raise AssertionError(
+                f"_check_no_aliased_rel_imports falsely rejected {label}: {exc}"
+            )
+
+    for label, text in (
+        ("bad_singleline", bad_singleline),
+        ("bad_multiline", bad_multiline),
+        ("bad_dotted", bad_dotted),
+    ):
+        try:
+            bsf._check_no_aliased_rel_imports(sentinel, text)
+        except SystemExit as exc:
+            msg = str(exc)
+            _assert(
+                "aliased relative imports" in msg,
+                f"{label}: error must mention 'aliased relative imports'; got: {msg}",
+            )
+            _assert(
+                "dummy-module.py" in msg,
+                f"{label}: error must include the offending file path; got: {msg}",
+            )
+            continue
+        raise AssertionError(
+            f"_check_no_aliased_rel_imports failed to reject {label} — "
+            f"would have silently broken the single-file artifact"
+        )
+
+
+def _selftest_diagnostics_format_swift_package_failure_executable_product() -> None:
+    """swift-protobuf 1.32.0 trips this shape: its `protoc` executable
+    product is backed by a `.binaryTarget(url:, checksum:)` artifact
+    bundle, and `swift package describe` rejects that combo with the
+    "expects target ... to be executable; ... requires a 'main.swift'"
+    line. The hint must name the product, point at the env-var-gating
+    workaround (the swift-protobuf-style PROTOBUF_NO_PROTOC trick), and
+    note that xcframeworks can't ship executables anyway — so --product
+    or skipping is the right path."""
+    from spm_to_xcframework.diagnostics import format_swift_package_failure
+
+    stderr = (
+        "warning: 'staged': Invalid Exclude '/tmp/staged/Sources/SwiftProtobuf/"
+        "CMakeLists.txt': File not found.\n"
+        "error: 'staged': executable product 'protoc' expects target "
+        "'protoc' to be executable; an executable target requires a "
+        "'main.swift' file\n"
+    )
+    out = format_swift_package_failure("swift package describe", stderr)
+    _assert("First error:" in out, out)
+    _assert("'protoc'" in out, out)
+    _assert("Try:" in out, out)
+    # Hint should mention the artifact-bundle root cause and the
+    # env-var-gating workaround pattern (without depending on
+    # swift-protobuf specifically being installed).
+    _assert("binaryTarget" in out.lower() or "artifact bundle" in out.lower(), out)
+    _assert("--product" in out or "skip" in out.lower(), out)
+    # Wrong-direction tools-version hints must not fire on this shape.
+    _assert("bump the manifest" not in out.lower(), out)
+    _assert("upgrade xcode" not in out.lower(), out)
 
 
 def _selftest_diagnostics_format_swift_package_failure_unknown_shape() -> None:
@@ -10424,6 +10582,10 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          _selftest_diagnostics_format_swift_package_failure_tools_version, False),
         ("diagnostics [Codex review P2]: tools-version too-new hint points at Xcode upgrade",
          _selftest_diagnostics_format_swift_package_failure_tools_version_too_new, False),
+        ("diagnostics: executable-product backed by artifact bundle gets a hint (wild-sample swift-protobuf 1.32.0)",
+         _selftest_diagnostics_format_swift_package_failure_executable_product, False),
+        ("build_single_file: rejects aliased relative imports (single + multi-line)",
+         _selftest_build_single_file_rejects_aliased_relative_imports, False),
         ("diagnostics: swift-package shaping degrades silently on unknown stderr",
          _selftest_diagnostics_format_swift_package_failure_unknown_shape, False),
         ("diagnostics: swift-package shaping handles empty stderr",
@@ -10679,6 +10841,24 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          _roundtrip_validator_catches_missing_product, True),
         ("round-trip: full prepare() flow on GRDB", _roundtrip_full_prepare_grdb, True),
         ("round-trip: Foo minimal fixture synth_dynamic_library", _roundtrip_foo_force_dynamic, True),
+        ("plan-json: empty plan round-trips",
+         _selftest_plan_json_roundtrip_empty, False),
+        ("plan-json: GRDB plan round-trips (synth_dynamic_library + skipped tuples)",
+         _selftest_plan_json_roundtrip_grdb, False),
+        ("plan-json: Stripe plan round-trips (synth_library + synth_dynamic_library)",
+         _selftest_plan_json_roundtrip_stripe, False),
+        ("plan-json: binary-mode plan round-trips (Path artifact_path)",
+         _selftest_plan_json_roundtrip_binary_mode, False),
+        ("plan-json: synthetic plan exercises consume_external_sibling + macros",
+         _selftest_plan_json_roundtrip_synthetic_edits, False),
+        ("plan-json: schema_version mismatch raises ValueError",
+         _selftest_plan_json_schema_version_mismatch, False),
+        ("plan-json: to_json output is directly json.dumps-able",
+         _selftest_plan_json_to_json_is_serializable, False),
+        ("cli: --dry-run-json emits plan JSON without invoking xcodebuild",
+         lambda: _selftest_cli_dry_run_json_writes_plan_to_stdout(tmp_root), True),
+        ("cli: --dry-run-json failure path keeps stdout empty",
+         lambda: _selftest_cli_dry_run_json_failure_path(tmp_root), True),
     ]
 
 
@@ -10712,6 +10892,389 @@ def run_self_test(fast: bool) -> int:
     return 0
 
 
+
+
+# --- Plan JSON round-trip + --dry-run-json CLI tests ---------------------
+#
+# Covers the Serializable Plan + `--dry-run-json` work tracked in ROADMAP.md
+# under P1. Round-trip: every shape the planner can emit (synth_library,
+# synth_dynamic_library, consume_external_sibling, binary-mode copy-artifact,
+# macros, skipped products) must survive `Plan.to_json()` → `json.dumps` →
+# `json.loads` → `Plan.from_json()` with equality. CLI-level: `--dry-run`
+# must never invoke xcodebuild, and `--dry-run-json` emits a parseable JSON
+# document on stdout while routing every other log line to stderr.
+
+
+def _selftest_plan_json_roundtrip_empty() -> None:
+    """The default-constructed Plan round-trips cleanly. Sanity check that
+    every dataclass field has both a serializer and deserializer (a missing
+    one would surface as a non-equality here, not a crash)."""
+    plan = Plan()
+    payload = plan.to_json()
+    # Must serialise to real JSON — no Path objects or tuples surviving.
+    text = json.dumps(payload)
+    restored = Plan.from_json(json.loads(text))
+    _assert(restored == plan, f"empty-plan round-trip failed: {restored!r} != {plan!r}")
+    _assert(
+        payload["schema_version"] == Plan.JSON_SCHEMA_VERSION,
+        f"schema_version missing or wrong in serialized payload: {payload!r}",
+    )
+
+
+def _selftest_plan_json_roundtrip_grdb() -> None:
+    """GRDB plan exercises synth_dynamic_library + skipped products + warnings
+    (the planner emits a `synth_dynamic_library` edit for GRDB, drops
+    GRDBSQLite as a system-only wrapper). Confirms tuples-in-skipped survive
+    the JSON list→tuple round-trip."""
+    pkg = _mk_package_from_snapshot(
+        GRDB_DUMP_SNAPSHOT,
+        schemes=["GRDB", "GRDB-dynamic", "GRDB-Package"],
+    )
+    config = Config(
+        package_source="https://github.com/groue/GRDB.swift.git",
+        user_version="7.9.0",
+        resolved_version="v7.9.0",
+    )
+    plan = plan_source_build(config, pkg)
+    _assert(
+        any(e.kind == "synth_dynamic_library" for e in plan.package_swift_edits),
+        "expected the GRDB plan to carry a synth_dynamic_library edit",
+    )
+    _assert(plan.skipped, "expected the GRDB plan to skip GRDBSQLite")
+
+    text = json.dumps(plan.to_json())
+    restored = Plan.from_json(json.loads(text))
+    _assert(
+        restored == plan,
+        "GRDB plan round-trip failed: serialized/deserialized plan differs",
+    )
+    # Spot-check the tuple conversion in skipped — `from_json` must produce
+    # tuples (matching the dataclass field type), not lists.
+    for entry in restored.skipped:
+        _assert(
+            isinstance(entry, tuple) and len(entry) == 2,
+            f"skipped entries must be (str, str) tuples after from_json, got {entry!r}",
+        )
+
+
+def _selftest_plan_json_roundtrip_stripe() -> None:
+    """Stripe plan exercises the union of synth_library (for --target) and
+    synth_dynamic_library (for --product Stripe / auto-synth StripePayments)
+    edits in a single plan."""
+    pkg = _mk_package_from_snapshot(STRIPE_DUMP_SNAPSHOT, schemes=[])
+    config = Config(
+        package_source="https://github.com/stripe/stripe-ios.git",
+        user_version="25.6.2",
+        resolved_version="25.6.2",
+        product_filters=["Stripe"],
+        target_filters=["StripeCore", "StripeUICore"],
+    )
+    plan = plan_source_build(config, pkg)
+    edit_kinds = {e.kind for e in plan.package_swift_edits}
+    _assert(
+        "synth_library" in edit_kinds and "synth_dynamic_library" in edit_kinds,
+        f"expected both synth_library and synth_dynamic_library in Stripe plan; got {edit_kinds}",
+    )
+
+    text = json.dumps(plan.to_json())
+    restored = Plan.from_json(json.loads(text))
+    _assert(restored == plan, "Stripe plan round-trip failed")
+
+
+def _selftest_plan_json_roundtrip_binary_mode() -> None:
+    """Binary-mode plan: copy-artifact build units with `artifact_path` Path
+    fields. Exercise Path → str → Path conversion on the round-trip."""
+    pkg_path = Path("/tmp/spm2xc-fake-artifact/Foo.xcframework")
+    artifacts = [BinaryArtifact(product_name="Foo", path=pkg_path)]
+    config = Config(
+        package_source="https://example.com/foo.git",
+        user_version="1.0.0",
+        resolved_version="1.0.0",
+        binary_mode=True,
+    )
+    plan = plan_binary_build(config, artifacts)
+    _assert(plan.binary_mode, "plan_binary_build must set binary_mode=True")
+    _assert(
+        len(plan.build_units) == 1
+        and plan.build_units[0].archive_strategy == "copy-artifact"
+        and plan.build_units[0].artifact_path == pkg_path,
+        f"plan_binary_build did not produce the expected copy-artifact unit: {plan.build_units}",
+    )
+
+    text = json.dumps(plan.to_json())
+    restored = Plan.from_json(json.loads(text))
+    _assert(restored == plan, "binary-mode plan round-trip failed")
+    _assert(
+        isinstance(restored.build_units[0].artifact_path, Path),
+        "artifact_path must be a Path after from_json, not a string",
+    )
+
+
+def _selftest_plan_json_roundtrip_synthetic_edits() -> None:
+    """Synthetic Plan exercising consume_external_sibling + macros — shapes
+    the snapshot-based planner tests don't hit because they depend on
+    orchestrator state. Built by hand to exercise the optional Path fields."""
+    plan = Plan(
+        stage=StageSpec(exclude_globs=["__MACOSX", ".DS_Store"]),
+        package_swift_edits=[
+            PackageSwiftEdit(
+                kind="synth_library",
+                product_name="StripeCore",
+                targets=["StripeCore"],
+            ),
+            PackageSwiftEdit(
+                kind="consume_external_sibling",
+                product_name="IssueReporting",
+                targets=[],
+                package_identity="xctest-dynamic-overlay",
+                xcframework_path=Path("/tmp/xcframeworks/IssueReporting.xcframework"),
+            ),
+        ],
+        build_units=[
+            BuildUnit(
+                name="Foo",
+                scheme="Foo",
+                framework_name="Foo",
+                language="Swift",
+                archive_strategy="archive",
+                source_targets=["Foo"],
+                macro_deps=["FooMacros"],
+            ),
+        ],
+        skipped=[("LegacyHelper", "system-only wrapper"), ("DebugTool", "executable target")],
+        warnings=["consider --include-deps for hidden symbols"],
+        include_deps=True,
+        binary_mode=False,
+        macros=[
+            MacroSupport(
+                macro_target_name="FooMacros",
+                plugin_executable_path=Path("/tmp/.build/release/FooMacros"),
+            ),
+        ],
+    )
+
+    text = json.dumps(plan.to_json())
+    restored = Plan.from_json(json.loads(text))
+    _assert(restored == plan, "synthetic plan round-trip failed")
+    # The optional Path fields must round-trip as Path, not str.
+    _assert(
+        isinstance(restored.package_swift_edits[1].xcframework_path, Path),
+        "consume_external_sibling xcframework_path must round-trip as Path",
+    )
+    _assert(
+        isinstance(restored.macros[0].plugin_executable_path, Path),
+        "MacroSupport plugin_executable_path must round-trip as Path",
+    )
+
+
+def _selftest_plan_json_schema_version_mismatch() -> None:
+    """A payload claiming a schema_version we don't support must raise a
+    clean ValueError rather than silently producing a half-deserialized
+    Plan. Future-proofs callers against deserialising newer plans on older
+    binaries."""
+    bogus = {
+        "schema_version": 999,
+        "stage": {"exclude_globs": []},
+        "package_swift_edits": [],
+        "build_units": [],
+        "skipped": [],
+        "warnings": [],
+        "include_deps": False,
+        "binary_mode": False,
+        "macros": [],
+    }
+    try:
+        Plan.from_json(bogus)
+    except ValueError as exc:
+        _assert(
+            "schema_version" in str(exc) or "schema" in str(exc),
+            f"ValueError did not mention schema_version: {exc!r}",
+        )
+    else:
+        raise AssertionError(
+            "Plan.from_json should reject an unsupported schema_version with ValueError"
+        )
+
+
+def _selftest_plan_json_to_json_is_serializable() -> None:
+    """`plan.to_json()` must produce a value that `json.dumps` accepts with
+    no custom encoder. Catches stray Path/tuple/Enum leaks at the boundary."""
+    plan = Plan(
+        package_swift_edits=[
+            PackageSwiftEdit(
+                kind="consume_external_sibling",
+                product_name="Bar",
+                package_identity="bar-package",
+                xcframework_path=Path("/abs/path/Bar.xcframework"),
+            ),
+        ],
+        build_units=[
+            BuildUnit(
+                name="Bar",
+                scheme="Bar",
+                framework_name="Bar",
+                language="Swift",
+                archive_strategy="copy-artifact",
+                artifact_path=Path("/another/path/Bar.xcframework"),
+            ),
+        ],
+        skipped=[("X", "reason")],
+        macros=[MacroSupport(macro_target_name="M", plugin_executable_path=Path("/x"))],
+    )
+    payload = plan.to_json()
+    # `json.dumps` with no `default=` argument must accept the payload —
+    # any TypeError here means a Path / tuple / set leaked through.
+    try:
+        json.dumps(payload)
+    except TypeError as exc:
+        raise AssertionError(
+            f"Plan.to_json() produced a payload json.dumps cannot serialise: {exc}"
+        )
+
+
+def _selftest_cli_dry_run_json_writes_plan_to_stdout(tmp_root: Path) -> None:
+    """End-to-end CLI smoke: a local SPM package + `--dry-run-json` must
+    print a JSON document on stdout that parses, contains a `plan` field,
+    and exits 0 without invoking xcodebuild. Build the smallest possible
+    fixture in tmp so the test stays hermetic. Requires the swift toolchain
+    (Fetch + Stage + Inspect call `swift package` subprocesses)."""
+    pkg_dir = tmp_root / "tiny-spm-pkg"
+    pkg_dir.mkdir(exist_ok=True)
+    (pkg_dir / "Package.swift").write_text(
+        '// swift-tools-version:5.9\n'
+        'import PackageDescription\n'
+        'let package = Package(\n'
+        '    name: "TinyLib",\n'
+        '    platforms: [.iOS(.v15)],\n'
+        '    products: [\n'
+        '        .library(name: "TinyLib", targets: ["TinyLib"])\n'
+        '    ],\n'
+        '    targets: [\n'
+        '        .target(name: "TinyLib")\n'
+        '    ]\n'
+        ')\n'
+    )
+    src_dir = pkg_dir / "Sources" / "TinyLib"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    (src_dir / "TinyLib.swift").write_text(
+        "public struct TinyLib { public init() {} }\n"
+    )
+
+    # Run against the on-disk single-file artifact (the committed
+    # spm-to-xcframework executable) so the CLI test exercises the same
+    # path real users hit. The src/spm_to_xcframework.py module is the
+    # builder output; either works since they are byte-identical, but
+    # invoking the root artifact is closer to the user experience.
+    repo_root = Path(__file__).resolve().parent.parent
+    artifact = repo_root / "spm-to-xcframework"
+    _assert(artifact.is_file(), f"single-file artifact missing: {artifact}")
+
+    # Strip xcodebuild from PATH so a regression that accidentally invokes
+    # it surfaces as a "command not found" error rather than passing silently.
+    env = dict(os.environ)
+    stripped = []
+    for entry in env.get("PATH", "").split(os.pathsep):
+        # Crude but effective filter: drop /usr/bin if xcodebuild lives there
+        # AND drop any Xcode.app paths. We can't omit /usr/bin entirely (swift
+        # also lives there sometimes), so instead nuke `xcodebuild` via a
+        # wrapper directory at the head of PATH.
+        stripped.append(entry)
+    wrapper_dir = tmp_root / "no-xcodebuild"
+    wrapper_dir.mkdir(exist_ok=True)
+    wrapper = wrapper_dir / "xcodebuild"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        'echo "regression: --dry-run-json should not call xcodebuild (args: $*)" >&2\n'
+        "exit 99\n"
+    )
+    wrapper.chmod(0o755)
+    env["PATH"] = str(wrapper_dir) + os.pathsep + env.get("PATH", "")
+
+    proc = subprocess.run(
+        [str(artifact), str(pkg_dir), "--dry-run-json"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        text=True,
+    )
+    _assert(
+        proc.returncode == 0,
+        f"--dry-run-json exit was {proc.returncode}, expected 0.\n"
+        f"--- stderr ---\n{proc.stderr[-2000:]}\n--- stdout ---\n{proc.stdout[-2000:]}",
+    )
+    # The PATH-shimmed xcodebuild would write "regression:" to stderr if
+    # something invoked it. Either presence is a regression.
+    _assert(
+        "regression: --dry-run-json should not call xcodebuild" not in proc.stderr,
+        "--dry-run-json invoked the xcodebuild PATH shim — regression",
+    )
+
+    # Stdout must be parseable JSON with a `plan` envelope.
+    try:
+        envelope = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise AssertionError(
+            f"--dry-run-json stdout is not valid JSON: {exc}\n"
+            f"--- stdout (head 800) ---\n{proc.stdout[:800]}"
+        )
+    _assert(
+        envelope.get("package") == "TinyLib",
+        f"envelope.package was {envelope.get('package')!r}, expected 'TinyLib'",
+    )
+    _assert("plan" in envelope, f"envelope missing 'plan' key; got {list(envelope.keys())}")
+    plan_dict = envelope["plan"]
+    _assert(
+        plan_dict.get("schema_version") == Plan.JSON_SCHEMA_VERSION,
+        f"plan.schema_version was {plan_dict.get('schema_version')!r}",
+    )
+    # The `platforms` field is the resolved per-platform deployment
+    # target map (Codex review P2 catch — without this the JSON can't
+    # tell a tooling consumer which platforms the run targets, info
+    # the human render shows under "Selected slices"). The fixture
+    # declares iOS only, so the autodetect should populate ios.
+    _assert(
+        "platforms" in envelope,
+        f"envelope missing 'platforms' key; got {list(envelope.keys())}",
+    )
+    platforms = envelope["platforms"]
+    _assert(
+        isinstance(platforms, dict) and platforms.get("ios"),
+        f"envelope.platforms must include an ios entry; got {platforms!r}",
+    )
+    # Round-trip the embedded plan back through the dataclass to confirm
+    # the envelope's plan field is consumable by tooling that just wants
+    # `Plan.from_json(envelope['plan'])`.
+    restored = Plan.from_json(plan_dict)
+    _assert(
+        any(bu.name == "TinyLib" for bu in restored.build_units),
+        f"expected a TinyLib build unit; got {[bu.name for bu in restored.build_units]}",
+    )
+
+
+def _selftest_cli_dry_run_json_failure_path(tmp_root: Path) -> None:
+    """When an early phase (Fetch/Inspect/Plan) fails, `--dry-run-json` must
+    exit non-zero with a clean error on stderr and an empty stdout — no
+    half-formed JSON the campaign tooling could mistakenly parse."""
+    # A non-existent local path is the cheapest forced Fetch failure.
+    bogus_pkg = tmp_root / "does-not-exist"
+    repo_root = Path(__file__).resolve().parent.parent
+    artifact = repo_root / "spm-to-xcframework"
+
+    proc = subprocess.run(
+        [str(artifact), str(bogus_pkg), "--dry-run-json"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    _assert(
+        proc.returncode != 0,
+        f"--dry-run-json against a missing path should fail; got exit 0 stdout={proc.stdout!r}",
+    )
+    _assert(
+        proc.stdout == "",
+        f"--dry-run-json stdout must be empty on failure (so the campaign "
+        f"tooling never half-parses a stub envelope); got {proc.stdout!r}",
+    )
 
 
 # --- Sync-check test ------------------------------------------------------

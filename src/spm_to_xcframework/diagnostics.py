@@ -217,6 +217,18 @@ _TOOLS_VERSION_REQUIRES = re.compile(
     re.IGNORECASE,
 )
 
+# Manifest declares an executable product whose backing target SPM can't
+# treat as executable — typically a `.binaryTarget(url:, checksum:)`
+# artifact-bundle exposed as `.executable(name: ...)`. swift-protobuf
+# 1.32.0's `protoc` product is the canonical case. Captured via regex
+# (not the substring-matched `_PATTERNS` table) so we can surface the
+# offending product name in the hint.
+_EXECUTABLE_PRODUCT_BAD_BACKING = re.compile(
+    r"executable product '([^']+)' expects target '([^']+)' to be "
+    r"executable; an executable target requires a 'main\.swift' file",
+    re.IGNORECASE,
+)
+
 
 def _first_error_line(stderr: str) -> Optional[str]:
     """Return the first stderr line containing `error:` (case-insensitive),
@@ -287,6 +299,23 @@ def format_swift_package_failure(cmd: str, stderr: str) -> str:
                 "the package's `// swift-tools-version:` line against your "
                 "installed Xcode toolchain."
             )
+        else:
+            m3 = _EXECUTABLE_PRODUCT_BAD_BACKING.search(stderr)
+            if m3:
+                product = m3.group(1)
+                hint = (
+                    f"Try: the package declares an executable product "
+                    f"'{product}' whose backing target SPM doesn't accept as "
+                    f"executable (most often a `.binaryTarget(url:, checksum:)` "
+                    f"artifact bundle exposed via `.executable(name: ...)`). "
+                    f"spm-to-xcframework is library-focused — xcframeworks "
+                    f"can't ship executable products. Check whether the "
+                    f"package gates that product behind an env-var (e.g. "
+                    f"swift-protobuf's `PROTOBUF_NO_PROTOC=true` disables "
+                    f"its `protoc` executable product); otherwise use "
+                    f"--product to select a library product, or skip this "
+                    f"package."
+                )
     if hint:
         lines.append(hint)
 

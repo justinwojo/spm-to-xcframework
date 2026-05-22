@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from ..diagnostics import format_block as _format_diagnosis_block, scan as _scan_diagnosis
+from ..diagnostics import format_block, scan
 from ..errors import ExecuteError
 from ..log import info, verbose_log
 from ..model import ArchiveSlice, BuildUnit
@@ -279,10 +279,10 @@ def _format_execute_error(unit_name: str, log_path: Path, errors: List[dict]) ->
                 haystack_parts.append("".join(f.readlines()[-200:]))
     except OSError:
         pass
-    diag = _scan_diagnosis("\n".join(haystack_parts))
+    diag = scan("\n".join(haystack_parts))
     if diag is not None:
         lines.append("")
-        lines.append(_format_diagnosis_block(diag))
+        lines.append(format_block(diag))
 
     lines.append("")
     if errors:

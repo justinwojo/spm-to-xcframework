@@ -11,6 +11,7 @@ bubble up so the user sees a full traceback.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -52,7 +53,7 @@ from .plan import (
     plan_source_build,
     print_plan,
 )
-from .log import _wrap, bold, die, dim, info, warn
+from .log import _wrap, bold, die, dim, info, set_log_stdout_to_stderr, warn
 from .model import ExecutedUnit, Language, Package, TargetKind
 from .platforms import _autodetect_min_versions, _enabled_platforms
 from .prepare import prepare
@@ -165,7 +166,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> Tuple[argparse.Namespace
     parser.add_argument("--verbose", action="store_true",
                         help="Show full build output")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Show what would be built without building")
+                        help="Show what would be built without building. "
+                             "Runs Fetch + Inspect + Plan only; no xcodebuild "
+                             "is invoked (transitive sibling resolution is "
+                             "skipped — the printed plan reflects the umbrella "
+                             "package alone).")
+    parser.add_argument("--dry-run-json", action="store_true",
+                        help="Like --dry-run, but emit the resolved Plan as "
+                             "machine-readable JSON on stdout (informational "
+                             "log messages route to stderr). Implies --dry-run.")
     parser.add_argument("--keep-work", action="store_true",
                         help="Keep temporary work directory (for debugging)")
     parser.add_argument(
@@ -227,7 +236,8 @@ def _config_from_args(ns: argparse.Namespace) -> Config:
         include_deps=ns.include_deps,
         binary_mode=ns.binary,
         verbose=ns.verbose,
-        dry_run=ns.dry_run,
+        dry_run=ns.dry_run or ns.dry_run_json,
+        dry_run_json=ns.dry_run_json,
         keep_work=ns.keep_work,
         no_cleanup_stale=ns.no_cleanup_stale,
         no_dedup_overlap=ns.no_dedup_overlap,
@@ -252,6 +262,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "Drop one or the other.")
 
     config = _config_from_args(ns)
+    if config.dry_run_json:
+        # Keep stdout clean for the JSON document; all info/bold/dim/success
+        # phase chatter routes to stderr until the final json.dumps call.
+        set_log_stdout_to_stderr(True)
 
     # Argument-injection hardening. Reject shapes that could be
     # misinterpreted by downstream `git` invocations before we do any
@@ -521,6 +535,49 @@ def _validate_platforms_post_autodetect(config: Config) -> None:
             )
 
 
+def _emit_dry_run_json(
+    plan,
+    *,
+    package,
+    config: Config,
+) -> None:
+    """Print the resolved Plan as JSON on stdout for `--dry-run-json`.
+
+    The envelope wraps `plan.to_json()` with a small amount of context the
+    campaign tooling wants for free: package label, version, mode, and the
+    list of transitive SPM identities that would be built as siblings if
+    the run weren't a dry-run. The transitive list is purely informational
+    — the plan itself never includes `consume_external_sibling` edits in
+    dry-run mode because no actual sibling xcframeworks exist on disk.
+    """
+    if package is not None:
+        name = package.name
+        transitive_idents = [tp.identity for tp in package.transitive_packages]
+    else:
+        name = _derive_package_label(config.package_source or "(unknown)")
+        transitive_idents = []
+    # Resolved per-platform deployment targets: same source of truth
+    # that `print_plan` renders as "Selected slices" (see
+    # plan.py:1251). Without this, JSON consumers can't recover what
+    # platform set the run will actually drive xcodebuild against —
+    # caught by Codex review on the 2026-05-22 dry-run-json pass.
+    platforms = {
+        p: getattr(config, f"min_{p}")
+        for p in _enabled_platforms(config)
+    }
+    envelope = {
+        "package": name,
+        "version": config.user_version or None,
+        "mode": "binary" if plan.binary_mode else "source",
+        "platforms": platforms,
+        "transitive_packages": transitive_idents,
+        "plan": plan.to_json(),
+    }
+    json.dump(envelope, sys.stdout, indent=2, sort_keys=False)
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
 def _source_mode_inspect(config: Config):
     """Fetch + Stage + Inspect + autodetect + post-autodetect validation.
 
@@ -612,7 +669,10 @@ def _source_mode_after_inspect(
     plan = plan_source_build(config, package)
     for w in plan.warnings:
         warn(w)
-    print_plan(plan, package=package, config=config)
+    if config.dry_run_json:
+        _emit_dry_run_json(plan, package=package, config=config)
+    else:
+        print_plan(plan, package=package, config=config)
 
     if config.dry_run:
         return 0
@@ -1051,6 +1111,17 @@ def _run_source_mode_with_transitives(config: Config) -> int:
     if config.no_transitive_products or config.child_run:
         return _run_source_mode(config)
 
+    # Dry-run skips the transitive build loop entirely — emitting a plan
+    # for the umbrella alone is the point of `--dry-run` (no xcodebuild
+    # invocation, no 5-minute archives). The dry-run JSON envelope still
+    # lists the transitive package identities so the campaign tooling can
+    # see what would be built. The umbrella plan in dry-run lacks
+    # `consume_external_sibling` edits because no sibling xcframeworks
+    # exist on disk yet — that's accepted scope; dry-run is a preview, not
+    # a faithful end-state simulation.
+    if config.dry_run:
+        return _run_source_mode(config)
+
     inspect_result = _source_mode_inspect(config)
     if isinstance(inspect_result, int):
         return inspect_result
@@ -1298,7 +1369,10 @@ def _run_binary_mode(config: Config) -> int:
     plan = plan_binary_build(config, artifacts)
     for w in plan.warnings:
         warn(w)
-    print_plan(plan, package=None, config=config)
+    if config.dry_run_json:
+        _emit_dry_run_json(plan, package=None, config=config)
+    else:
+        print_plan(plan, package=None, config=config)
 
     if config.dry_run:
         return 0

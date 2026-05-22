@@ -17,7 +17,7 @@ from typing import Iterable, List, Optional, Tuple
 from .config import Config
 from .diagnostics import format_swift_package_failure
 from .errors import InspectError
-from .log import bold, info, verbose_log
+from .log import bold, info, out, verbose_log
 from .model import (
     Language,
     Linkage,
@@ -564,16 +564,16 @@ def inspect_package(config: Config, staged_dir: Path) -> Package:
 def print_package(pkg: Package) -> None:
     """Human-readable Package summary, used by --inspect-only."""
     bold(f"\n=== {pkg.name} ===")
-    print(f"  tools-version: {pkg.tools_version}")
+    out(f"  tools-version: {pkg.tools_version}")
     if pkg.platforms:
         plats = ", ".join(f"{p.name} {p.version}" for p in pkg.platforms)
-        print(f"  platforms:     {plats}")
-    print(f"  staged dir:    {pkg.staged_dir}")
-    print(f"  schemes:       {', '.join(pkg.schemes) if pkg.schemes else '(none discovered)'}")
+        out(f"  platforms:     {plats}")
+    out(f"  staged dir:    {pkg.staged_dir}")
+    out(f"  schemes:       {', '.join(pkg.schemes) if pkg.schemes else '(none discovered)'}")
 
     bold(f"\nProducts ({len(pkg.products)}):")
     if not pkg.products:
-        print("  (none)")
+        out("  (none)")
     for p in pkg.products:
         # Cross-reference each product's backing targets to flag system /
         # already-dynamic shapes the planner will care about.
@@ -587,7 +587,7 @@ def print_package(pkg: Package) -> None:
         if all(k == TargetKind.SYSTEM for k in kinds) and kinds:
             notes.append("system-only — will be skipped")
         note_s = f"  [{', '.join(notes)}]" if notes else ""
-        print(
+        out(
             f"  - {p.name}  linkage={p.linkage}  targets={p.targets}{note_s}"
         )
 
@@ -595,7 +595,7 @@ def print_package(pkg: Package) -> None:
     for t in pkg.targets:
         path_disp = t.path or "(default)"
         hdr = f" headers={t.public_headers_path}" if t.public_headers_path else ""
-        print(
+        out(
             f"  - {t.name}  kind={t.kind}  language={t.language}"
             f"  path={path_disp}{hdr}  files={t.source_file_count}"
         )

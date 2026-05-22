@@ -23,10 +23,34 @@ _ANSI = {
 }
 
 
+# When True, `info`/`success`/`dim`/`bold` route to stderr instead of
+# stdout. Used by `--dry-run-json` (set by `cli.main()` before the
+# pipeline runs) so stdout stays a clean JSON document the campaign
+# tooling can pipe straight into `jq`. Read-only outside the CLI entry
+# point.
+_LOG_STDOUT_TO_STDERR = False
+
+
+def set_log_stdout_to_stderr(enabled: bool) -> None:
+    """Route info/success/dim/bold to stderr instead of stdout. The CLI
+    flips this on for --dry-run-json so the only stdout writes are the
+    JSON document at the end. Lives as a setter (not a direct attribute
+    mutation) so it survives the build_single_file.py concatenation step
+    — there is no `log` submodule to reach into in the single-file
+    artifact, but the setter is a module-global function either way.
+    """
+    global _LOG_STDOUT_TO_STDERR
+    _LOG_STDOUT_TO_STDERR = enabled
+
+
+def _stdout() -> "object":
+    return sys.stderr if _LOG_STDOUT_TO_STDERR else sys.stdout
+
+
 def _color_enabled() -> bool:
     if os.environ.get("NO_COLOR"):
         return False
-    return sys.stdout.isatty()
+    return _stdout().isatty()
 
 
 def _wrap(text: str, color: str) -> str:
@@ -35,12 +59,29 @@ def _wrap(text: str, color: str) -> str:
     return f"{_ANSI[color]}{text}{_ANSI['reset']}"
 
 
+def out(msg: str) -> None:
+    """Plain (uncoloured) user-facing output, routed through `_stdout()`.
+
+    Use this when the line is part of a structured human-readable
+    rendering that shouldn't carry inline colour (e.g. `print_package`
+    for `--inspect-only`). The route still respects
+    `set_log_stdout_to_stderr` so `--dry-run-json` keeps stdout clean.
+
+    Codex review P3 catch (2026-05-22): without this helper,
+    `print_package` used raw `print()` and would leak human-readable
+    text onto stdout under `--inspect-only --dry-run-json`, breaking
+    the "stdout is a clean JSON document" contract for that flag
+    combination.
+    """
+    print(msg, file=_stdout())
+
+
 def info(msg: str) -> None:
-    print(_wrap(msg, "cyan"))
+    print(_wrap(msg, "cyan"), file=_stdout())
 
 
 def success(msg: str) -> None:
-    print(_wrap(msg, "green"))
+    print(_wrap(msg, "green"), file=_stdout())
 
 
 def warn(msg: str) -> None:
@@ -48,11 +89,11 @@ def warn(msg: str) -> None:
 
 
 def dim(msg: str) -> None:
-    print(_wrap(msg, "dim"))
+    print(_wrap(msg, "dim"), file=_stdout())
 
 
 def bold(msg: str) -> None:
-    print(_wrap(msg, "bold"))
+    print(_wrap(msg, "bold"), file=_stdout())
 
 
 def die(msg: str) -> NoReturn:
@@ -68,4 +109,4 @@ def die(msg: str) -> NoReturn:
 # Verbose logger — gated on Config.verbose at call sites.
 def verbose_log(verbose: bool, msg: str) -> None:
     if verbose:
-        print(_wrap(msg, "dim"))
+        print(_wrap(msg, "dim"), file=_stdout())
