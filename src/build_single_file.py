@@ -45,6 +45,7 @@ DST = HERE.parent / "spm-to-xcframework"
 MODULE_ORDER: List[str] = [
     "log.py",
     "errors.py",
+    "diagnostics.py",
     "config.py",
     "model.py",
     "platforms.py",

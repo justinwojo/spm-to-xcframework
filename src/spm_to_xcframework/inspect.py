@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
 from .config import Config
+from .diagnostics import format_swift_package_failure
 from .errors import InspectError
 from .log import bold, info, verbose_log
 from .model import (
@@ -42,9 +43,7 @@ def _swift_dump_package(staged_dir: Path) -> dict:
     )
     if cp.returncode != 0:
         raise InspectError(
-            "swift package dump-package failed:\n"
-            + (cp.stderr or "  (no stderr)").rstrip()
-            + "\nIs the swift-tools-version supported by your toolchain?"
+            format_swift_package_failure("swift package dump-package", cp.stderr)
         )
     try:
         return json.loads(cp.stdout)
@@ -255,8 +254,7 @@ def _swift_describe_package(staged_dir: Path) -> dict:
     )
     if cp.returncode != 0:
         raise InspectError(
-            "swift package describe failed:\n"
-            + (cp.stderr or "  (no stderr)").rstrip()
+            format_swift_package_failure("swift package describe", cp.stderr)
         )
     try:
         return json.loads(cp.stdout)

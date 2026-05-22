@@ -17,6 +17,7 @@ from __future__ import annotations
 # regardless of which module actually defines it.
 from .log import *  # noqa: F401,F403
 from .errors import *  # noqa: F401,F403
+from .diagnostics import *  # noqa: F401,F403
 from .config import *  # noqa: F401,F403
 from .model import *  # noqa: F401,F403
 from .platforms import *  # noqa: F401,F403

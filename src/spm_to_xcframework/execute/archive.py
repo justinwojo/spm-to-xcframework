@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from ..diagnostics import format_block as _format_diagnosis_block, scan as _scan_diagnosis
 from ..errors import ExecuteError
 from ..log import info, verbose_log
 from ..model import ArchiveSlice, BuildUnit
@@ -244,8 +245,46 @@ def read_xcresult_errors(result_bundle_path: Path, limit: int = 5) -> List[dict]
 def _format_execute_error(unit_name: str, log_path: Path, errors: List[dict]) -> str:
     """Build a human-readable ExecuteError message body for one failed
     build unit. Pulled out so the parallelization work in Session 4 can
-    reuse it without re-deriving the format."""
+    reuse it without re-deriving the format.
+
+    Output shape:
+        xcodebuild archive failed for build unit '<unit>'.
+
+        Diagnosis: ...                                (when matched)
+        Try: ...
+
+        Top N error(s) from xcresult:
+          [i] [<target>] <message>
+              at <sourceURL>
+        Build log: <path>
+
+    The diagnosis block lands ABOVE the raw xcresult errors — the
+    actionable signal must precede the evidence for a first-time user.
+    Misses are silent (no block emitted) so unmatched failures look
+    identical to the pre-diagnostics output.
+    """
     lines = [f"xcodebuild archive failed for build unit {unit_name!r}."]
+
+    # Scan against the joined xcresult-error messages + log tail so a
+    # pattern that never reached xcresulttool can still match. Log-tail
+    # read is best-effort: any failure leaves the haystack empty rather
+    # than masking the real xcodebuild failure underneath.
+    haystack_parts: List[str] = [
+        f"{err.get('target') or ''} {err.get('message') or ''}"
+        for err in errors
+    ]
+    try:
+        if log_path.is_file():
+            with open(log_path, "r", errors="replace") as f:
+                haystack_parts.append("".join(f.readlines()[-200:]))
+    except OSError:
+        pass
+    diag = _scan_diagnosis("\n".join(haystack_parts))
+    if diag is not None:
+        lines.append("")
+        lines.append(_format_diagnosis_block(diag))
+
+    lines.append("")
     if errors:
         lines.append(f"Top {len(errors)} error(s) from xcresult:")
         for i, err in enumerate(errors, start=1):

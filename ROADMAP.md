@@ -1,6 +1,6 @@
 # Roadmap
 
-Date: 2026-05-21 (last updated after `28863d1`)
+Date: 2026-05-22 (last updated after diagnostics ship — see "Actionable error messages" below)
 
 Forward-looking work plan for `spm-to-xcframework`. The mission: **95%+ of arbitrary SPM packages produce a valid xcframework on the first try**, with a UX that lets a first-time user succeed without reading the source.
 
@@ -32,16 +32,20 @@ This doc supersedes the forward-looking sections of [REFACTOR_PROPOSAL.md](REFAC
 
 Follow-on risks to watch as more macro-using packages land in the matrix: build-tool plugins (`.plugin(...)`, distinct from `.macro`) are not yet exercised, and macros that themselves depend on transitive binary frameworks haven't been stress-tested.
 
-### Actionable error messages
+### ~~Actionable error messages~~ — Shipped 2026-05-22
 
-Today's failure modes (xcodebuild exit code, raw stderr, `dump-package` parse errors, missing-product-from-Plan, etc.) print useful information but rarely tell a first-time user **what to do next**. For the "easy to use" half of the mission, this is as important as coverage.
+**Shipped.** New `src/spm_to_xcframework/diagnostics.py` ships a substring-keyed pattern table that translates opaque xcodebuild / `swift package` failures into a two-line `Diagnosis: ... / Try: ...` block. Seven patterns cover the known surfaces: macro plugin pre-build failure (`SwiftSyntax` not found at archive time), library-evolution resilience boundary (the dedup-overlap auto-recovery surface), Xcode 26.3 / swift-collections `@_lifetime` ceiling, auto-linked library miss (`--target` / `--include-deps` hint), `binaryTarget` Swift-version mismatch, dependency cycles, and `PhaseScriptExecution` failures (most often `.plugin(...)` build-tool scripts).
 
-Targets:
-- When prepare/execute fails for a known shape, emit a labelled diagnosis ("this package uses a custom-target wrapper — the overlay edit failed because X"). The internal exception classes (`PrepareUserError`, `ExecuteError`) already have the structure; the surface needs a translation layer.
-- When `swift package dump-package` fails, surface the *first* manifest error verbatim, with a "try this" suggestion when the pattern is recognisable.
-- When verify fails, name the missing artifact (e.g., "`Foo.framework/Modules/module.modulemap` not present") rather than just "verify failed".
+`format_swift_package_failure` shapes `swift package dump-package` / `describe` failures: surfaces the first `error:` line verbatim and emits a directional tools-version hint — when the manifest is older than the toolchain ("bump the manifest"), and when it's newer than the installed Xcode ("upgrade Xcode"). The opposite-direction case was a Codex-review catch; without it the helper would have pointed users at editing a manifest they don't control.
 
-Risk: moderate. Touches many code paths but each touch is small. Iterative.
+Wired into `_format_execute_error` (xcodebuild archive failures) so the diagnosis block lands ABOVE the raw xcresult errors — the actionable signal precedes the evidence. Unmatched failures look identical to the pre-diagnostics output. Also wired into `_swift_dump_package` and `_swift_describe_package` so SPM manifest failures get the same treatment.
+
+Verify-side missing-artifact naming (the third target below) wasn't critical-path: `verify_output` already names the missing path in its `VerifyError` / `VerifyResult` issues (e.g. `f"xcframework not found at {xcframework_path}"`, `f"Info.plist missing — ..."`). Left as-is.
+
+Original targets, for reference:
+- ~~When prepare/execute fails for a known shape, emit a labelled diagnosis.~~ Done via `diagnostics.scan` + `_format_execute_error`.
+- ~~When `swift package dump-package` fails, surface the *first* manifest error verbatim with a "try this" suggestion when recognisable.~~ Done via `format_swift_package_failure`.
+- ~~When verify fails, name the missing artifact rather than just "verify failed".~~ Already in place — confirmed during this work.
 
 ---
 
@@ -121,6 +125,6 @@ Risk: zero unless triggered by external demand.
 
 ## Suggested sequencing
 
-With macros shipped, the remaining P0 is **actionable error messages** — cheap, iterative, immediate user-visible improvement. Land **stress-test additions** alongside it; they're cheap and may surface adjacent gaps now that the macro / sibling-xcframework paths are live. **Serializable plan / `--dry-run`** lands next as a UX capstone. **Nightly CI** turns on after a few weeks of green matrix runs. P2 items wait for either external demand or genuine free cycles.
+Both P0 items are shipped (macros in `28863d1`, actionable errors in this session). **Serializable plan / `--dry-run`** is the next P1 — small, well-scoped, immediately user-visible. **Nightly CI** turns on after a few weeks of green matrix runs. P2 items wait for either external demand or genuine free cycles. New diagnostic patterns can be added to `diagnostics._PATTERNS` as fresh failure shapes show up in the wild — that's a cheap follow-on lane rather than a discrete project.
 
 When picking up: confirm the matrix is still 15/15 passing + 2 known_broken first (`python3 tests/integration/run_integration.py`) so the baseline is known-green before adding scope. The two known_broken entries (swift-async-algorithms, swift-composable-architecture) are pinned to the Xcode 26.3 / swift-collections 1.5.x `@_lifetime` ceiling — they should flip to PASS without code changes once Xcode 26.4 or swift-collections 1.6 lifts the experimental gate.

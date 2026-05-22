@@ -4778,6 +4778,205 @@ def _selftest_parse_xcresult_build_results() -> None:
     _assert(_parse_xcresult_build_results("not a dict", limit=5) == [], "non-dict input")
 
 
+def _selftest_diagnostics_scan_known_patterns() -> None:
+    """`diagnostics.scan` returns a `Diagnosis` for every entry in the
+    canonical pattern table — these are the surfaces the ROADMAP names
+    explicitly. Each match also exposes the substring that fired (for
+    telemetry / future Codex review)."""
+    from spm_to_xcframework.diagnostics import scan, format_block
+
+    # Macro plugin pre-build failure (swift-syntax not found at archive)
+    diag = scan("error: Unable to find module dependency: 'SwiftSyntax'")
+    _assert(diag is not None, "macro plugin pattern must match")
+    _assert("macro plugin" in diag.headline.lower(), diag.headline)
+    _assert("pre-build" in diag.suggestion.lower(), diag.suggestion)
+    _assert("SwiftSyntax" in diag.pattern, diag.pattern)
+
+    # Library-evolution resilience boundary (currently auto-recovered)
+    diag = scan("Switch covers known cases, but Foo may have additional unknown values")
+    _assert(diag is not None, "resilience pattern must match")
+    _assert("library-evolution" in diag.headline.lower(), diag.headline)
+    _assert("dedup-overlap" in diag.suggestion.lower(), diag.suggestion)
+
+    # Xcode 26.3 / swift-collections 1.5.x bug
+    diag = scan(
+        "error: '@_lifetime' attribute is only valid when experimental "
+        "feature Lifetimes is enabled"
+    )
+    _assert(diag is not None, "lifetimes pattern must match")
+    _assert("swift-collections" in diag.headline.lower(), diag.headline)
+
+    # Missing sibling target → --target hint. Wording was softened per
+    # Codex review (the linker diagnostic isn't always a sibling miss),
+    # but `--target` and `--include-deps` must still appear so the user
+    # has actionable next steps for the common SPM case.
+    diag = scan("ld: warning: Could not find or use auto-linked library 'StripeCore'")
+    _assert(diag is not None, "auto-linked library pattern must match")
+    _assert("--target" in diag.suggestion, diag.suggestion)
+    _assert("--include-deps" in diag.suggestion, diag.suggestion)
+
+    # Vendored binary built with mismatched swiftc
+    diag = scan("module 'Foo' was built with a different version of Swift")
+    _assert(diag is not None, "binary-mismatch pattern must match")
+    _assert("binarytarget" in diag.headline.lower(), diag.headline)
+
+    # SPM build-tool plugin script failure. Wording was softened per
+    # Codex review ("most often an SPM `.plugin(...)`") because the
+    # diagnostic is generic Xcode wording that can also fire for
+    # user-added Run Script phases.
+    diag = scan(
+        "Command PhaseScriptExecution failed with a nonzero exit code"
+    )
+    _assert(diag is not None, "phase-script-execution pattern must match")
+    _assert("shell-script" in diag.headline.lower() or
+            "build phase" in diag.headline.lower(), diag.headline)
+    _assert("most often" in diag.suggestion.lower() or
+            ".plugin" in diag.suggestion.lower(), diag.suggestion)
+
+    # Case-insensitive matching: the pattern table holds lower-case
+    # substrings but real xcodebuild output may capitalise differently.
+    diag = scan("CYCLE IN DEPENDENCIES BETWEEN TARGETS")
+    _assert(diag is not None, "scan must be case-insensitive")
+    _assert("cycle" in diag.headline.lower(), diag.headline)
+
+    # Misses return None (unknown text must fall through, never raise).
+    _assert(scan("totally unrelated build failure no pattern matches") is None,
+            "unknown text must return None")
+    _assert(scan("") is None, "empty input returns None")
+
+    # format_block shape contract: stable two-line "Diagnosis: ...\nTry: ..."
+    diag = scan("'@_lifetime' attribute is only valid when experimental feature Lifetimes is enabled")
+    block = format_block(diag)
+    _assert(block.startswith("Diagnosis: "), block)
+    _assert("\nTry: " in block, block)
+    _assert(block.count("\n") == 1, f"block must be exactly two lines: {block!r}")
+
+
+def _selftest_diagnostics_format_swift_package_failure_tools_version() -> None:
+    """The SPM `swift package <cmd>` shaping helper extracts the
+    proximate `error:` line and recognises the canonical tools-version
+    mismatch shape so the user sees a "bump from X to Y" hint instead
+    of just the raw stderr blast."""
+    from spm_to_xcframework.diagnostics import format_swift_package_failure
+
+    stderr = (
+        "Building for distribution\n"
+        "error: package at '/tmp/staged' is using Swift tools version 5.5.0 "
+        "but the minimum required by the toolchain is 5.7.0\n"
+        "  see https://example/help\n"
+    )
+    out = format_swift_package_failure("swift package dump-package", stderr)
+    _assert(out.startswith("swift package dump-package failed."), out.splitlines()[0])
+    # First error line surfaced verbatim with the `First error: ` prefix.
+    _assert("First error: error: package at" in out, out)
+    # Tools-version hint with both versions parsed out of the stderr.
+    _assert("5.5.0" in out and "5.7.0" in out, out)
+    _assert("bump the manifest" in out.lower() or "swift-tools-version" in out.lower(), out)
+    # Raw stderr tail still present so the user has the same info they
+    # had before — just better organised. The `---` divider separates
+    # the actionable headline from the raw tail.
+    _assert("---" in out, out)
+
+
+def _selftest_diagnostics_format_swift_package_failure_tools_version_too_new() -> None:
+    """The opposite-direction tools-version mismatch: a manifest pinned
+    newer than the user's installed Xcode supports. Codex review caught
+    that the original implementation only handled the manifest-too-old
+    case and would give a wrong-direction hint here (telling the user
+    to bump a manifest they don't control). The hint must point at
+    upgrading Xcode, not editing the manifest down."""
+    from spm_to_xcframework.diagnostics import format_swift_package_failure
+
+    stderr = (
+        "Resolving package graph\n"
+        "error: package at '/tmp/staged' is using Swift tools version 6.0.0 "
+        "but the installed version is 5.10.0\n"
+    )
+    out = format_swift_package_failure("swift package dump-package", stderr)
+    _assert("6.0.0" in out and "5.10.0" in out, out)
+    # Hint must point at upgrading Xcode, NOT at bumping the manifest down.
+    _assert("upgrade xcode" in out.lower(), out)
+    _assert("bump the manifest" not in out.lower(),
+            f"wrong-direction hint must not fire: {out!r}")
+
+
+def _selftest_diagnostics_format_swift_package_failure_unknown_shape() -> None:
+    """Unrecognised stderr still gets the proximate `error:` line on top
+    plus the raw tail. The point is to never make things worse — even
+    when no pattern matches, the user still sees every byte they would
+    have seen before."""
+    from spm_to_xcframework.diagnostics import format_swift_package_failure
+
+    stderr = (
+        "Resolving package graph\n"
+        "error: something completely unrecognised happened here\n"
+        "more chatter\n"
+    )
+    out = format_swift_package_failure("swift package describe", stderr)
+    _assert("First error: error: something completely unrecognised" in out, out)
+    _assert("more chatter" in out, out)  # tail preserved
+    # No `Try:` hint when the pattern doesn't match — silent miss.
+    _assert("Try:" not in out, f"unmatched shape must not invent a Try: hint: {out!r}")
+
+
+def _selftest_diagnostics_format_swift_package_failure_empty_stderr() -> None:
+    """Empty stderr degrades gracefully — no first-error line, no hint,
+    but the failure still surfaces (vs. raising in the formatter)."""
+    from spm_to_xcframework.diagnostics import format_swift_package_failure
+
+    out = format_swift_package_failure("swift package dump-package", "")
+    _assert(out.startswith("swift package dump-package failed."), out)
+    _assert("(no stderr)" in out, out)
+    _assert("First error:" not in out, out)
+
+
+def _selftest_diagnostics_format_execute_error_prepends_block() -> None:
+    """`_format_execute_error` lands the Diagnosis/Try block above the
+    raw xcresult errors when one of the patterns fires against the
+    parsed error messages. Without a match, the output shape stays
+    identical to the pre-diagnostics behaviour."""
+    from spm_to_xcframework import _format_execute_error
+    from pathlib import Path
+
+    # Match case: the `@_lifetime` text fires the swift-collections 1.5.x
+    # diagnosis. Headline must precede the `Top N error(s)` block.
+    errors = [{
+        "target": "InternalCollectionsUtilities",
+        "message": "'@_lifetime' attribute is only valid when experimental "
+                   "feature Lifetimes is enabled",
+        "source": "file:///x/LifetimeOverride.swift",
+        "issueType": "Swift Compiler Error",
+    }]
+    out = _format_execute_error(
+        unit_name="OrderedCollections (ios-arm64)",
+        log_path=Path("/nonexistent/build.log"),
+        errors=errors,
+    )
+    diag_idx = out.find("Diagnosis: ")
+    top_idx = out.find("Top 1 error(s) from xcresult:")
+    _assert(diag_idx != -1, f"diagnosis missing: {out!r}")
+    _assert(top_idx != -1, f"top-errors missing: {out!r}")
+    _assert(diag_idx < top_idx, f"diagnosis must come BEFORE raw errors: {out!r}")
+    _assert("Try:" in out, out)
+
+    # Miss case: unrelated error → no diagnosis block, raw errors unchanged.
+    errors = [{
+        "target": "Foo",
+        "message": "totally unrecognised build failure",
+        "source": "",
+        "issueType": "Swift Compiler Error",
+    }]
+    out = _format_execute_error(
+        unit_name="Foo",
+        log_path=Path("/nonexistent/build.log"),
+        errors=errors,
+    )
+    _assert("Diagnosis: " not in out,
+            f"unmatched error must not emit a diagnosis: {out!r}")
+    _assert("Top 1 error(s) from xcresult:" in out, out)
+    _assert("totally unrecognised build failure" in out, out)
+
+
 def _selftest_unsupported_swift_constructs() -> None:
     """The Prepare safety net rejects Package.swift files containing Swift
     constructs the balanced-paren walker can't reason about: raw strings.
@@ -10219,6 +10418,18 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          _selftest_compute_internal_target_deps_mixed_internal_and_external, False),
         ("xcresulttool build-results parser",
          _selftest_parse_xcresult_build_results, False),
+        ("diagnostics: scan matches known xcodebuild failure patterns",
+         _selftest_diagnostics_scan_known_patterns, False),
+        ("diagnostics: swift-package shaping extracts tools-version mismatch",
+         _selftest_diagnostics_format_swift_package_failure_tools_version, False),
+        ("diagnostics [Codex review P2]: tools-version too-new hint points at Xcode upgrade",
+         _selftest_diagnostics_format_swift_package_failure_tools_version_too_new, False),
+        ("diagnostics: swift-package shaping degrades silently on unknown stderr",
+         _selftest_diagnostics_format_swift_package_failure_unknown_shape, False),
+        ("diagnostics: swift-package shaping handles empty stderr",
+         _selftest_diagnostics_format_swift_package_failure_empty_stderr, False),
+        ("diagnostics: _format_execute_error prepends diagnosis above raw errors",
+         _selftest_diagnostics_format_execute_error_prepends_block, False),
         ("unsupported Swift constructs guard",
          _selftest_unsupported_swift_constructs, False),
         ("unsupported Swift constructs guard: comment-aware stripping",
