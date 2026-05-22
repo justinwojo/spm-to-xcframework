@@ -30,24 +30,37 @@ class Config:
     product_filters: List[str] = field(default_factory=list)
     target_filters: List[str] = field(default_factory=list)
     revision: Optional[str] = None
-    # Per-platform deployment targets. `None` means "don't build this platform".
-    # All default to None; when the user passes zero --min-* flags, the
-    # source-mode pipeline auto-derives the set from `Package.platforms[]`
-    # after Inspect. The auto-detect falls back to iOS 15.0 when the
-    # package declares no platforms at all. Binary mode (no Inspect)
-    # applies the same iOS-15 fallback in `_run_binary_mode` (cli.py).
+    # Two-piece per-platform state.
+    #
+    # `include_<plat>` is the set-membership signal: True means "build a
+    # slice for this platform." iOS defaults to True (the project's
+    # downstream consumer is .NET MAUI, which is iOS-first); all others
+    # default False. The CLI flips them on via the bare-flag opt-in
+    # (--macos / --maccatalyst / --tvos / --watchos / --visionos) — and
+    # any explicit --min-<plat> VERSION also implies inclusion, so an
+    # existing `--min-macos 11` invocation still adds macOS without
+    # requiring users to also pass --macos. `--no-ios` turns include_ios
+    # off.
+    #
+    # `min_<plat>` is the resolved deployment-target version, populated
+    # by `_autodetect_min_versions` after Inspect (source mode) or by
+    # the fallback-only pass in `_run_binary_mode`. Resolution order:
+    # user-explicit `--min-<plat>` > `Package.platforms[]` declaration >
+    # `_PLATFORM_FALLBACK_VERSIONS[plat]`. Stays None for platforms whose
+    # `include_<plat>` is False — downstream slice-walkers key off
+    # truthiness post-resolution.
+    include_ios: bool = True
+    include_macos: bool = False
+    include_maccatalyst: bool = False
+    include_tvos: bool = False
+    include_watchos: bool = False
+    include_visionos: bool = False
     min_ios: Optional[str] = None
     min_macos: Optional[str] = None
     min_maccatalyst: Optional[str] = None
     min_tvos: Optional[str] = None
     min_watchos: Optional[str] = None
     min_visionos: Optional[str] = None
-    # True iff the user passed --no-ios. Distinguishes "user explicitly
-    # opted out of iOS" from "user passed nothing and we'll auto-detect."
-    # Both end up with `min_ios == None` after _config_from_args, so the
-    # auto-detect needs this flag to know whether to skip iOS or fill it
-    # from the package.
-    no_ios: bool = False
     include_deps: bool = False
     binary_mode: bool = False
     verbose: bool = False

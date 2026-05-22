@@ -110,6 +110,25 @@ _PLATFORM_ORDER: Tuple[str, ...] = (
 )
 
 
+# Per-platform fallback deployment targets, applied by
+# `_autodetect_min_versions` when (a) the user opted into a platform
+# (via the bare `--<plat>` flag) but didn't pass `--min-<plat>`, and (b)
+# the resolved `Package.platforms[]` doesn't declare a version for that
+# platform either. Values chosen as Apple-SDK-modern floors — high
+# enough to be buildable with current Xcode, low enough not to exclude
+# the bulk of installed devices. The downstream binding-generation tool
+# is expected to raise these minimums per its own consumer-language
+# requirements (e.g. .NET) separately.
+_PLATFORM_FALLBACK_VERSIONS: Dict[str, str] = {
+    "ios": "15.0",
+    "macos": "11.0",
+    "maccatalyst": "15.0",
+    "tvos": "15.0",
+    "watchos": "8.0",
+    "visionos": "1.0",
+}
+
+
 def _selected_slices(config: "Config") -> List[Tuple[PlatformSlice, str]]:
     """Walk every `min_<platform>` field on `config` and return the
     ordered list of (slice, deployment_target_version) pairs the rest
@@ -137,56 +156,77 @@ def _selected_slices(config: "Config") -> List[Tuple[PlatformSlice, str]]:
     return out
 
 
-def _autodetect_min_versions(config: "Config", package: "Package") -> Dict[str, str]:
-    """Fill in `config.min_<platform>` fields from `Package.platforms[]`
-    when the user passed zero --min-* flags.
+def _autodetect_min_versions(
+    config: "Config", package: Optional["Package"] = None,
+) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """Resolve `config.min_<platform>` for every included platform.
 
-    Returns the dict of `{platform: version}` that was applied (empty
-    when no auto-detect ran — i.e., the user provided explicit flags).
-    Mutates `config` in place.
+    For each platform where `config.include_<plat>` is True:
 
-    Two policy choices, both deliberate:
+      1. If the user already supplied `--min-<plat>`, keep it.
+      2. Otherwise, if `package` is provided and `Package.platforms[]`
+         declares a version for that platform, use it.
+      3. Otherwise, fall back to `_PLATFORM_FALLBACK_VERSIONS[plat]`.
 
-    1. Explicit-vs-auto is all-or-nothing. If the user passed any
-       --min-* flag, we honor exactly that set; no mixing with derived
-       platforms. Keeps the mental model "what I typed is what I got."
+    Returns a `(derived, fallback)` tuple of `{platform: version}` maps
+    covering only the auto-resolutions (step 2 vs step 3) — user-
+    explicit values from step 1 are intentionally absent so the caller
+    can log "what we picked for you" without echoing back things the
+    user already typed. Mutates `config` in place by writing the
+    resolved version into `config.min_<plat>`.
 
-    2. When the package declares NO platforms at all (`platforms:` array
-       absent or empty), fall back to iOS 15.0 — today's pre-auto-detect
-       default. Many small library packages omit `platforms:` entirely
-       and rely on SPM's implicit minima; the tool's downstream (.NET
-       binding generation) almost always wants iOS, so the fallback
-       preserves the most common case.
+    `package=None` is the binary-mode path: with no Inspect there's no
+    `Package.platforms[]` to read, so every auto-resolution falls
+    straight through to the fallback table.
 
-    `--no-ios` is respected: if it was passed, auto-detect skips the iOS
-    entry from the package even when the package declares iOS. The
-    other declared platforms still get filled in. A `--no-ios`-only
-    invocation against an iOS-only package therefore yields zero
-    platforms; the caller's post-autodetect validator surfaces that as a
-    clear error.
+    Platforms with `include_<plat>` False are skipped entirely — their
+    `min_<plat>` stays None and downstream slice-walkers (which key off
+    truthiness) won't emit slices for them. `--no-ios` therefore flows
+    through as `include_ios = False` at the CLI layer; this function
+    doesn't special-case iOS.
     """
-    user_provided_any = any([
-        config.min_ios, config.min_macos, config.min_maccatalyst,
-        config.min_tvos, config.min_watchos, config.min_visionos,
-    ])
-    if user_provided_any:
-        return {}
+    declared: Dict[str, str] = {}
+    if package is not None:
+        for p in package.platforms:
+            if p.name not in _PLATFORM_ORDER or not p.version:
+                continue
+            declared[p.name] = p.version
 
     derived: Dict[str, str] = {}
-    for p in package.platforms:
-        if p.name not in _PLATFORM_ORDER or not p.version:
+    fallback: Dict[str, str] = {}
+    for plat in _PLATFORM_ORDER:
+        if not getattr(config, f"include_{plat}"):
             continue
-        if p.name == "ios" and config.no_ios:
+        if getattr(config, f"min_{plat}"):
             continue
-        derived[p.name] = p.version
+        version = declared.get(plat)
+        if version is not None:
+            setattr(config, f"min_{plat}", version)
+            derived[plat] = version
+        else:
+            version = _PLATFORM_FALLBACK_VERSIONS[plat]
+            setattr(config, f"min_{plat}", version)
+            fallback[plat] = version
+    return derived, fallback
 
-    if not derived and not config.no_ios:
-        config.min_ios = "15.0"
-        return {"ios": "15.0"}
 
-    for plat, ver in derived.items():
-        setattr(config, f"min_{plat}", ver)
-    return derived
+def _declared_unincluded_platforms(
+    config: "Config", package: "Package",
+) -> List[str]:
+    """Return platforms `Package.platforms[]` declares but the user
+    didn't opt into, in `_PLATFORM_ORDER`. Drives the CLI's "this
+    package also supports X" hint after autodetect.
+
+    iOS is excluded: there's no bare `--ios` flag and `--no-ios` is an
+    intentional drop, so re-suggesting iOS would be noise.
+    """
+    declared = {p.name for p in package.platforms}
+    return [
+        plat for plat in _PLATFORM_ORDER
+        if plat != "ios"
+        and plat in declared
+        and not getattr(config, f"include_{plat}")
+    ]
 
 
 def _enabled_platforms(config: "Config") -> List[str]:

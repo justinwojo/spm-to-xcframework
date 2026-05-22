@@ -2,7 +2,7 @@
 
 Build or download xcframeworks from Swift Package Manager packages — Swift, Objective-C, or mixed.
 
-Point it at an SPM package (URL or local path) and it produces ready-to-use xcframeworks for each library product. The platform set is auto-derived from the package's `Package.swift` `platforms:` declaration — multi-platform packages emit every declared platform's slice automatically, while packages that don't declare anything fall back to iOS 15. Override or extend that set with `--min-*` flags. Packages that distribute pre-built artifacts via SPM binary targets can be downloaded directly with `--binary`.
+Point it at an SPM package (URL or local path) and it produces ready-to-use xcframeworks for each library product. Defaults to **iOS-only** (deployment target auto-derived from `Package.swift`, falling back to 15.0); opt into other platforms with `--macos` / `--maccatalyst` / `--tvos` / `--watchos` / `--visionos`, each with its own auto-derived version and fallback. Pin any version explicitly with `--min-<plat> VERSION` (which also implies inclusion). Packages that distribute pre-built artifacts via SPM binary targets can be downloaded directly with `--binary`.
 
 Framework type (Swift, ObjC, Mixed) is auto-detected per output and reported in the build summary.
 
@@ -60,21 +60,29 @@ spm-to-xcframework <package-url-or-path> [--version <ver>] [options]
 
 **Platform selection**
 
+iOS is on by default; other platforms are opt-in. Each platform has a bare include flag (`--<plat>`) and an explicit pin flag (`--min-<plat> VERSION`); the pin also implies inclusion.
+
 | Flag | Description |
 |------|-------------|
-| `--min-ios <ver>` | Minimum iOS deployment target (e.g. `15.0`). Default: auto-derive from `Package.swift`; falls back to `15.0` if the package declares no platforms. |
-| `--no-ios` | Skip the iOS slices. The other platforms are auto-derived from `Package.swift`, or pass another `--min-*` flag to specify one explicitly. Mutually exclusive with `--min-ios`. |
-| `--min-macos <ver>` | Minimum macOS deployment target (e.g. `11.0`). Default: auto-derive from `Package.swift`. |
-| `--min-maccatalyst <ver>` | Minimum Mac Catalyst deployment target (e.g. `15.0`). Default: auto-derive from `Package.swift`. |
-| `--min-tvos <ver>` | Minimum tvOS deployment target (e.g. `15.0`). Default: auto-derive from `Package.swift`. |
-| `--min-watchos <ver>` | Minimum watchOS deployment target (e.g. `8.0`). Default: auto-derive from `Package.swift`. |
-| `--min-visionos <ver>` | Minimum visionOS deployment target (e.g. `1.0`). Default: auto-derive from `Package.swift`. |
+| `--min-ios <ver>` | Pin the iOS minimum deployment target. iOS is built by default; this flag overrides the auto-derived version. Mutually exclusive with `--no-ios`. |
+| `--no-ios` | Skip iOS. Pair with `--macos` / `--maccatalyst` / `--tvos` / `--watchos` / `--visionos` (or their `--min-<plat>` variants) to build other platforms only. |
+| `--macos` | Also build a macOS slice. Auto-derives the version from `Package.swift`, falling back to `11.0`. |
+| `--min-macos <ver>` | Pin the macOS minimum deployment target. Implies `--macos`. |
+| `--maccatalyst` | Also build a Mac Catalyst slice. Auto-derives, falling back to `15.0`. |
+| `--min-maccatalyst <ver>` | Pin the Mac Catalyst minimum. Implies `--maccatalyst`. |
+| `--tvos` | Also build tvOS device + simulator slices. Auto-derives, falling back to `15.0`. |
+| `--min-tvos <ver>` | Pin the tvOS minimum. Implies `--tvos`. |
+| `--watchos` | Also build watchOS device + simulator slices. Auto-derives, falling back to `8.0`. Requires watchOS SDK. |
+| `--min-watchos <ver>` | Pin the watchOS minimum. Implies `--watchos`. |
+| `--visionos` | Also build visionOS device + simulator slices. Auto-derives, falling back to `1.0`. Requires visionOS SDK. |
+| `--min-visionos <ver>` | Pin the visionOS minimum. Implies `--visionos`. |
 
 > **Platform selection at a glance**
-> - **No `--min-*` flags** → exactly the set declared in `Package.swift platforms:`. Empty/missing → iOS 15.0 fallback.
-> - **Any `--min-*` flag** → all-or-nothing override. The tool builds exactly the platforms you typed; auto-detect is suppressed entirely.
-> - **`--no-ios`** → drops iOS from the auto-detected set but keeps the rest; mutually exclusive with `--min-ios`.
-> - Auto-detect can request platforms whose SDKs aren't installed locally (e.g. watchOS / visionOS). Install via *Xcode › Settings › Components*, or pin to installed platforms with explicit `--min-*` flags.
+> - **No platform flags** → iOS only, version auto-derived from `Package.swift` (falling back to `15.0`).
+> - **`--<plat>` (bare flag)** → adds that platform; version auto-derived from `Package.swift`, or the per-platform fallback if the package doesn't declare it.
+> - **`--min-<plat> VERSION`** → adds that platform AND pins the version explicitly. User-explicit values always win over auto-derived and fallback.
+> - **`--no-ios`** → drops iOS. Combine with one or more opt-ins to build non-iOS platforms only.
+> - Opting into `--watchos` or `--visionos` requires the corresponding SDK to be installed locally — install via *Xcode › Settings › Components*.
 >
 > Full rules: [Platform selection](#platform-selection).
 
@@ -98,28 +106,37 @@ spm-to-xcframework <package-url-or-path> [--version <ver>] [options]
 
 ## Examples
 
-### Use the package's declared platforms (auto-detect)
+### iOS-only (default)
 
 ```bash
-# Alamofire declares iOS, macOS, tvOS, watchOS — all four slices come out
-# at the deployment targets the package specifies. No --min-* flags needed,
-# provided every declared platform's SDK is installed locally.
+# No platform flags → iOS slices only. Deployment target is auto-derived
+# from Package.swift if the package declares one; otherwise iOS 15.0.
 spm-to-xcframework https://github.com/Alamofire/Alamofire.git -v 5.10.2
 ```
 
-### Override platforms explicitly
+### Add more platforms
 
 ```bash
-# Force exactly the slices you typed; auto-detect is suppressed.
+# Bare --macos opts in; the deployment target is auto-derived from
+# Package.swift, or falls back to macOS 11.0 if the package doesn't
+# declare a macOS platforms: entry.
+spm-to-xcframework https://github.com/Alamofire/Alamofire.git -v 5.10.2 --macos
+
+# Add Mac Catalyst and tvOS too.
+spm-to-xcframework https://github.com/Alamofire/Alamofire.git -v 5.10.2 \
+    --macos --maccatalyst --tvos
+
+# Pin explicit minimums. Either flag adds the platform.
 spm-to-xcframework https://github.com/Alamofire/Alamofire.git -v 5.10.2 \
     --min-ios 15.0 --min-macos 11.0
+```
 
-# Drop iOS, keep everything else the package declared.
-spm-to-xcframework https://github.com/Alamofire/Alamofire.git -v 5.10.2 --no-ios
+### Non-iOS only
 
-# Build only macOS (single-slice xcframework).
+```bash
+# Drop iOS, build macOS only (single-slice xcframework).
 spm-to-xcframework https://github.com/Alamofire/Alamofire.git -v 5.10.2 \
-    --no-ios --min-macos 11.0
+    --no-ios --macos
 ```
 
 ### Filter to specific products
@@ -222,14 +239,21 @@ Product filtering (`--product`), revision verification (`--revision`), and dry-r
 
 ### Platform selection
 
-The tool resolves the platform set after `swift package dump-package`, before scheduling any builds. The rules:
+The tool resolves a deployment-target version for every included platform after `swift package dump-package`, before scheduling any builds. The rules:
 
-- **Zero `--min-*` flags** — the platform set is auto-derived from `Package.swift` `platforms:`. Every declared platform (with a recognized name) becomes an xcframework slice at the package's own minimum version. Platform-name strings the tool doesn't recognize (e.g. `driverkit`) are silently ignored.
-- **Any `--min-*` flag** — auto-detect is fully suppressed. The tool builds exactly the platforms you typed at the versions you typed. There is no mixing of derived and explicit platforms by design — "what I typed is what I got."
-- **No declared platforms in the manifest** — the tool falls back to iOS 15. Many small library packages omit `platforms:` entirely and rely on SPM's implicit minima; the downstream consumers of this tool almost always want iOS.
-- **`--no-ios`** — drops iOS from the auto-detected set but lets non-iOS declared platforms flow through. Combined with no other `--min-*` flag against a package that declares only iOS, the run errors out with a clear "no platforms selected" message. Mutually exclusive with `--min-ios`.
-- **SDK availability** — auto-detect will faithfully request every declared platform; if a platform's SDK isn't installed locally (visionOS / watchOS are common offenders on a fresh Xcode install), `xcodebuild` fails with `Unable to find a destination matching the provided destination specifier`. Install the missing SDK via *Xcode › Settings › Components*, or pin to installed platforms with explicit `--min-*` flags.
-- **Binary mode** — no `Package.swift` to read, so auto-detect doesn't apply. A run with zero `--min-*` flags still defaults to iOS 15; non-iOS binary builds require an explicit `--min-*`.
+- **Default set** — iOS is built unless `--no-ios` is passed. Every other platform requires an explicit opt-in via the bare `--<plat>` flag (`--macos`, `--maccatalyst`, `--tvos`, `--watchos`, `--visionos`) or via `--min-<plat> VERSION` (which also implies inclusion). The default reflects this tool's downstream consumers (.NET MAUI / Xamarin) being iOS-first and not benefiting from watchOS / visionOS slices; pure-Swift consumers opt in per build.
+- **Version precedence (per included platform)** — `--min-<plat> VERSION` (user-explicit) > `Package.platforms[]` declaration in the manifest > Apple-modern fallback table:
+  - `ios=15.0`, `macos=11.0`, `maccatalyst=15.0`, `tvos=15.0`, `watchos=8.0`, `visionos=1.0`.
+- **Mixing is allowed** — `--macos --min-tvos 17` includes both extras and pins only the tvOS version; iOS still flows through at its auto-derived or fallback version.
+- **Unknown platform names in `Package.platforms[]`** (e.g. `driverkit`) are silently ignored — a tool-stability invariant against future Apple SDK additions.
+- **Discovery hint** — when `Package.swift` declares non-iOS platforms you didn't opt into, the tool logs a one-liner naming the flags that would add them. Example output against a package like Nuke:
+
+  ```
+  Note: Package.swift also declares macOS, tvOS, visionOS. Pass --macos / --tvos / --visionos to include those slices.
+  ```
+- **`--no-ios`** — drops iOS. Combine with one or more opt-ins to build non-iOS only. A run with `--no-ios` and no other opt-in errors out with a clear "no platforms selected" message. Mutually exclusive with `--min-ios`.
+- **SDK availability** — opting into `--watchos` or `--visionos` requires the SDK to be installed locally; otherwise `xcodebuild` fails with `Unable to find a destination matching the provided destination specifier`. Install via *Xcode › Settings › Components*.
+- **Binary mode** — there's no `Package.swift` to read, so every included platform resolves straight to the fallback table (user-explicit `--min-<plat>` still wins). The discovery hint also no-ops in binary mode for the same reason.
 
 ### `--target` escape hatch
 
@@ -321,8 +345,8 @@ Symptoms below show the leading prefix of the actual error message — the real 
 | Symptom | Likely cause / fix |
 |---------|--------------------|
 | `Error: --no-ios and --min-ios are mutually exclusive. Drop one or the other.` | You passed both. Drop one — `--no-ios` already says "skip iOS"; `--min-ios` says "use this iOS version." |
-| `Error: No platforms selected.` | You passed `--no-ios` against a package that declares only iOS (or no platforms). Add another `--min-*` flag or drop `--no-ios`. |
-| `xcodebuild` reports `Unable to find a destination matching … { generic:1, platform:watchOS }` (or visionOS) | Auto-detect requested a platform whose SDK isn't installed locally. Install it via *Xcode › Settings › Components*, or pin to installed platforms with explicit `--min-*` flags. |
+| `Error: No platforms selected.` | You passed `--no-ios` without opting into any other platform. Add `--macos` / `--maccatalyst` / `--tvos` / `--watchos` / `--visionos` (or a `--min-<plat> VERSION` flag, which implies inclusion), or drop `--no-ios`. |
+| `xcodebuild` reports `Unable to find a destination matching … { generic:1, platform:watchOS }` (or visionOS) | You opted into a platform whose SDK isn't installed locally. Install it via *Xcode › Settings › Components*, or drop the `--watchos` / `--visionos` opt-in. |
 | `Error (fetch): Tag '<x>' not found` | The remote repo doesn't have that tag. Check `git ls-remote --tags <url>`. |
 | `Error (plan): --product filter matched no products: [...]` | A product name in `--product` doesn't exist. Run with `--inspect-only` to see the package's declared products and targets. If the module is exposed as a plain `.target(...)` instead, use `--target <name>`. |
 | `Error (plan): Plan produced zero build units.` | `--product` filtered everything out, or the package declares only non-library products (e.g. executables, macros). |
@@ -338,7 +362,7 @@ Symptoms below show the leading prefix of the actual error message — the real 
 - Packages that don't support library evolution (`-enable-library-evolution`) may produce xcframeworks without `.swiftinterface` files — Swift binding generation requires these, but ObjC binding generation is unaffected.
 - ObjC-only SPM targets must declare public headers via `publicHeadersPath` in `Package.swift` for headers to appear in the xcframework.
 - `--binary` only works with remote packages that distribute binary xcframeworks via SPM binary targets — packages with a mix of binary and source targets will only resolve the binary artifacts.
-- `--include-deps` is iOS-only in v1; combine it with iOS-enabled invocations only.
+- `--include-deps` requires iOS to be enabled; the transitive-dep xcframeworks themselves are iOS-only in v1, even when the primary outputs also build for macOS / tvOS / etc. (those non-iOS slices simply won't carry dep artifacts — the tool warns when this happens).
 - `--revision` requires the full 40-character commit SHA; short SHAs are rejected.
 - The planner's static-construct check (raw strings, triple-quoted strings, string interpolation in `Package.swift`) is a heuristic, not a full Swift parser; a manifest using these constructs is rejected with a clear `PrepareError` rather than silently mis-parsed.
 
