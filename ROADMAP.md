@@ -18,7 +18,7 @@ This doc supersedes the forward-looking sections of [REFACTOR_PROPOSAL.md](REFAC
 | D. Injection passes as separate library | REFACTOR_PROPOSAL.md | Open — see P2 below |
 | E. Content-addressed build cache | REFACTOR_PROPOSAL.md | Open — see P2 below |
 | F. Serializable Plan / `--dry-run` | REFACTOR_PROPOSAL.md | Open — see P1 below |
-| Integration matrix scaffolding | INTEGRATION_TESTING.md | **Done** — 10/10 passing |
+| Integration matrix scaffolding | INTEGRATION_TESTING.md | **Done** — 15/15 passing + 2 known_broken pinned to upstream bugs |
 | Nightly CI for integration matrix | INTEGRATION_TESTING.md (Phase 2) | Open — see P1 below |
 | Pre-merge integration check | INTEGRATION_TESTING.md (Phase 3) | Intentionally deferred (cost) |
 
@@ -47,17 +47,20 @@ Risk: moderate. Touches many code paths but each touch is small. Iterative.
 
 ## P1 — High-leverage, well-scoped
 
-### Stress-test matrix expansion
+### ~~Stress-test matrix expansion~~ — All listed candidates landed
 
-Add packages that exercise paths the current 12-entry matrix doesn't reach. Candidates ordered by ROI:
+Add packages that exercise paths the previously-12-entry matrix didn't reach. Candidates ordered by ROI:
 
 1. ~~**`apple/swift-syntax`**~~ — ~31 internal targets. **Added 2026-05-21**; surfaced the resilience boundary issue and now passes flag-free via the try-and-fallback shipped below.
 2. ~~**`pointfreeco/swift-case-paths`**~~ — **Added in `28863d1`** as a canonical macro-consuming package.
-3. **`apple/swift-async-algorithms`** — depends on swift-collections, validates `--include-deps` chain into the recent fix transitively.
-4. **`onevcat/Kingfisher`** — popular pure-Swift image library; broadens "common consumer packages" coverage.
-5. **`apple/swift-argument-parser`** — small, common, fast smoke test that pure-Swift baseline still works.
+3. ~~**`apple/swift-async-algorithms`**~~ — **Added in `1d20825`** as `known_broken`. Surfaced an Xcode 26.3 + swift-collections 1.5.x `@_lifetime` ceiling; revisit on Xcode 26.4 / swift-collections 1.6.
+4. ~~**`onevcat/Kingfisher`**~~ — **Added in `1d20825`**. Pure-Swift image library; broadens "common consumer packages" coverage.
+5. ~~**`apple/swift-argument-parser`**~~ — **Added in `1d20825`**. Small, common, fast smoke test that pure-Swift baseline still works.
+6. ~~**`pointfreeco/swift-composable-architecture`**~~ — **Added 2026-05-22** as a `known_broken` regression-test entry. Direct guard for commit `1d20825` (TCA-class transitive-graph hardening): the entry's `required_log_signatures` pins 13 sibling `*.xcframework ready (dependency)` lines, forcing the run to walk the hardened transitive paths before the same `@_lifetime` ceiling as #3 trips. Without `required_log_signatures`, an earlier failure that happened to log the same signature would silently mask as known_broken.
 
-Each follows the policy in INTEGRATION_TESTING.md: earns a slot only if it exercises a path the matrix doesn't.
+Matrix is now 17 entries (15 passing + 2 known_broken). Each addition followed the policy in INTEGRATION_TESTING.md: earns a slot only if it exercises a path the matrix doesn't.
+
+Next candidates earn a slot only on the same rule — new path, new value. None queued.
 
 Risk: low — additions are cheap to try and reveal information either way.
 
@@ -120,4 +123,4 @@ Risk: zero unless triggered by external demand.
 
 With macros shipped, the remaining P0 is **actionable error messages** — cheap, iterative, immediate user-visible improvement. Land **stress-test additions** alongside it; they're cheap and may surface adjacent gaps now that the macro / sibling-xcframework paths are live. **Serializable plan / `--dry-run`** lands next as a UX capstone. **Nightly CI** turns on after a few weeks of green matrix runs. P2 items wait for either external demand or genuine free cycles.
 
-When picking up: confirm the matrix is still 12/12 first (`python3 tests/integration/run_integration.py`) so the baseline is known-green before adding scope.
+When picking up: confirm the matrix is still 15/15 passing + 2 known_broken first (`python3 tests/integration/run_integration.py`) so the baseline is known-green before adding scope. The two known_broken entries (swift-async-algorithms, swift-composable-architecture) are pinned to the Xcode 26.3 / swift-collections 1.5.x `@_lifetime` ceiling — they should flip to PASS without code changes once Xcode 26.4 or swift-collections 1.6 lifts the experimental gate.

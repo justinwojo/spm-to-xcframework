@@ -55,6 +55,7 @@ class PackageSpec:
     known_broken: bool
     broken_reason: str
     broken_signature: str
+    required_log_signatures: list[str]
     allowed_unresolved: list[str]
     smoke: bool
 
@@ -100,6 +101,7 @@ def load_packages(only: str | None, smoke_only: bool) -> list[PackageSpec]:
             known_broken=bool(entry.get("known_broken", False)),
             broken_reason=str(entry.get("broken_reason", "")),
             broken_signature=str(entry.get("broken_signature", "")),
+            required_log_signatures=list(entry.get("required_log_signatures", [])),
             allowed_unresolved=list(entry.get("allowed_unresolved", [])),
             smoke=bool(entry.get("smoke", False)),
         )
@@ -241,6 +243,15 @@ def _classify_known_broken(
     log AND any verify-phase failure messages this harness emitted, so a
     matrix entry that fails only at verify (where messages never reach the
     log file) can still be pinned by its harness-side failure text.
+
+    `required_log_signatures` is a stricter gate: when set, *every* listed
+    substring must also appear in the haystack for the entry to count as
+    known_broken. This guards entries whose value is "thing X must have
+    happened before the known failure" — e.g. the TCA entry needs the 14
+    sibling xcframework-ready lines to appear before the swift-collections
+    ceiling trips, otherwise a regression that fails early but still
+    happens to log the same broken_signature would silently mask as
+    known_broken instead of surfacing as a real fail.
     """
     if not spec.known_broken:
         return "fail"
@@ -258,7 +269,12 @@ def _classify_known_broken(
     if verify_failures:
         haystack_parts.extend(verify_failures)
     haystack = "\n".join(haystack_parts)
-    return "known_broken" if spec.broken_signature in haystack else "fail"
+    if spec.broken_signature not in haystack:
+        return "fail"
+    for required in spec.required_log_signatures:
+        if required not in haystack:
+            return "fail"
+    return "known_broken"
 
 
 # --------------------------------------------------------------------------

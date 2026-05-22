@@ -372,6 +372,70 @@ broken_signature = "'@_lifetime' attribute is only valid when experimental featu
 broken_reason = "Xcode 26.3 + swift-collections 1.5.x interaction. The InternalCollectionsUtilities target's `@_lifetime`-annotated `~Escapable` helpers (LifetimeOverride.swift, #if compiler(>=6.2)) are rejected by xcodebuild's library-evolution EmitSwiftModule phase even though swiftSettings enable the Lifetimes experimental feature and the flag is passed on the swiftc command line. Reproduces with a vanilla `xcodebuild archive` against a fresh swift-async-algorithms checkout — no tool involvement — so this is an Xcode SPM-integration limitation, not a spm-to-xcframework bug. Re-test on Xcode 26.4 / swift-collections 1.6."
 notes = "First matrix entry exercising the SPM traits API and AvailabilityMacro experimental feature. Currently known_broken — see broken_reason. AsyncStreaming is intentionally NOT built — it depends on BasicContainers/ContainersPreview which are post-1.x swift-collections targets."
 
+# 15b — TCA-class transitive graph regression test for commit 1d20825
+# ("Harden the transitive-siblings path against TCA-class graphs"). The
+# Composable Architecture pulls in 11 external packages and 13 transitive
+# dependency products through its dependency closure, with cross-sibling
+# re-export chains, foreign-child product candidates, testTarget-only
+# children, and overlay-name post-init mutation — exactly the shapes
+# 1d20825 hardened. The local probe confirmed 13 dependency xcframeworks
+# build successfully (CombineSchedulers, ConcurrencyExtras, CustomDump,
+# Dependencies, IdentifiedCollections, IssueReporting, OrderedCollections,
+# Perception, PerceptionCore, Sharing, SwiftNavigation, UIKitNavigation,
+# XCTestDynamicOverlay) before swift-collections' InternalCollectionsUtilities
+# hits the same Xcode 26.3 / `@_lifetime` ceiling as swift-async-algorithms
+# (which also takes out ComposableArchitecture itself, since the umbrella
+# transitively depends on it). So this entry is currently `known_broken`
+# with the identical signature, but the 13 successful dependency builds
+# en route to the failure are what exercise the hardened code paths —
+# that's the actual regression value. When Xcode 26.4 or
+# swift-collections 1.6 lifts the experimental gate, this entry
+# transitions to PASS without code changes.
+[[package]]
+name = "swift-composable-architecture"
+url = "https://github.com/pointfreeco/swift-composable-architecture"
+version = "1.25.5"
+min_versions = { ios = "13.0" }
+args = ["--include-deps", "--product", "ComposableArchitecture"]
+expected_products = ["ComposableArchitecture"]
+exercises = [
+    "include-deps-transitive",
+    "tca-class-dependency-graph",  # 11 transitive packages, 13 sibling products
+    "cross-sibling-reexport-expansion",  # 1d20825: re-exported siblings across packages
+    "foreign-child-product-leak-filter",  # 1d20825: skip products owned by other packages
+    "overlay-names-post-init-mutation-guard",  # 1d20825: _SPM2XC_OVERLAY_NAMES mutability
+    "testtarget-pruning-large-graph",  # testTargets dropped from transitive closure
+    "swift-macros-pre-built",  # ComposableArchitectureMacros via swift build -c release
+]
+known_broken = true
+broken_signature = "'@_lifetime' attribute is only valid when experimental feature Lifetimes is enabled"
+# `required_log_signatures` is the actual regression guard. The
+# `broken_signature` alone would mask a regression that fails *before*
+# any siblings build (e.g. a Plan-phase break that happens to emit the
+# `@_lifetime` substring downstream). Pinning the sibling-ready lines
+# forces the run to have walked the hardened transitive paths from
+# 1d20825 before the Xcode bug trips. If any of these stop appearing,
+# the classifier flips to "fail" and the entry needs fresh triage.
+# `create_xcframework.py:346` emits `<name>.xcframework ready (dependency)`
+# for each successful sibling build.
+required_log_signatures = [
+    "CombineSchedulers.xcframework ready (dependency)",
+    "ConcurrencyExtras.xcframework ready (dependency)",
+    "CustomDump.xcframework ready (dependency)",
+    "Dependencies.xcframework ready (dependency)",
+    "IdentifiedCollections.xcframework ready (dependency)",
+    "IssueReporting.xcframework ready (dependency)",
+    "OrderedCollections.xcframework ready (dependency)",
+    "Perception.xcframework ready (dependency)",
+    "PerceptionCore.xcframework ready (dependency)",
+    "Sharing.xcframework ready (dependency)",
+    "SwiftNavigation.xcframework ready (dependency)",
+    "UIKitNavigation.xcframework ready (dependency)",
+    "XCTestDynamicOverlay.xcframework ready (dependency)",
+]
+broken_reason = "Same Xcode 26.3 + swift-collections 1.5.x interaction as swift-async-algorithms. TCA's transitive closure terminates in swift-collections, whose InternalCollectionsUtilities target's `@_lifetime`-annotated `~Escapable` helpers are rejected by xcodebuild's library-evolution EmitSwiftModule phase. CRITICAL CONTEXT FOR REGRESSION VALUE: a local probe confirmed 13 transitive dependency xcframeworks (CombineSchedulers, ConcurrencyExtras, CustomDump, Dependencies, IdentifiedCollections, IssueReporting, OrderedCollections, Perception, PerceptionCore, Sharing, SwiftNavigation, UIKitNavigation, XCTestDynamicOverlay) Plan + Prepare + Execute successfully — proving commit 1d20825's TCA-class-graph hardening works — before InternalCollectionsUtilities trips the Xcode bug (which then takes out ComposableArchitecture itself, since the umbrella transitively depends on it). The entry still regression-guards 1d20825 because the 13 successful builds run end-to-end through the hardened code paths. Re-test on Xcode 26.4 / swift-collections 1.6. The `required_log_signatures` field above is what enforces this — Codex review caught that without it, an early failure that still happened to emit the broken_signature would silently mask as known_broken."
+notes = "Direct regression test for commit 1d20825 (Harden the transitive-siblings path against TCA-class graphs). Currently known_broken due to a downstream swift-collections / Xcode 26.3 interaction, but the 13 dependency xcframeworks that build successfully en route to the failure are exactly what exercises the hardening — enforced by required_log_signatures. When that bug is fixed upstream, flip known_broken=false and expand expected_products to also include the 13 siblings (so the matrix asserts every product, not just the umbrella)."
+
 # 16 — Two products backing the same target. Alamofire ships both
 # `.library(name: "Alamofire", targets: ["Alamofire"])` (implicit static)
 # AND `.library(name: "AlamofireDynamic", type: .dynamic, targets:
