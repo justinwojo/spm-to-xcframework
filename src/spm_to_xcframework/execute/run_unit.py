@@ -48,6 +48,7 @@ from .create_xcframework import (
 from .dedup import (
     _apply_dedup_overlap_substitutions,
     _apply_phantom_helper_dep_augmentation,
+    _author_explicit_linkage_protected_targets,
     _compute_dedup_substitutions,
     _compute_phantom_helper_deps,
     _demote_synth_product_in_manifest,
@@ -55,7 +56,7 @@ from .dedup import (
 )
 from .inject_clang_bridge import inject_bridge_clang_modules
 from .inject_clang_system import inject_system_clang_modules
-from .inject_objc import inject_objc_headers
+from .inject_objc import inject_objc_headers, inject_pure_swift_clang_modulemap
 from .inject_resources import inject_resource_bundles
 from .inject_swiftmodule import inject_swiftmodule
 from .rename_framework import rename_framework_bundle
@@ -216,6 +217,22 @@ def _run_one_unit(
             fw_path=s.framework_path,
             verbose=config.verbose,
         )
+        # Pure-Swift frameworks (no ObjC headers in the source tree) emerge
+        # from xcodebuild with `Modules/<X>.swiftmodule/` but no Clang
+        # `module.modulemap`. Swift consumers don't need one, but ObjC
+        # consumers that do `@import <Name>` fail to resolve the module
+        # without it. Synthesize a minimal modulemap pointing at the
+        # Swift-generated `<Name>-Swift.h` so ObjC sites can import the
+        # framework's @objc surface. Runs after `inject_objc_headers` so
+        # that pass's umbrella-based modulemap takes precedence whenever
+        # the source tree did ship ObjC public headers.
+        inject_pure_swift_clang_modulemap(
+            fw_path=s.framework_path,
+            fw_name=fw_name,
+            dd_path=s.dd_path,
+            variant=sid,
+            verbose=config.verbose,
+        )
         inject_resource_bundles(
             fw_path=s.framework_path,
             fw_name=fw_name,
@@ -354,6 +371,22 @@ def execute_source_plan(
         if not config.no_dedup_overlap
         else set()
     )
+    # Author-declared `.library(type: .dynamic | .static, targets:[T])`
+    # products are NEVER demoted by our run — the author asked for
+    # explicit linkage — so T must stay protected from `.binaryTarget`
+    # substitution for the entire run. Frozen so the post-unit shrink
+    # at `synth_dynamic_protected.discard(t)` below physically cannot
+    # touch it; the union of both sets is what guards each dedup pass.
+    # (Triggered by RxSwift 6.x which ships both an automatic
+    # `RxSwift` library AND a dynamic `RxSwift-Dynamic` library
+    # backed by the same target. The `.static` case is symmetric:
+    # SPM rejects binary-only products that aren't executable or
+    # AUTOMATIC libraries — Codex P1 catch.)
+    author_explicit_linkage_protected: frozenset = (
+        frozenset(_author_explicit_linkage_protected_targets(prepared.package.products))
+        if not config.no_dedup_overlap
+        else frozenset()
+    )
     # Build the unit → planner-injected synth product mapping once.
     # synth_dynamic_library edits: unit.scheme == edit.product_name
     # (and unit.framework_name is the original product name, post-
@@ -438,7 +471,9 @@ def execute_source_plan(
                 target_to_unit=target_to_unit,
                 built_by_unit=built_by_unit,
                 target_deps=target_deps,
-                synth_dynamic_protected=synth_dynamic_protected,
+                synth_dynamic_protected=(
+                    synth_dynamic_protected | author_explicit_linkage_protected
+                ),
             )
             if substitutions:
                 # The apply helper writes only when at least one

@@ -473,6 +473,174 @@ def _selftest_language_counter(tmp_root: Path) -> None:
             f"SwiftOnly.source_file_count={swift_only_tgt.source_file_count}; expected 1")
 
 
+def _selftest_stage_preserves_root_package_swift_when_excluded(tmp_root: Path) -> None:
+    """[realm-swift 20.0.3 regression] Some packages (Realm) declare a
+    target with `path: "."` and list `"Package.swift"` in `exclude:`
+    — telling SPM "don't try to compile the manifest as part of my
+    target's source set." The exclude list is a per-target source-set
+    filter, NOT a filesystem-deletion list.
+
+    Pre-fix: the post-stage Pass 2 in `stage_source` obediently
+    computed `Path(".") / "Package.swift" = "Package.swift"` and
+    `unlink()`'d the manifest. Then `swift package resolve` ran
+    against a manifestless staged dir and died.
+
+    Post-fix: the root manifest (any depth-1 `Package.swift` or
+    `Package@swift-*.swift` entry in the staged tree) is protected
+    from removal regardless of the exclude list."""
+    fixture = tmp_root / "evil-exclude-pkg"
+    fixture.mkdir(parents=True, exist_ok=True)
+    (fixture / "Package.swift").write_text('''// swift-tools-version:5.5
+import PackageDescription
+
+let package = Package(
+    name: "EvilExclude",
+    targets: [
+        .target(
+            name: "Foo",
+            path: ".",
+            exclude: ["Package.swift", "doc.txt", "Bar", "Bar/Generated.swift"],
+            sources: ["Sources/Foo.swift"]
+        ),
+        .target(
+            name: "Bar",
+            path: "Bar"
+        ),
+    ]
+)
+''')
+    (fixture / "doc.txt").write_text("excluded doc")
+    sources = fixture / "Sources"
+    sources.mkdir(parents=True, exist_ok=True)
+    (sources / "Foo.swift").write_text("public struct Foo {}\n")
+    bar = fixture / "Bar"
+    bar.mkdir(parents=True, exist_ok=True)
+    (bar / "Bar.swift").write_text("public struct Bar {}\n")
+    # Sibling-child exclude — Foo also excludes "Bar/Generated.swift",
+    # which is a file INSIDE another target's root. The bidirectional
+    # sibling-target guard must protect it. (Codex P2 review catch.)
+    (bar / "Generated.swift").write_text("public let generated = 1\n")
+
+    work = tmp_root / "evil-exclude-work"
+    work.mkdir(parents=True, exist_ok=True)
+    config = Config(
+        package_source=str(fixture),
+        user_version="",
+        resolved_version="",
+        work_dir=work,
+    )
+    source_dir = fetch_source(config)
+    staged = stage_source(config, source_dir)
+    # The critical assertion: the manifest at the root of staged/ must
+    # survive even though the package's own exclude list names it. If
+    # the regression returns, `stage_source` itself would already have
+    # raised FetchError before reaching here (swift package resolve
+    # fails without a manifest).
+    _assert(
+        (staged / "Package.swift").is_file(),
+        "Package.swift was deleted from staged/ — the exclude-list "
+        "Pass 2 root-manifest guard is not in effect.",
+    )
+    # The non-manifest excluded file must still be removed — we did
+    # not over-broaden the protection.
+    _assert(
+        not (staged / "doc.txt").exists(),
+        "doc.txt should have been removed by the exclude pass — root "
+        "manifest guard widened too far.",
+    )
+    # The sibling target's source directory must survive even though
+    # the first target excludes it. Same conceptual bug as the manifest
+    # case: the exclude list is a source-set filter, not a deletion
+    # list, and "Bar" here is another target's `path:` directive.
+    _assert(
+        (staged / "Bar" / "Bar.swift").is_file(),
+        "Sibling target's source dir was deleted by the first target's "
+        "exclude — sibling-target-path guard is not in effect.",
+    )
+    _assert(
+        (staged / "Bar" / "Generated.swift").is_file(),
+        "Sibling target's child file was deleted by the first target's "
+        "sibling-child exclude — bidirectional sibling-target-path "
+        "guard is not in effect (Codex P2 catch).",
+    )
+
+
+def _selftest_stage_preserves_public_headers_path_when_excluded(tmp_root: Path) -> None:
+    """[realm-swift 20.0.3 round 2 regression] Some packages (Realm)
+    declare `publicHeadersPath: "include"` for a target AND list
+    `"include"` in that same target's `exclude:`. The exclude list is
+    a per-target source-set filter ("don't compile headers from this
+    dir as sources"), while `publicHeadersPath` is a separate
+    SPM directive that tells the build system where the target's
+    public headers live for downstream ObjC consumers. The directory
+    physically exists in the repo and SPM tolerates the apparent
+    contradiction.
+
+    Pre-fix: Pass 2 deleted the publicHeadersPath directory, and the
+    next `swift package describe` failed with "public headers
+    directory path for 'Realm' is invalid or not contained in the
+    target."
+
+    Post-fix: any path that overlaps a target's effective
+    publicHeadersPath (including the current target's) is protected
+    from removal regardless of the exclude list.
+    """
+    fixture = tmp_root / "evil-ph-exclude-pkg"
+    fixture.mkdir(parents=True, exist_ok=True)
+    (fixture / "Package.swift").write_text('''// swift-tools-version:5.5
+import PackageDescription
+
+let package = Package(
+    name: "EvilPHExclude",
+    targets: [
+        .target(
+            name: "Realmish",
+            path: ".",
+            exclude: ["include", "junk.txt"],
+            sources: ["Sources/Realmish.m"],
+            publicHeadersPath: "include"
+        ),
+    ]
+)
+''')
+    sources = fixture / "Sources"
+    sources.mkdir(parents=True, exist_ok=True)
+    (sources / "Realmish.m").write_text("// dummy\n")
+    include = fixture / "include"
+    include.mkdir(parents=True, exist_ok=True)
+    (include / "Realmish.h").write_text("// public header\n")
+    (fixture / "junk.txt").write_text("excluded junk")
+
+    work = tmp_root / "evil-ph-exclude-work"
+    work.mkdir(parents=True, exist_ok=True)
+    config = Config(
+        package_source=str(fixture),
+        user_version="",
+        resolved_version="",
+        work_dir=work,
+    )
+    source_dir = fetch_source(config)
+    staged = stage_source(config, source_dir)
+    # Critical: the publicHeadersPath directory must survive Pass 2,
+    # even though the same target's exclude list names it. If the
+    # regression returns, swift package resolve / describe would fail
+    # with "public headers directory path for 'Realmish' is invalid or
+    # not contained in the target."
+    _assert(
+        (staged / "include" / "Realmish.h").is_file(),
+        "publicHeadersPath directory was deleted by the exclude pass "
+        "— publicHeadersPath guard is not in effect (Realm 20.0.3 "
+        "regression).",
+    )
+    # The non-publicHeadersPath excluded file must still be removed —
+    # the guard didn't over-broaden.
+    _assert(
+        not (staged / "junk.txt").exists(),
+        "junk.txt should have been removed by the exclude pass — "
+        "publicHeadersPath guard widened too far.",
+    )
+
+
 def _selftest_minimixed_fetch_integration() -> None:
     """Full Fetch integration against testdata/MiniMixed.
 
@@ -565,10 +733,9 @@ def _selftest_minimixed_fetch_integration() -> None:
         # Mixed-language regression contract: SPM rejects the
         # MiniMixed target at describe time, so the full
         # inspect_package call must surface an InspectError whose
-        # message names the unsupported feature. This is the boundary
-        # the describe-based classifier is supposed to enforce — see
-        # REFACTOR_PROPOSAL.md "Open risks for B" line on mixed
-        # targets being a known-broken SPM feature.
+        # message names the unsupported feature. Mixed-language
+        # targets are a known-broken SPM feature; the describe-based
+        # classifier is the boundary that enforces it.
         try:
             inspect_package(config, staged)
         except InspectError as exc:
@@ -1033,6 +1200,207 @@ def _selftest_package_is_binary_only() -> None:
         "system + binary products: should still be binary-only because "
         "system-only products are dropped from the package check (the "
         "planner drops them too)",
+    )
+
+
+def _selftest_flatten_dependency_tree_url_version() -> None:
+    """`_flatten_dependency_tree` returns identity → (path, url, version)
+    tuples. Both url and version are pulled from the show-dependencies
+    JSON so the binary-only transitive auto-switch can route through
+    `_run_binary_mode` against the canonical upstream rather than the
+    `.build/repositories/<id>/` cache the checkout's local .git points
+    at. Missing fields fall through as None — the orchestrator then
+    falls back to the source-mode child."""
+    from spm_to_xcframework.inspect import _flatten_dependency_tree
+
+    tree = {
+        "identity": "root",
+        "path": "/root",
+        "url": "/root",
+        "version": "unspecified",
+        "dependencies": [
+            {
+                "identity": "adjust_signature_sdk",
+                "path": "/checkouts/adjust_signature_sdk",
+                "url": "https://github.com/adjust/adjust_signature_sdk.git",
+                "version": "3.67.0",
+                "dependencies": [],
+            },
+            {
+                "identity": "revision-pinned",
+                "path": "/checkouts/revision-pinned",
+                "url": "https://github.com/example/foo.git",
+                # show-dependencies emits "unspecified" for revision-
+                # pinned deps and any dep the root overrides with
+                # .package(name:, path:). Both must surface as a missing
+                # version so the binary-only auto-switch falls back.
+                "version": "unspecified",
+                "dependencies": [],
+            },
+        ],
+    }
+    flat = _flatten_dependency_tree(tree)
+
+    _assert("adjust_signature_sdk" in flat, f"missing key: {flat.keys()}")
+    path, url, version = flat["adjust_signature_sdk"]
+    _assert(path == "/checkouts/adjust_signature_sdk", path)
+    _assert(url == "https://github.com/adjust/adjust_signature_sdk.git", url)
+    _assert(version == "3.67.0", version)
+
+    _assert("revision-pinned" in flat, f"missing key: {flat.keys()}")
+    _, _, rp_version = flat["revision-pinned"]
+    _assert(rp_version == "unspecified", rp_version)
+
+    # Root identity is NOT included in the flattened output.
+    _assert("root" not in flat, "root must be excluded from flattened tree")
+
+
+def _selftest_looks_remote_url_and_resolved_version() -> None:
+    """Helpers that decide whether show-dependencies values are usable
+    for the binary-only auto-switch. Remote requires a real scheme; a
+    resolved version excludes 'unspecified' and falsy values.
+    """
+    from spm_to_xcframework.inspect import (
+        _looks_remote_url,
+        _looks_resolved_version,
+    )
+
+    _assert(_looks_remote_url("https://github.com/adjust/foo.git"))
+    _assert(_looks_remote_url("git@github.com:adjust/foo.git"))
+    _assert(_looks_remote_url("ssh://git@github.com/adjust/foo.git"))
+    _assert(_looks_remote_url("http://example.com/foo.git"))
+    # Local checkout paths SPM echoes for the root entry must NOT be
+    # treated as a remote URL — that would loop us back into the local-
+    # path-refusal we're trying to fix.
+    _assert(not _looks_remote_url("/private/var/.../staged"))
+    _assert(not _looks_remote_url(""))
+    _assert(not _looks_remote_url(None))
+
+    _assert(_looks_resolved_version("3.67.0"))
+    _assert(_looks_resolved_version("v3.67.0"))
+    _assert(_looks_resolved_version("11.24.2"))
+    _assert(not _looks_resolved_version("unspecified"))
+    _assert(not _looks_resolved_version(""))
+    _assert(not _looks_resolved_version(None))
+
+
+def _selftest_is_transitive_binary_only_classifier() -> None:
+    """`_is_transitive_binary_only` is the (products, targets)-shaped
+    twin of `_package_is_binary_only`. Inspect uses it to precompute
+    `TransitivePackageInfo.is_binary_only` so the orchestrator can route
+    binary-only transitives through `_run_binary_mode`."""
+    from spm_to_xcframework.inspect import _is_transitive_binary_only
+
+    pkg_pure = _mk_package_from_snapshot(KIDOZ_LIKE_DUMP_SNAPSHOT)
+    _assert(
+        _is_transitive_binary_only(pkg_pure.products, pkg_pure.targets),
+        "pure-binary transitive must classify as binary-only",
+    )
+
+    pkg_mixed = _mk_package_from_snapshot(MIXED_BINARY_AND_SOURCE_SNAPSHOT)
+    _assert(
+        not _is_transitive_binary_only(pkg_mixed.products, pkg_mixed.targets),
+        "mixed (binary + source) transitive must NOT be binary-only — "
+        "source mode still has real work to do",
+    )
+
+    # Empty product list returns False — there's nothing to route to
+    # binary mode either.
+    _assert(
+        not _is_transitive_binary_only([], pkg_pure.targets),
+        "empty product list must not classify as binary-only",
+    )
+
+    # Product with empty target list is malformed → not binary-only.
+    empty_product_pkg = _mk_package_from_snapshot({
+        "name": "EmptyProduct",
+        "toolsVersion": {"_version": "5.7.0"},
+        "platforms": [{"options": [], "platformName": "ios", "version": "15.0"}],
+        "products": [
+            {"name": "X", "type": {"library": ["automatic"]}, "targets": []},
+        ],
+        "targets": [],
+    })
+    _assert(
+        not _is_transitive_binary_only(
+            empty_product_pkg.products, empty_product_pkg.targets
+        ),
+        "product with empty target list must not classify as binary-only",
+    )
+
+
+def _selftest_referenced_products_are_all_binary_helper() -> None:
+    """`_referenced_products_are_all_binary` complements Inspect's
+    whole-package `is_binary_only` by handling mixed-mode transitives
+    where the umbrella only references the binary side. Without it,
+    Amplitude-Swift v1.18.3 → AmplitudeCore-Swift fails with `Plan
+    produced zero build units` because the source-mode child runs with
+    `product_filter=[AmplitudeCoreFramework]` and the binary-backed
+    product has no source target to compile."""
+    from spm_to_xcframework.cli import _referenced_products_are_all_binary
+    from spm_to_xcframework.model import Product, TransitivePackageInfo
+
+    # Mixed package, umbrella references ONLY the binary product —
+    # routes to binary mode despite `is_binary_only=False`.
+    mixed_amplitude_like = TransitivePackageInfo(
+        identity="amplitudecore-swift",
+        checkout_path=Path("/dummy"),
+        products=[
+            Product(name="AmplitudeCore", linkage="automatic",
+                    targets=["AmplitudeCore"]),
+            Product(name="AmplitudeCoreFramework", linkage="automatic",
+                    targets=["AmplitudeCoreFramework"]),
+        ],
+        tools_version="5.7",
+        referenced_products=["AmplitudeCoreFramework"],
+        is_binary_only=False,
+        binary_target_names=["AmplitudeCoreFramework",
+                             "AmplitudeCoreNoUIKitFramework"],
+    )
+    _assert(
+        _referenced_products_are_all_binary(mixed_amplitude_like),
+        "mixed package + umbrella references only binary product must "
+        "route through binary mode",
+    )
+
+    # Same package but umbrella references a SOURCE product — must NOT
+    # route to binary mode (source mode still has real work to do).
+    from dataclasses import replace as _dc_replace
+    mixed_source_ref = _dc_replace(
+        mixed_amplitude_like, referenced_products=["AmplitudeCore"]
+    )
+    _assert(
+        not _referenced_products_are_all_binary(mixed_source_ref),
+        "umbrella references source product → must stay on source mode",
+    )
+
+    # Umbrella references one source + one binary product → also stays
+    # on source mode (binary-mode child can't service the source ref).
+    mixed_both_ref = _dc_replace(
+        mixed_amplitude_like,
+        referenced_products=["AmplitudeCore", "AmplitudeCoreFramework"],
+    )
+    _assert(
+        not _referenced_products_are_all_binary(mixed_both_ref),
+        "umbrella references source AND binary → must stay on source mode",
+    )
+
+    # No referenced_products → False (nothing for binary mode to ship).
+    no_refs = _dc_replace(mixed_amplitude_like, referenced_products=[])
+    _assert(
+        not _referenced_products_are_all_binary(no_refs),
+        "empty referenced_products must not trigger binary routing",
+    )
+
+    # Unknown referenced product → False (paranoid: orchestrator should
+    # not silently route through binary mode for a product the
+    # transitive doesn't even declare).
+    bogus_ref = _dc_replace(
+        mixed_amplitude_like, referenced_products=["DoesNotExist"]
+    )
+    _assert(
+        not _referenced_products_are_all_binary(bogus_ref),
+        "unknown referenced product must not trigger binary routing",
     )
 
 
@@ -2003,6 +2371,31 @@ def _selftest_edit_replace_with_binary_target_unknown_raises() -> None:
     _assert(raised, "expected PrepareUserError for unknown target")
 
 
+def _selftest_edit_replace_with_binary_target_unknown_raises_typed_subclass() -> None:
+    """The "no .target call found" failure raises the narrower
+    `TargetCallNotFoundError` subclass, not the generic
+    `PrepareUserError`. The dedup-overlap router relies on this type
+    distinction to decide whether to fall back to the overlay path
+    vs. surface a real failure — losing the narrowing would silently
+    swallow other kinds of substitution errors. Guards against future
+    refactors collapsing the subclass back into the parent."""
+    text = STRIPE_PACKAGE_SWIFT_FIXTURE
+    caught: Optional[Exception] = None
+    try:
+        edit_replace_with_binary_target(text, "DoesNotExist", "/X.xcframework")
+    except Exception as exc:
+        caught = exc
+    _assert(caught is not None, "expected an exception")
+    _assert(
+        isinstance(caught, tool.TargetCallNotFoundError),
+        f"expected TargetCallNotFoundError, got {type(caught).__name__}",
+    )
+    _assert(
+        isinstance(caught, PrepareUserError),
+        "TargetCallNotFoundError must remain a PrepareUserError subclass",
+    )
+
+
 def _selftest_find_target_call_for_name_ignores_dependency_target_refs() -> None:
     """[Codex P1 regression] A target whose `dependencies:` array uses
     explicit `.target(name: "Foo")` syntax must NOT cause the finder
@@ -2085,6 +2478,86 @@ let p = Package(
             "second edit through dep-ref manifest was not a no-op")
 
 
+def _selftest_edit_append_synth_to_post_init_products_promisekit() -> None:
+    """PromiseKit 8.1.2 shape: `Package(name: "PromiseKit")` with no
+    `products:` argument, followed by `pkg.products = [...]` at file
+    scope. Without surgery, `swift package add-product` injects a
+    `products:` arg into the initializer that the post-init assignment
+    silently overwrites — our synth library vanishes.
+
+    The helper must (a) detect the assignment, (b) splice
+    `pkg.products.append(.library(name: "<synth>", type: .dynamic,
+    targets: [...]))` immediately after the assignment, and (c) preserve
+    the rest of the manifest verbatim.
+    """
+    text = (
+        "// swift-tools-version:5.3\n"
+        'import PackageDescription\n'
+        'let pkg = Package(name: "PromiseKit")\n'
+        'pkg.products = [\n'
+        '    .library(name: "PromiseKit", targets: ["PromiseKit"]),\n'
+        ']\n'
+        'pkg.targets = [.target(name: "PromiseKit")]\n'
+    )
+    out = edit_append_synth_to_post_init_products(
+        text, "PromiseKitDynamic", ["PromiseKit"]
+    )
+    _assert(out is not None, "expected an edited manifest for pkg.products = [...]")
+    _assert(
+        'pkg.products.append(.library(name: "PromiseKitDynamic", '
+        'type: .dynamic, targets: ["PromiseKit"]))' in out,
+        f"synth append statement missing:\n{out}",
+    )
+    # The author's original assignment must be preserved untouched.
+    _assert(
+        'pkg.products = [\n'
+        '    .library(name: "PromiseKit", targets: ["PromiseKit"]),\n'
+        ']' in out,
+        f"original pkg.products assignment was disturbed:\n{out}",
+    )
+    # Append lands AFTER the closing `]` of the assignment, BEFORE the
+    # next file-scope statement (`pkg.targets = ...`).
+    append_idx = out.index("pkg.products.append")
+    targets_idx = out.index("pkg.targets =")
+    _assert(append_idx < targets_idx,
+            "append statement must precede the targets assignment")
+    closing_bracket_idx = out.index("]", out.index('.library(name: "PromiseKit"'))
+    _assert(append_idx > closing_bracket_idx,
+            "append statement must come after the products array closes")
+
+
+def _selftest_edit_append_synth_to_post_init_products_no_match() -> None:
+    """When the manifest has no `<var>.products = [...]` assignment, the
+    helper must return None so the caller falls through to the normal
+    add-product flow."""
+    text = (
+        'let package = Package(\n'
+        '    name: "X",\n'
+        '    products: [.library(name: "X", targets: ["X"])],\n'
+        '    targets: [.target(name: "X")]\n'
+        ')\n'
+    )
+    out = edit_append_synth_to_post_init_products(text, "Y", ["X"])
+    _assert(out is None,
+            f"expected None for constructor-arg manifest; got:\n{out!r}")
+
+
+def _selftest_edit_append_synth_to_post_init_products_ignores_dotted_owner() -> None:
+    """Manifests can mention `something.pkg.products` (a dotted owner
+    chain) without intending file-scope mutation. The `(?<![.\\w])`
+    lookbehind in the regex must reject those — otherwise we'd capture
+    `pkg` as the variable name and emit a malformed splice.
+    """
+    text = (
+        'let pkg = Package(name: "X")\n'
+        '// Note: legacy.pkg.products = [...] used to be supported\n'
+        'pkg.targets = [.target(name: "X")]\n'
+    )
+    out = edit_append_synth_to_post_init_products(text, "Y", ["X"])
+    _assert(out is None,
+            f"expected None when no file-scope products assignment exists; got:\n{out!r}")
+
+
 SWIFT_COLLECTIONS_WRAPPER_FIXTURE = '''// swift-tools-version:5.7
 import PackageDescription
 
@@ -2147,7 +2620,7 @@ def _selftest_overlay_first_call_injects_block_and_wraps_targets_arg() -> None:
         "overlay names declaration missing",
     )
     _assert(
-        ").filter { !_SPM2XC_OVERLAY_NAMES.contains($0.name) } + _SPM2XC_OVERLAY_TARGETS"
+        ").filter { t in !_SPM2XC_OVERLAY_NAMES.contains(where: { $0 == t.name }) } + _SPM2XC_OVERLAY_TARGETS"
         in out,
         f"targets: arg was not wrapped with the filter+append:\n{out}",
     )
@@ -2196,7 +2669,7 @@ def _selftest_overlay_second_call_extends_block_no_rewrap() -> None:
     )
     # Exactly one wrap (the filter+append must NOT be applied twice — a
     # double wrap would mean nested `.filter { ... }.filter { ... }`).
-    wrap_count = twice.count(".filter { !_SPM2XC_OVERLAY_NAMES.contains($0.name) }")
+    wrap_count = twice.count(".filter { t in !_SPM2XC_OVERLAY_NAMES.contains(where: { $0 == t.name }) }")
     _assert(
         wrap_count == 1,
         f"targets: argument was wrapped {wrap_count} times — expected exactly 1",
@@ -2683,7 +3156,7 @@ for target in package.targets where target.type != .system {
     )
     out = edit_guard_target_loops_from_overlay(with_overlay)
     _assert(
-        "where (target.type != .system) && !_SPM2XC_OVERLAY_NAMES.contains(target.name)"
+        "where (target.type != .system) && !_SPM2XC_OVERLAY_NAMES.contains(where: { $0 == target.name })"
         in out,
         f"guard did not augment the where clause as expected:\n{out}",
     )
@@ -2730,7 +3203,7 @@ for target in package.targets {
     )
     out = edit_guard_target_loops_from_overlay(with_overlay)
     _assert(
-        "for target in package.targets where !_SPM2XC_OVERLAY_NAMES.contains(target.name) {"
+        "for target in package.targets where !_SPM2XC_OVERLAY_NAMES.contains(where: { $0 == target.name }) {"
         in out,
         f"guard did not insert where clause as expected:\n{out}",
     )
@@ -2788,6 +3261,79 @@ def _selftest_overlay_resulting_manifest_only_one_set_decl() -> None:
     _assert(
         out.count("let _SPM2XC_OVERLAY_TARGETS: [Target] = [") == 1,
         f"overlay targets declaration appeared more than once:\n{out}",
+    )
+
+
+RXSWIFT_FACTORY_FIXTURE = '''// swift-tools-version:5.5
+import PackageDescription
+
+extension Target {
+    static func rxTarget(name: String, dependencies: [Target.Dependency]) -> Target {
+        .target(
+            name: name,
+            dependencies: dependencies,
+            resources: [.copy("PrivacyInfo.xcprivacy")]
+        )
+    }
+}
+
+let package = Package(
+  name: "RxSwift",
+  products: [
+    .library(name: "RxSwift", targets: ["RxSwift"]),
+    .library(name: "RxRelay", targets: ["RxRelay"]),
+  ],
+  targets: [
+    .rxTarget(name: "RxSwift", dependencies: []),
+    .rxTarget(name: "RxRelay", dependencies: ["RxSwift"]),
+  ]
+)
+'''
+
+
+def _selftest_dedup_overlay_fallback_on_factory_wrapper(tmp_root: Path) -> None:
+    """[RxSwift 6.9.0 regression] When the manifest declares targets
+    through a factory wrapper that returns `Target` (e.g. RxSwift's
+    `static func rxTarget(name:, ...) -> Target`), the call sites are
+    `.rxTarget(name: "RxSwift", ...)` — no literal `.target(name:
+    "RxSwift", ...)` exists anywhere. The plan-time wrapper-signal
+    check (`_CUSTOM_TARGET_WRAPPER_SIGNALS`) doesn't flag this shape
+    because the factory returns `Target`, not a custom helper type,
+    so the dedup router originally took the in-place path and died
+    with `TargetCallNotFoundError`.
+
+    Reactive fallback: `_apply_dedup_overlap_substitutions` catches
+    `TargetCallNotFoundError` and re-runs the unit through the
+    overlay branch, which doesn't need a literal call to find. This
+    test exercises the fallback end-to-end."""
+    staged = tmp_root / "dedup-factory-fallback"
+    staged.mkdir(parents=True, exist_ok=True)
+    manifest = staged / "Package.swift"
+    manifest.write_text(RXSWIFT_FACTORY_FIXTURE)
+    xcfw = tmp_root / "RxSwift.xcframework"
+    xcfw.mkdir(parents=True, exist_ok=True)
+    _apply_dedup_overlap_substitutions(
+        staged_dir=staged,
+        substitutions=[("RxSwift", xcfw)],
+        unit_name="RxRelay",
+        verbose=False,
+    )
+    out = manifest.read_text()
+    _assert(
+        "spm-to-xcframework dedup-overlap overlay — begin" in out,
+        f"factory-wrapper manifest was not routed through the overlay "
+        f"fallback:\n{out}",
+    )
+    _assert(
+        "let _SPM2XC_OVERLAY_TARGETS" in out,
+        "overlay var was not injected by the dedup fallback",
+    )
+    # The original .rxTarget(name: "RxSwift", ...) call must NOT have been
+    # rewritten — the overlay path leaves the source target declaration
+    # alone and instead overrides via name-keyed filter + concat.
+    _assert(
+        '.rxTarget(name: "RxSwift", dependencies: [])' in out,
+        "factory call for RxSwift was unexpectedly rewritten in place",
     )
 
 
@@ -4164,6 +4710,124 @@ def _selftest_synth_dynamic_protected_targets_helper() -> None:
     )
 
 
+def _selftest_author_explicit_linkage_protected_targets_helper() -> None:
+    """RxSwift-shape: any AUTHOR-declared library product with EXPLICIT
+    linkage (`.dynamic` OR `.static`) must contribute its targets to
+    the protected set so the dedup-overlap pass skips substituting
+    them with `.binaryTarget`. Only AUTOMATIC products are exempt —
+    SPM's binary-only-product rule allows AUTOMATIC and executable
+    products to reference binary targets, but explicit `.dynamic`
+    AND explicit `.static` are both rejected.
+
+    Triggered by RxSwift 6.x (`.library(name: "RxSwift-Dynamic",
+    type: .dynamic, targets:["RxSwift"])`). The `.static` arm is the
+    Codex P1 final-review symmetric extension — no wild-sample
+    candidate has triggered it yet, but the SPM rejection is
+    identical.
+    """
+    products = [
+        tool.Product(name="RxSwift", linkage=Linkage.AUTOMATIC, targets=["RxSwift"]),
+        tool.Product(name="RxSwift-Dynamic", linkage=Linkage.DYNAMIC, targets=["RxSwift"]),
+        tool.Product(name="RxCocoa", linkage=Linkage.AUTOMATIC, targets=["RxCocoa"]),
+        tool.Product(name="FooStatic", linkage=Linkage.STATIC, targets=["Foo"]),
+        tool.Product(name="Multi-Dynamic", linkage=Linkage.DYNAMIC, targets=["A", "B"]),
+    ]
+    protected = tool._author_explicit_linkage_protected_targets(products)
+    _assert(
+        protected == {"RxSwift", "Foo", "A", "B"},
+        f"expected DYNAMIC + STATIC product targets (not AUTOMATIC), got {protected!r}",
+    )
+
+
+def _selftest_compute_dedup_substitutions_author_dynamic_target_skipped() -> None:
+    """RxSwift-shape end-to-end at the dedup decision boundary: an
+    author-declared `.library(type: .dynamic, targets:["RxSwift"])`
+    surviving in the manifest must keep RxSwift out of dedup
+    substitution. If we rewrote it to `.binaryTarget`, the surviving
+    dynamic product would crash SPM at the next archive's manifest
+    parse with "invalid type for binary product."
+
+    Note: at the call site `synth_dynamic_protected | author_dynamic_protected`
+    is the union passed in; this test pins behavior via that same
+    union — author-only entries must be respected even when the synth
+    set is empty (the RxSwift case has no planner-injected synth
+    dynamic libraries).
+    """
+    BU = tool.BuildUnit
+    sibling = BU(name="RxSwift", scheme="RxSwift",
+                 framework_name="RxSwift", language="Swift",
+                 archive_strategy="archive", source_targets=["RxSwift"])
+    umbrella = BU(name="RxCocoa", scheme="RxCocoa",
+                  framework_name="RxCocoa", language="Swift",
+                  archive_strategy="archive", source_targets=["RxCocoa"])
+    target_to_unit = {"RxSwift": sibling, "RxCocoa": umbrella}
+    built = {"RxSwift": tool.ExecutedUnit(
+        name="RxSwift",
+        xcframework_path=Path("/build/RxSwift.xcframework"),
+        framework_name="RxSwift",
+    )}
+    deps = {"RxCocoa": {"RxSwift"}, "RxSwift": set()}
+
+    # Synth set is EMPTY (RxSwift has no planner-injected synth dynamic
+    # libraries — the dynamic library is author-declared). The author
+    # set carries the protection. The call site union's them.
+    synth_protected: set = set()
+    author_protected = frozenset({"RxSwift"})
+    subs = _compute_dedup_substitutions(
+        unit=umbrella,
+        target_to_unit=target_to_unit,
+        built_by_unit=built,
+        target_deps=deps,
+        synth_dynamic_protected=(synth_protected | author_protected),
+    )
+    _assert(subs == [],
+            "author-declared .library(.dynamic, targets:[RxSwift]) must "
+            f"protect RxSwift from .binaryTarget substitution; got {subs!r}")
+
+
+def _selftest_compute_dedup_substitutions_author_static_target_skipped() -> None:
+    """[Codex P1 final-review] Symmetric to the `.dynamic` case above:
+    an author-declared `.library(name: "FooStatic", type: .static,
+    targets:["Foo"])` must also protect `Foo` from dedup substitution,
+    because SPM rejects EXPLICIT-linkage products referencing only
+    binary targets — not just dynamic ones. The error text is the
+    same: "products referencing only binary targets must be executable
+    or automatic library products."
+
+    Not yet observed in the wild-sample harness (Grok labelled this a
+    "latent narrow gap"), but the SPM rule is symmetric so the
+    protection is symmetric. This test pins the behavior so a future
+    refactor can't quietly drop `.static` from the helper.
+    """
+    BU = tool.BuildUnit
+    sibling = BU(name="Foo", scheme="Foo",
+                 framework_name="Foo", language="Swift",
+                 archive_strategy="archive", source_targets=["Foo"])
+    umbrella = BU(name="Bar", scheme="Bar",
+                  framework_name="Bar", language="Swift",
+                  archive_strategy="archive", source_targets=["Bar"])
+    target_to_unit = {"Foo": sibling, "Bar": umbrella}
+    built = {"Foo": tool.ExecutedUnit(
+        name="Foo",
+        xcframework_path=Path("/build/Foo.xcframework"),
+        framework_name="Foo",
+    )}
+    deps = {"Bar": {"Foo"}, "Foo": set()}
+
+    synth_protected: set = set()
+    author_protected = frozenset({"Foo"})
+    subs = _compute_dedup_substitutions(
+        unit=umbrella,
+        target_to_unit=target_to_unit,
+        built_by_unit=built,
+        target_deps=deps,
+        synth_dynamic_protected=(synth_protected | author_protected),
+    )
+    _assert(subs == [],
+            "author-declared .library(.static, targets:[Foo]) must "
+            f"protect Foo from .binaryTarget substitution; got {subs!r}")
+
+
 def _selftest_apply_dedup_overlap_substitutions_guards_unsupported_constructs(tmp_root: Path) -> None:
     """[Codex P2 round 4 regression] When `prepare()` takes its no-op
     path (no `package_swift_edits`), `apply_package_swift_edits` is
@@ -4852,6 +5516,395 @@ def _selftest_diagnostics_scan_known_patterns() -> None:
     _assert(block.startswith("Diagnosis: "), block)
     _assert("\nTry: " in block, block)
     _assert(block.count("\n") == 1, f"block must be exactly two lines: {block!r}")
+
+    # Mixpanel-style swift-interface module/type name collision.
+    # Verified against mixpanel-swift 6.3.0's vendored `JSON` sibling
+    # on Xcode 26.3 2026-05-22.
+    diag = scan(
+        "[1] [(unknown target)] 'JSON' is not a member type of enum 'JSON.JSON'"
+    )
+    _assert(diag is not None, "module/type name-collision pattern must match")
+    _assert("name collision" in diag.headline.lower(), diag.headline)
+    _assert("mixpanel" in diag.suggestion.lower() or "json" in diag.suggestion.lower(),
+            diag.suggestion)
+
+    # Realm-style C++ header search-path miss.
+    # Verified against realm-swift 20.0.3 / realm-core on Xcode 26.3
+    # 2026-05-22.
+    diag = scan(
+        "[1] 'realm/object-store/thread_safe_reference.hpp' file not found"
+    )
+    _assert(diag is not None, ".hpp file-not-found pattern must match")
+    _assert("c++" in diag.headline.lower() or "header" in diag.headline.lower(),
+            diag.headline)
+
+    # GoogleSignIn-style Clang/Swift module-not-found. The headline must
+    # surface the offending module name so the user can grep their
+    # transitives. Verified against GoogleSignIn-iOS 9.1.0 on Xcode 26.3
+    # 2026-05-22.
+    diag = scan("[1] [(unknown target)] Module 'GTMAppAuth' not found")
+    _assert(diag is not None, "Module-not-found pattern must match")
+    _assert("GTMAppAuth" in diag.headline, diag.headline)
+    _assert("GTMAppAuth" in diag.suggestion, diag.suggestion)
+
+    # Module-not-found is case-sensitive on the `Module` token — the
+    # lower-case `module` form appears in adjacent diagnostics
+    # ("module map", "module imported") where this hint would mislead.
+    _assert(scan("module 'Foo' was built with a different version of Swift").headline.lower()
+            .find("binarytarget") >= 0,
+            "lower-case 'module' must still hit the binary-mismatch pattern, "
+            "not the new module-not-found regex")
+
+
+def _selftest_edit_strip_test_targets() -> None:
+    """`edit_strip_test_targets` excises `.testTarget(...)` calls from
+    every staged manifest. Test targets contribute nothing to archive
+    builds and can be the sole reason SPM rejects an otherwise-fine
+    package (analytics-connector-ios v1.3.0's mixed-language test
+    target). Verifies both the middle-of-array and end-of-array
+    comma-handling paths, plus idempotency."""
+    from spm_to_xcframework.prepare import edit_strip_test_targets
+
+    # Middle-of-array: trailing comma absorbed.
+    middle = '''let package = Package(
+    name: "X",
+    targets: [
+        .target(name: "X"),
+        .testTarget(name: "XTests", dependencies: ["X"]),
+        .target(name: "Y"),
+    ]
+)'''
+    out = edit_strip_test_targets(middle)
+    _assert(".testTarget" not in out, "middle: testTarget call must be removed")
+    _assert(".target(name: \"X\")" in out, "middle: sibling target X must survive")
+    _assert(".target(name: \"Y\")" in out, "middle: sibling target Y must survive")
+    _assert(",," not in out and "[," not in out and ",]" not in out,
+            f"middle: must not leave dangling commas:\n{out}")
+
+    # End-of-array: leading comma absorbed.
+    end = '''let package = Package(
+    name: "X",
+    targets: [
+        .target(name: "X"),
+        .testTarget(name: "XTests", dependencies: ["X"])
+    ]
+)'''
+    out = edit_strip_test_targets(end)
+    _assert(".testTarget" not in out, "end: testTarget call must be removed")
+    _assert(".target(name: \"X\")" in out, "end: sibling target X must survive")
+    _assert(",]" not in out and ",\n    ]" not in out and ", ]" not in out,
+            f"end: must not leave dangling comma before close bracket:\n{out}")
+
+    # Multiple testTargets in one manifest — all removed.
+    multi = '''let package = Package(
+    targets: [
+        .target(name: "A"),
+        .testTarget(name: "ATests"),
+        .target(name: "B"),
+        .testTarget(name: "BTests"),
+        .target(name: "C"),
+    ]
+)'''
+    out = edit_strip_test_targets(multi)
+    _assert(".testTarget" not in out, "multi: all testTarget calls must go")
+    for t in ("A", "B", "C"):
+        _assert(f'.target(name: "{t}")' in out, f"multi: target {t} must survive")
+
+    # Comment containing `.testTarget(` text must NOT trigger removal.
+    in_comment = '''let package = Package(
+    targets: [
+        // Old shape: .testTarget(name: "Z") removed in v2
+        .target(name: "Z"),
+    ]
+)'''
+    out = edit_strip_test_targets(in_comment)
+    _assert(out == in_comment,
+            f"manifest with only commented testTarget must be unchanged:\n{out}")
+
+    # String literal containing `.testTarget(` must NOT trigger.
+    in_string = '''let package = Package(
+    name: ".testTarget(name: \\"fake\\")",
+    targets: [.target(name: "Real")]
+)'''
+    out = edit_strip_test_targets(in_string)
+    _assert(out == in_string,
+            "manifest with .testTarget mention inside a string literal "
+            "must be unchanged")
+
+    # Idempotency: re-running on an already-stripped manifest is a no-op.
+    out2 = edit_strip_test_targets(out)
+    _assert(out2 == out, "edit_strip_test_targets must be idempotent")
+
+
+def _selftest_edit_strip_unused_binary_targets() -> None:
+    """`edit_strip_unused_binary_targets` removes URL-based
+    `.binaryTarget(...)` declarations whose name isn't referenced by
+    any source target's dependency list, plus any `.library(...)`
+    product whose targets list is made entirely of stripped names.
+
+    Real-world trigger: analytics-connector-ios v1.3.x ships
+    `.target("AnalyticsConnector", path: "Sources/AnalyticsConnector")`
+    AND `.binaryTarget(name: "AnalyticsConnectorFramework", url: "...
+    AnalyticsConnector.xcframework.zip", checksum: ...)`. SPM unpacks
+    the prebuilt artifact during resolve and xcodebuild archive
+    overwrites the source compile's framework output with prebuilt-
+    tvOS-only slices, breaking the iOS umbrella build."""
+    from spm_to_xcframework.prepare import edit_strip_unused_binary_targets
+
+    # Canonical analytics-connector-ios v1.3.x shape — strip both the
+    # binary target and the .library product backed only by it.
+    acc = '''// swift-tools-version:5.3
+import PackageDescription
+
+let package = Package(
+    name: "analytics-connector-ios",
+    products: [
+        .library(name: "AnalyticsConnector", targets: ["AnalyticsConnector"]),
+        .library(name: "AnalyticsConnectorFramework",
+                 targets: ["AnalyticsConnectorFramework"])
+    ],
+    targets: [
+        .target(name: "AnalyticsConnector",
+                path: "Sources/AnalyticsConnector"),
+        .binaryTarget(name: "AnalyticsConnectorFramework",
+                      url: "https://example.com/AnalyticsConnector.xcframework.zip",
+                      checksum: "deadbeef"),
+    ]
+)
+'''
+    out = edit_strip_unused_binary_targets(acc)
+    _assert(".binaryTarget" not in out, f"binary target must be stripped:\n{out}")
+    _assert("AnalyticsConnectorFramework" not in out,
+            f"product backed only by stripped binary must be stripped too:\n{out}")
+    _assert('.target(name: "AnalyticsConnector"' in out,
+            "source target must survive")
+    _assert('.library(name: "AnalyticsConnector",' in out,
+            "source-backed library product must survive")
+    # No dangling commas left behind.
+    _assert(",," not in out and "[," not in out and ",]" not in out
+            and ",\n    ]" not in out and ", ]" not in out,
+            f"no dangling commas allowed:\n{out}")
+
+    # Binary target depended-on by a source target — must NOT be stripped.
+    # (Use a clearly DIFFERENT name from any path string so the
+    # depended-on check doesn't false-positive on `path:`.)
+    depended = '''let package = Package(
+    name: "Vendored",
+    targets: [
+        .target(name: "Wrapper",
+                dependencies: ["VendoredLibKit"],
+                path: "Sources/Wrapper"),
+        .binaryTarget(name: "VendoredLibKit",
+                      url: "https://example.com/VendoredLibKit.xcframework.zip",
+                      checksum: "abc")
+    ]
+)'''
+    out = edit_strip_unused_binary_targets(depended)
+    _assert(out == depended,
+            f"depended-on binary target must survive:\n{out}")
+
+    # Path-based `.binaryTarget(...)` is a vendored local artifact —
+    # NEVER strip these even if no source target depends on the name
+    # (the package's purpose may BE shipping the vendored framework
+    # as a product).
+    vendored_path = '''let package = Package(
+    name: "Foo",
+    products: [
+        .library(name: "FooBinary", targets: ["FooBinary"])
+    ],
+    targets: [
+        .binaryTarget(name: "FooBinary", path: "Vendored.xcframework")
+    ]
+)'''
+    out = edit_strip_unused_binary_targets(vendored_path)
+    _assert(out == vendored_path,
+            f"path-based .binaryTarget must NEVER be stripped:\n{out}")
+
+    # No-op when no binary targets at all.
+    plain = '''let package = Package(
+    name: "X",
+    targets: [.target(name: "X")]
+)'''
+    out = edit_strip_unused_binary_targets(plain)
+    _assert(out == plain, "no-op when no binary targets present")
+
+    # Idempotency.
+    out2 = edit_strip_unused_binary_targets(
+        edit_strip_unused_binary_targets(acc)
+    )
+    _assert(out2 == edit_strip_unused_binary_targets(acc),
+            "edit_strip_unused_binary_targets must be idempotent")
+
+    # Comment containing `.binaryTarget(` text must NOT trigger removal.
+    in_comment = '''let package = Package(
+    name: "X",
+    targets: [
+        // Legacy: .binaryTarget(name: "Old", url: "...", checksum: "...")
+        .target(name: "X")
+    ]
+)'''
+    out = edit_strip_unused_binary_targets(in_comment)
+    _assert(out == in_comment,
+            f"manifest with only commented .binaryTarget must be unchanged:\n{out}")
+
+
+def _selftest_inject_pure_swift_clang_modulemap() -> None:
+    """`inject_pure_swift_clang_modulemap` synthesizes a Clang modulemap
+    for pure-Swift frameworks that expose `@objc` API. Without it, ObjC
+    consumers fail `@import <Name>` because the framework has only a
+    `.swiftmodule/` directory and no `module.modulemap` (real trigger:
+    GoogleSignIn-iOS's `GIDEMMSupport.h` doing `@import GTMAppAuth`).
+
+    Covers: (1) happy path writes modulemap + copies `-Swift.h` header,
+    (2) skip when modulemap already exists (don't clobber the ObjC
+    pass's umbrella form), (3) skip when no swiftmodule directory (not
+    a Swift framework), (4) skip when no bridge header in DD (Swift
+    target exposes nothing to ObjC)."""
+    import tempfile
+    from spm_to_xcframework.execute.inject_objc import (
+        inject_pure_swift_clang_modulemap,
+    )
+
+    def _make_swift_framework(root: Path, fw_name: str, *,
+                              with_swiftmodule: bool = True) -> Path:
+        fw_path = root / f"{fw_name}.framework"
+        if with_swiftmodule:
+            sm = fw_path / "Modules" / f"{fw_name}.swiftmodule"
+            sm.mkdir(parents=True)
+            (sm / "arm64-apple-ios.swiftinterface").write_text(
+                "// swift-interface-format-version: 1.0\n"
+                "@objc public class Foo {}\n"
+            )
+        else:
+            fw_path.mkdir(parents=True)
+        return fw_path
+
+    def _make_dd_with_bridge(root: Path, fw_name: str) -> Path:
+        dd = root / "DerivedData"
+        intermediates = (
+            dd / "Build" / "Intermediates.noindex" / f"{fw_name}.build"
+            / "Release-iphoneos" / f"{fw_name}.build" / "DerivedSources"
+        )
+        intermediates.mkdir(parents=True)
+        (intermediates / f"{fw_name}-Swift.h").write_text(
+            f"// {fw_name}-Swift.h auto-generated bridge\n"
+            f"#import <Foundation/Foundation.h>\n"
+            f"@interface {fw_name}Foo : NSObject\n@end\n"
+        )
+        return dd
+
+    # 1. Happy path.
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        fw = _make_swift_framework(td_path / "out", "GTMAppAuth")
+        dd = _make_dd_with_bridge(td_path / "build", "GTMAppAuth")
+        result = inject_pure_swift_clang_modulemap(
+            fw_path=fw, fw_name="GTMAppAuth", dd_path=dd,
+            variant="ios-arm64", verbose=False,
+        )
+        _assert(result is True, "happy path should return True")
+        modulemap = fw / "Modules" / "module.modulemap"
+        _assert(modulemap.is_file(), "module.modulemap must be written")
+        mm_text = modulemap.read_text()
+        _assert("framework module GTMAppAuth" in mm_text, mm_text)
+        _assert('header "GTMAppAuth-Swift.h"' in mm_text, mm_text)
+        _assert("requires objc" in mm_text, mm_text)
+        bridge = fw / "Headers" / "GTMAppAuth-Swift.h"
+        _assert(bridge.is_file(), "-Swift.h must be copied into Headers/")
+
+    # 2. Existing modulemap — no-op.
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        fw = _make_swift_framework(td_path / "out", "GTMAppAuth")
+        existing_mm = fw / "Modules" / "module.modulemap"
+        existing_text = (
+            'framework module GTMAppAuth {\n'
+            '  umbrella header "GTMAppAuth.h"\n'
+            '  export *\n'
+            '}\n'
+        )
+        existing_mm.write_text(existing_text)
+        dd = _make_dd_with_bridge(td_path / "build", "GTMAppAuth")
+        result = inject_pure_swift_clang_modulemap(
+            fw_path=fw, fw_name="GTMAppAuth", dd_path=dd,
+            variant="ios-arm64", verbose=False,
+        )
+        _assert(result is False, "existing modulemap should short-circuit")
+        _assert(existing_mm.read_text() == existing_text,
+                "existing modulemap must not be overwritten")
+
+    # 3. No swiftmodule — not a Swift framework, skip.
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        fw = _make_swift_framework(td_path / "out", "ObjCOnly",
+                                   with_swiftmodule=False)
+        dd = _make_dd_with_bridge(td_path / "build", "ObjCOnly")
+        result = inject_pure_swift_clang_modulemap(
+            fw_path=fw, fw_name="ObjCOnly", dd_path=dd,
+            variant="ios-arm64", verbose=False,
+        )
+        _assert(result is False, "no swiftmodule should short-circuit")
+        _assert(not (fw / "Modules" / "module.modulemap").exists(),
+                "no modulemap should be written")
+
+    # 4. Bridge header missing — Swift target exposes nothing to ObjC.
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        fw = _make_swift_framework(td_path / "out", "PureSwift")
+        empty_dd = td_path / "empty_dd"
+        empty_dd.mkdir()
+        result = inject_pure_swift_clang_modulemap(
+            fw_path=fw, fw_name="PureSwift", dd_path=empty_dd,
+            variant="ios-arm64", verbose=False,
+        )
+        _assert(result is False, "missing -Swift.h should short-circuit")
+        _assert(not (fw / "Modules" / "module.modulemap").exists(),
+                "no modulemap should be written when bridge header absent")
+
+
+def _selftest_diagnostics_scan_plan_error() -> None:
+    """`diagnostics.scan_plan_error` reshapes PlanError bodies into the
+    canonical Diagnosis/Try shape so the wild-sample harness flags them
+    as `diagnosed` failures instead of `undiagnosed`. The two shapes:
+    (1) `Plan produced zero build units...` from plan.py and (2) the
+    binary-only auto-switch local-path refusal from cli.py."""
+    from spm_to_xcframework.diagnostics import scan_plan_error, format_block
+
+    # Plan-zero-units (canonical: amplitudecore-swift transitive).
+    diag = scan_plan_error(
+        "Plan produced zero build units. Did --product filter out "
+        "everything, or does this package declare only non-library products?"
+    )
+    _assert(diag is not None, "Plan-zero-units must diagnose")
+    _assert("zero build units" in diag.headline.lower(), diag.headline)
+    _assert("--product" in diag.suggestion or "--inspect-only" in diag.suggestion,
+            diag.suggestion)
+
+    # Binary-only-on-local-path refusal.
+    diag = scan_plan_error(
+        "Detected a binary-only Package.swift (every product is "
+        "backed only by binaryTarget targets). Auto-switching to "
+        "--binary mode requires a remote package URL plus --version "
+        "<tag>; this run was given a local path."
+    )
+    _assert(diag is not None, "binary-only local-path refusal must diagnose")
+    _assert("binary-only" in diag.headline.lower(), diag.headline)
+    _assert("--version" in diag.suggestion or "binary mode" in diag.suggestion.lower(),
+            diag.suggestion)
+
+    # Misses return None — PlanError bodies we don't have shapes for
+    # must fall through silently so the existing "Error (plan): ..."
+    # rendering is unchanged.
+    _assert(
+        scan_plan_error("Some unrelated PlanError text") is None,
+        "non-matching PlanError bodies must return None",
+    )
+
+    # format_block produces the same two-line shape used by archive-side
+    # diagnoses so the wild-sample regex picks it up identically.
+    block = format_block(diag)
+    _assert(block.startswith("Diagnosis: "), block)
+    _assert("\nTry: " in block, block)
 
 
 def _selftest_diagnostics_format_swift_package_failure_tools_version() -> None:
@@ -9273,6 +10326,108 @@ def _selftest_inject_swiftmodule_flat_unchanged(tmp_root: Path) -> None:
             "flat framework must not gain a Versions/ directory")
 
 
+def _selftest_strip_self_module_qualifier_in_swiftinterface() -> None:
+    """The self-module qualifier strip is the workaround for Swift bug
+    SR-14195 / #56573: a module M containing a public type also named M
+    emits `M.X` refs into its own swiftinterface that the re-parser then
+    binds as "nested type X in class M.M" and fails. Within M's own
+    interface, `M.X` ALWAYS resolves to top-level X in M, so dropping
+    the leading `M.` is semantically equivalent.
+
+    Canonical packages this unblocks: analytics-connector-ios
+    (class AnalyticsConnector in module AnalyticsConnector), mixpanel-swift
+    (JSON in module JSON). Both verified failing pre-fix.
+    """
+    from spm_to_xcframework.execute.inject_swiftmodule import (
+        _strip_self_module_qualifier_from_swiftinterface as strip,
+    )
+
+    # 1. Canonical AnalyticsConnector shape — both extension on the
+    #    shadowing class and member-type refs must lose the qualifier.
+    src = (
+        "extension AnalyticsConnector.AnalyticsConnector {\n"
+        "  public func register(_ bridge: AnalyticsConnector.EventBridge) {}\n"
+        "}\n"
+    )
+    expected = (
+        "extension AnalyticsConnector {\n"
+        "  public func register(_ bridge: EventBridge) {}\n"
+        "}\n"
+    )
+    _assert(strip(src, "AnalyticsConnector") == expected,
+            f"canonical AnalyticsConnector strip wrong: {strip(src, 'AnalyticsConnector')!r}")
+
+    # 2. Lookbehind protects nested-type chain: `M.M.X` becomes `M.X`,
+    #    NOT `X`. (The bug-pattern case `M.M` still collapses to `M`.)
+    src2 = "public typealias Alias = Mod.Mod.Inner\n"
+    expected2 = "public typealias Alias = Mod.Inner\n"
+    _assert(strip(src2, "Mod") == expected2,
+            f"nested-chain lookbehind broken: {strip(src2, 'Mod')!r}")
+
+    # 3. import lines untouched — `import Mod.Submodule` is rare but
+    #    valid Clang-style; even if it became unqualified Swift would
+    #    treat it identically, but the leading lookbehind makes it
+    #    skip anyway because the dot-path starts after a keyword and
+    #    space (no preceding word char). The substring inside the
+    #    import statement should still survive because it IS preceded
+    #    by whitespace; assert that `import Mod\n` does NOT lose
+    #    anything meaningful and that we don't corrupt the import.
+    src3 = "import Mod\nimport Foundation\n"
+    _assert(strip(src3, "Mod") == src3,
+            "import lines must not be rewritten")
+
+    # 4. Cross-module refs untouched: stripping module Mod must leave
+    #    OtherMod.Foo and submoduleRef.Foo alone.
+    src4 = "public var x: OtherMod.Foo = OtherMod.Foo()\npublic var y: aMod.Foo = aMod.Foo()\n"
+    _assert(strip(src4, "Mod") == src4,
+            f"cross-module ref corrupted: {strip(src4, 'Mod')!r}")
+
+    # 5. String literal containing the qualifier survives untouched
+    #    (deprecation messages, @available reasons).
+    src5 = (
+        '@available(*, deprecated, message: "Use Mod.NewType instead")\n'
+        "public class Old: Mod.OldBase {}\n"
+    )
+    expected5 = (
+        '@available(*, deprecated, message: "Use Mod.NewType instead")\n'
+        "public class Old: OldBase {}\n"
+    )
+    _assert(strip(src5, "Mod") == expected5,
+            f"string-literal not preserved: {strip(src5, 'Mod')!r}")
+
+    # 6. Block and line comments containing the qualifier survive.
+    src6 = (
+        "// extension Mod.X { } — historical note\n"
+        "/* extension Mod.Y { } */\n"
+        "public class Real: Mod.Base {}\n"
+    )
+    expected6 = (
+        "// extension Mod.X { } — historical note\n"
+        "/* extension Mod.Y { } */\n"
+        "public class Real: Base {}\n"
+    )
+    _assert(strip(src6, "Mod") == expected6,
+            f"comment not preserved: {strip(src6, 'Mod')!r}")
+
+    # 7. Idempotent: a second pass over an already-stripped interface
+    #    is a no-op.
+    once = strip(src, "AnalyticsConnector")
+    _assert(strip(once, "AnalyticsConnector") == once,
+            "second-pass strip should be a no-op (idempotency)")
+
+    # 8. Lookahead `[A-Z_]` rejects lowercase / numeric continuations,
+    #    so we don't munge a method name accidentally namespaced by a
+    #    same-letter prefix. (Pathological, but cheap to assert.)
+    src8 = "public let v: Mod.value = 0\n"
+    _assert(strip(src8, "Mod") == src8,
+            "lookahead must reject lowercase continuation")
+
+    # 9. No-op when module name never appears in code body.
+    src9 = "public class Foo { public var bar: Int { 0 } }\n"
+    _assert(strip(src9, "AnalyticsConnector") == src9,
+            "no-op when module name absent")
+
+
 def _selftest_inject_resource_bundles_versioned_macos(tmp_root: Path) -> None:
     """SwiftPM `.bundle` sub-bundles drop under Versions/A/Resources/
     on macOS, not at the framework root (which would break codesigning).
@@ -10532,6 +11687,10 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          _selftest_is_binary_only_product_classifier, False),
         ("planner: _package_is_binary_only classifier (issue #39)",
          _selftest_package_is_binary_only, False),
+        ("inspect: _is_transitive_binary_only classifier (pure-binary vs mixed)",
+         _selftest_is_transitive_binary_only_classifier, False),
+        ("cli: _referenced_products_are_all_binary routes mixed-package + binary-only-ref transitives through binary mode",
+         _selftest_referenced_products_are_all_binary_helper, False),
         ("planner: mixed package — skip binary product, plan source (issue #39)",
          _selftest_planner_skips_binary_only_product_in_mixed_package, False),
         ("planner: pure-binary package reaching planner raises PlanError (issue #39)",
@@ -10579,10 +11738,18 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          _selftest_edit_replace_with_binary_target_multiline, False),
         ("dedup-overlap: edit_replace_with_binary_target unknown target raises",
          _selftest_edit_replace_with_binary_target_unknown_raises, False),
+        ("edit_replace_with_binary_target: unknown target raises TargetCallNotFoundError subclass",
+         _selftest_edit_replace_with_binary_target_unknown_raises_typed_subclass, False),
         ("dedup-overlap [Codex P1]: _find_target_call_for_name ignores .target(name:) inside dependencies",
          _selftest_find_target_call_for_name_ignores_dependency_target_refs, False),
         ("dedup-overlap [Codex P1]: edit_replace doesn't clobber sibling that references the target in deps",
          _selftest_edit_replace_with_binary_target_dep_ref_does_not_clobber_sibling, False),
+        ("synth-product [PromiseKit]: post-init pkg.products = [...] gets .append surgery",
+         _selftest_edit_append_synth_to_post_init_products_promisekit, False),
+        ("synth-product: post-init helper returns None when no assignment exists",
+         _selftest_edit_append_synth_to_post_init_products_no_match, False),
+        ("synth-product: post-init helper rejects dotted-owner false matches",
+         _selftest_edit_append_synth_to_post_init_products_ignores_dotted_owner, False),
         ("dedup-overlap overlay [swift-collections]: first call injects block + wraps targets: arg",
          _selftest_overlay_first_call_injects_block_and_wraps_targets_arg, False),
         ("dedup-overlap overlay [swift-collections]: second call extends block, no re-wrap",
@@ -10623,6 +11790,8 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          _selftest_overlay_guard_skips_string_literals, False),
         ("dedup-overlap routing: wrapper-style manifest routed through overlay edit",
          lambda: _selftest_dedup_routes_wrapper_manifest_through_overlay(tmp_root), False),
+        ("dedup-overlap fallback: RxSwift-style factory wrapper triggers reactive overlay path",
+         lambda: _selftest_dedup_overlay_fallback_on_factory_wrapper(tmp_root), False),
         ("phantom-helper: edit_augment_target_dependencies appends to nonempty array",
          _selftest_augment_target_deps_appends_to_nonempty_array, False),
         ("phantom-helper: edit_augment_target_dependencies is idempotent",
@@ -10721,6 +11890,12 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          _selftest_compute_dedup_substitutions_synth_dynamic_target_skipped, False),
         ("dedup-overlap [Codex final-review]: _synth_dynamic_protected_targets helper excludes synth_library",
          _selftest_synth_dynamic_protected_targets_helper, False),
+        ("dedup-overlap [RxSwift]: _author_explicit_linkage_protected_targets helper covers DYNAMIC + STATIC, skips AUTOMATIC",
+         _selftest_author_explicit_linkage_protected_targets_helper, False),
+        ("dedup-overlap [RxSwift]: author-declared .library(.dynamic) protects backing target from substitution",
+         _selftest_compute_dedup_substitutions_author_dynamic_target_skipped, False),
+        ("dedup-overlap [Codex P1 final-review]: author-declared .library(.static) protects backing target from substitution",
+         _selftest_compute_dedup_substitutions_author_static_target_skipped, False),
         ("dedup-overlap [Codex P2]: external .product collision must not become an internal edge",
          _selftest_compute_internal_target_deps_external_product_collision, False),
         ("dedup-overlap [Codex P2]: mixed internal byName + external product with same name",
@@ -10729,6 +11904,14 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          _selftest_parse_xcresult_build_results, False),
         ("diagnostics: scan matches known xcodebuild failure patterns",
          _selftest_diagnostics_scan_known_patterns, False),
+        ("diagnostics: scan_plan_error reshapes Plan-phase failures",
+         _selftest_diagnostics_scan_plan_error, False),
+        ("stage: edit_strip_test_targets removes .testTarget(...) declarations (analytics-connector-ios mixed-lang test target)",
+         _selftest_edit_strip_test_targets, False),
+        ("stage: edit_strip_unused_binary_targets removes URL .binaryTarget alternates (analytics-connector-ios shadowing source build)",
+         _selftest_edit_strip_unused_binary_targets, False),
+        ("inject: pure-Swift framework gets synthetic Clang modulemap referencing -Swift.h (unblocks ObjC @import from siblings)",
+         _selftest_inject_pure_swift_clang_modulemap, False),
         ("diagnostics: swift-package shaping extracts tools-version mismatch",
          _selftest_diagnostics_format_swift_package_failure_tools_version, False),
         ("diagnostics [Codex review P2]: tools-version too-new hint points at Xcode upgrade",
@@ -10874,6 +12057,8 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          lambda: _selftest_inject_swiftmodule_versioned_macos(tmp_root), False),
         ("execute: inject_swiftmodule on flat (iOS) framework keeps flat layout (regression)",
          lambda: _selftest_inject_swiftmodule_flat_unchanged(tmp_root), False),
+        ("execute: strip self-module qualifier in swiftinterface (SR-14195 workaround)",
+         _selftest_strip_self_module_qualifier_in_swiftinterface, False),
         ("execute: inject_resource_bundles on macOS versioned framework lands under Versions/A/Resources",
          lambda: _selftest_inject_resource_bundles_versioned_macos(tmp_root), False),
         ("execute: inject_system_clang_modules end-to-end (GRDB shape)",
@@ -10995,6 +12180,10 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
         ("manifest: --no-cleanup-stale preserves AND keeps tracking",
          lambda: _selftest_manifest_no_cleanup_stale_preserves_and_tracks(tmp_root), False),
         ("MiniMixed fetch+stage+inspect (real swift)", _selftest_minimixed_fetch_integration, True),
+        ("stage: root Package.swift preserved when target excludes it (Realm regression)",
+         lambda: _selftest_stage_preserves_root_package_swift_when_excluded(tmp_root), True),
+        ("stage: publicHeadersPath directory preserved when same target excludes it (Realm 20.0.3 round 2)",
+         lambda: _selftest_stage_preserves_public_headers_path_when_excluded(tmp_root), True),
         ("round-trip: GRDB (synth_dynamic_library + skip system)", _roundtrip_grdb, True),
         ("round-trip: Alamofire (synth_dynamic_library with collision-aware naming)",
          _roundtrip_alamofire, True),

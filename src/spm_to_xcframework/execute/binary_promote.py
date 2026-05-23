@@ -181,6 +181,21 @@ def _filter_xcframework_slices_to_requested_platforms(
         data["AvailableLibraries"] = kept
         with info_plist.open("wb") as fh:
             plistlib.dump(data, fh)
+        # An upstream-signed xcframework (e.g. Mapbox's Turf) carries a
+        # top-level `_CodeSignature/CodeResources` manifest that hashes
+        # `Info.plist` plus every slice directory it shipped. Once we
+        # rewrite `Info.plist` and delete unrequested slice dirs the
+        # manifest no longer matches reality, and any downstream archive
+        # that runs Xcode's `SignatureCollection` build phase on the
+        # consumed sibling fails with an opaque `SWBUtil.CodeSignatureInfo.
+        # Error error 0`. We can't re-sign with the upstream identity, so
+        # drop the now-invalid manifest — the kept per-slice
+        # `Framework/_CodeSignature/` entries still describe their own
+        # binaries correctly, and the final app archive will re-sign on
+        # embed.
+        top_sig = xcframework_path / "_CodeSignature"
+        if top_sig.is_dir():
+            shutil.rmtree(top_sig, ignore_errors=True)
         verbose_log(
             verbose,
             f"  Dropped {len(removed)} unrequested slice(s) from "

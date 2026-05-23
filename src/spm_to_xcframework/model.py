@@ -116,6 +116,34 @@ class TransitivePackageInfo:
     # products would force the child to build BOTH products even if only one
     # caller is in the user's selection.
     product_to_root_targets: Dict[str, List[str]] = field(default_factory=dict)
+    # True iff every (non-system) product is backed only by binaryTarget
+    # targets — the transitive analogue of the umbrella's binary-only
+    # auto-switch. When True AND `origin_url` + `head_tag` are populated,
+    # the orchestrator routes the child through `_run_binary_mode` against
+    # the upstream URL+tag instead of cloning the pre-staged checkout.
+    # Without this, mapbox-maps-ios-binary's `turf-swift` and adjust-ios-
+    # sdk's `adjust_signature_sdk` transitives fail Plan with a binary-only-
+    # on-local-path refusal. Populated by Inspect.
+    is_binary_only: bool = False
+    # Names of every `.binaryTarget(...)` target this transitive declares.
+    # Lets the orchestrator detect "mixed-mode package, but the umbrella
+    # only references the binary side" cases that whole-package
+    # `is_binary_only` misses — see `_referenced_products_are_all_binary`
+    # for the Amplitude-Swift v1.18.3 example. Populated by Inspect from
+    # the same target dump used to compute `is_binary_only`.
+    binary_target_names: List[str] = field(default_factory=list)
+    # The transitive's upstream git remote URL, recovered from `git config
+    # --get remote.origin.url` on `checkout_path`. None if the checkout
+    # has no `.git` dir (rare — SPM's normal `.build/checkouts/<id>/` does
+    # have one) or the remote was renamed. Used by the binary-only
+    # auto-switch to point Fetch at the upstream URL instead of the local
+    # pre-staged dir.
+    origin_url: Optional[str] = None
+    # The exact tag the transitive's HEAD points at, recovered from `git
+    # describe --tags --exact-match HEAD`. None if HEAD is not on a tag
+    # (revision-pinned packages, branch-tracking deps). Used by the
+    # binary-only auto-switch to populate Fetch's `--version <tag>`.
+    head_tag: Optional[str] = None
 
 
 @dataclass

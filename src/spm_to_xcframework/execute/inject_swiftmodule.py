@@ -11,7 +11,7 @@ import os
 import re
 import shutil
 from pathlib import Path
-from typing import Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 from ..log import dim, verbose_log
 
@@ -59,6 +59,54 @@ def _strip_package_name_from_swiftinterfaces(swiftmod_dir: Path) -> None:
                 changed = True
         if changed:
             iface.write_text("".join(lines), encoding="utf-8")
+
+
+def _strip_self_module_qualifier_from_swiftinterface(
+    text: str, module_name: str
+) -> str:
+    """Remove leading `<module_name>.` qualifier from type references in
+    the swiftinterface OF that module. Within module M's own emitted
+    interface, every `M.X` qualifies type X in module M — the bare `X`
+    resolves to the same thing in this lexical scope. Stripping the
+    qualifier is the documented workaround for the Swift compiler bug
+    where a type whose name shadows the module name causes the
+    swiftinterface re-parser to bind `M.X` as "nested type X inside
+    type M" (the shadowing class) instead of "top-level type X in
+    module M", producing errors like
+    "'EventBridge' is not a member type of class 'AnalyticsConnector.AnalyticsConnector'"
+    (Swift issue #56573 / SR-14195; canonical packages: mixpanel-swift's
+    `JSON.JSON`, analytics-connector-ios's `AnalyticsConnector.AnalyticsConnector`).
+
+    Scope:
+    - Substitution runs over the code-only view of the swiftinterface so
+      comments (`//` lines including the `swift-module-flags` header,
+      `/* */` blocks) and string literals (deprecation messages in
+      `@available(..., message: "...")`, etc.) are left untouched.
+    - Lookbehind `(?<![\\w.])` ensures we only strip the FIRST `M.` of
+      any qualified chain, so a legitimate nested-type reference
+      `M.M.X` (where the second `M` is a real nested type inside the
+      shadowing top-level type) survives as `M.X` rather than collapsing
+      to `X`. The shadowing-class case `M.M` still collapses to `M`,
+      which is what we want.
+    - The lookahead `(?=[A-Z_])` requires the next character after the
+      dot to start an identifier (uppercase or underscore by Swift
+      convention for type names) — guards against substitutions inside
+      attribute syntax like `@frozen` or numeric suffixes.
+    """
+    from ..prepare import _make_code_token_view
+    code_view = _make_code_token_view(text)
+    pattern = re.compile(
+        r"(?<![\w.])" + re.escape(module_name) + r"\.(?=[A-Z_])"
+    )
+    out: List[str] = []
+    last = 0
+    for m in pattern.finditer(code_view):
+        out.append(text[last:m.start()])
+        last = m.end()  # drop `<module_name>.`, keep the looked-ahead char
+    if last == 0:
+        return text
+    out.append(text[last:])
+    return "".join(out)
 
 
 def _find_swiftmodule_in_dd(
@@ -227,6 +275,20 @@ def inject_swiftmodule(
     if dest.exists():
         shutil.rmtree(dest)
     shutil.copytree(swiftmod, dest)
+    _disambiguate_self_module_qualifier_in_swiftmodule(dest, module_name)
     _strip_package_name_from_swiftinterfaces(dest)
     _ensure_root_symlink(fw_path, "Modules")
     return True
+
+
+def _disambiguate_self_module_qualifier_in_swiftmodule(
+    swiftmod_dir: Path, module_name: str
+) -> None:
+    for iface in swiftmod_dir.glob("*.swiftinterface"):
+        try:
+            text = iface.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        rewritten = _strip_self_module_qualifier_from_swiftinterface(text, module_name)
+        if rewritten != text:
+            iface.write_text(rewritten, encoding="utf-8")

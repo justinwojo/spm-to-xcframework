@@ -1,26 +1,26 @@
 # Roadmap
 
-Date: 2026-05-22 (last updated after `--dry-run` + wild-sample campaign — see "Serializable Plan + --dry-run" and "Wild-sample campaign" below)
+Date: 2026-05-22 (last updated after iOS-default platform redesign + wild-sample archive-mode harness)
 
 Forward-looking work plan for `spm-to-xcframework`. The mission: **95%+ of arbitrary SPM packages produce a valid xcframework on the first try**, with a UX that lets a first-time user succeed without reading the source.
 
-This doc supersedes the forward-looking sections of [REFACTOR_PROPOSAL.md](REFACTOR_PROPOSAL.md) (whose A/B already shipped) and [INTEGRATION_TESTING.md](INTEGRATION_TESTING.md) (whose harness is live). Both remain as historical / operational reference.
-
 ---
 
-## Status of prior proposals
+## Status of prior work
 
-| Item | Source | Status |
-|---|---|---|
-| A. Modularize single file | REFACTOR_PROPOSAL.md | **Done** (`ffbc7fd`) |
-| B. `swift package add-product` for Phase 3 edits | REFACTOR_PROPOSAL.md | **Done** (`ffbc7fd`) |
-| C. SwiftSyntax helper binary | REFACTOR_PROPOSAL.md | **Deferred indefinitely** — per proposal itself, B made it unnecessary |
-| D. Injection passes as separate library | REFACTOR_PROPOSAL.md | Open — see P2 below |
-| E. Content-addressed build cache | REFACTOR_PROPOSAL.md | Open — see P2 below |
-| F. Serializable Plan / `--dry-run` | REFACTOR_PROPOSAL.md | **Done** (2026-05-22) — see "Serializable Plan + --dry-run" below |
-| Integration matrix scaffolding | INTEGRATION_TESTING.md | **Done** — 15/15 passing + 2 known_broken pinned to upstream bugs |
-| Nightly CI for integration matrix | INTEGRATION_TESTING.md (Phase 2) | Open — see P1 below |
-| Pre-merge integration check | INTEGRATION_TESTING.md (Phase 3) | Intentionally deferred (cost) |
+| Item | Status |
+|---|---|
+| Modularize single file | **Done** (`ffbc7fd`) |
+| `swift package add-product` for Phase 3 edits | **Done** (`ffbc7fd`) |
+| SwiftSyntax helper binary | **Deferred indefinitely** — `swift package add-product` made it unnecessary |
+| Injection passes as separate library | Open — see P2 below |
+| Content-addressed build cache | Open — see P2 below |
+| Serializable Plan / `--dry-run` | **Done** (2026-05-22) — see "Serializable Plan + --dry-run" below |
+| Integration matrix scaffolding | **Done** — 15/15 passing + 2 known_broken pinned to upstream bugs |
+| Nightly CI for integration matrix | Open — see P1 below |
+| Pre-merge integration check | Intentionally deferred (cost) |
+| iOS-default platform selection + discovery hint | **Done** (`04f23c0`) |
+| Wild-sample archive-mode stress harness | **Done** (`04f23c0`) — quantifies plan-ok → archive-ok gap |
 
 ---
 
@@ -62,7 +62,7 @@ Add packages that exercise paths the previously-12-entry matrix didn't reach. Ca
 5. ~~**`apple/swift-argument-parser`**~~ — **Added in `1d20825`**. Small, common, fast smoke test that pure-Swift baseline still works.
 6. ~~**`pointfreeco/swift-composable-architecture`**~~ — **Added 2026-05-22** as a `known_broken` regression-test entry. Direct guard for commit `1d20825` (TCA-class transitive-graph hardening): the entry's `required_log_signatures` pins 13 sibling `*.xcframework ready (dependency)` lines, forcing the run to walk the hardened transitive paths before the same `@_lifetime` ceiling as #3 trips. Without `required_log_signatures`, an earlier failure that happened to log the same signature would silently mask as known_broken.
 
-Matrix is now 17 entries (15 passing + 2 known_broken). Each addition followed the policy in INTEGRATION_TESTING.md: earns a slot only if it exercises a path the matrix doesn't.
+Matrix is now 17 entries (15 passing + 2 known_broken). Each addition follows the same policy: a new entry earns a slot only if it exercises a path the matrix doesn't.
 
 Next candidates earn a slot only on the same rule — new path, new value. None queued.
 
@@ -77,8 +77,6 @@ Risk: low — additions are cheap to try and reveal information either way.
 The flag still exists as the explicit opt-out and silences the per-unit warning.
 
 ### ~~Serializable Plan + `--dry-run`~~ — Shipped 2026-05-22
-
-(F from REFACTOR_PROPOSAL.md, merged with the UX `--dry-run` ask.)
 
 `Plan` (and every sub-dataclass that hangs off it: `StageSpec`, `PackageSwiftEdit`, `BuildUnit`, `MacroSupport`) gained `.to_json()` / `.from_json()` round-trip with an explicit `JSON_SCHEMA_VERSION = 1` envelope. `--dry-run` runs Fetch + Inspect + Plan and exits with a human-readable plan render; `--dry-run-json` does the same and writes `{schema_version, package, version, mode, transitive_packages, plan}` to stdout with all log noise routed to stderr — pipe-friendly. The orchestrator skips transitive recursion under any dry-run so no xcodebuild ever fires (was previously broken — child configs reset `dry_run=False`).
 
@@ -104,8 +102,6 @@ After the diagnostics ship (`fa96866`), the matrix run revealed a `NameError: na
 
 ### Nightly integration CI
 
-(Phase 2 of INTEGRATION_TESTING.md.)
-
 GitHub Actions on `macos-latest`, cron-triggered, runs the full matrix and posts results. Primary value: catch Apple-Xcode-shipped regressions before a release tag.
 
 Risk: low, but cost ($5–8/run) means defer until matrix has been green for a few weeks under normal dev churn. We're at "passing right now" — wait at least a couple more PR cycles before turning it on.
@@ -122,15 +118,11 @@ Risk: low. Mechanical.
 
 ### Content-addressed build cache
 
-(E from REFACTOR_PROPOSAL.md.)
-
 Hash `(Package.resolved SHA, xcodebuild settings, tool version, requested platforms, requested products)`. On a hit, copy the cached `.xcframework` and skip Execute. Free win for CI runs and repeated binding regeneration; ~150 lines.
 
 Risk: low. Independent of all other items.
 
 ### Injection passes as separately-importable library
-
-(D from REFACTOR_PROPOSAL.md.)
 
 After the modular split, the injection passes (`inject_swiftmodule`, `inject_objc_headers`, `inject_clang_bridge`, `inject_resources`, `binary_promote`) are already self-contained. Promoting `src/spm_to_xcframework/execute/` to a public API only matters if a second consumer materialises (e.g., a "finish my hand-vendored framework" tool). Until then, no action.
 

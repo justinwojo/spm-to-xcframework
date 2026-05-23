@@ -25,7 +25,7 @@ from ..model import (
 )
 
 from .inject_clang_system import _SYSTEM_SHIM_SENTINEL
-from .inject_objc import inject_objc_headers
+from .inject_objc import inject_objc_headers, inject_pure_swift_clang_modulemap
 from .inject_resources import inject_resource_bundles
 from .inject_swiftmodule import inject_swiftmodule
 
@@ -316,6 +316,27 @@ def _build_dependency_xcframeworks(
             product_name=fw_name,
             fw_name=fw_name,
             fw_path=sim_fw,
+            verbose=verbose,
+        )
+        # Synthesize a Clang modulemap when the dep is pure-Swift with
+        # @objc surface so the umbrella's ObjC code (or another mixed
+        # dep) can `@import Dep` / `#import <Dep/Dep-Swift.h>`. No-op
+        # when inject_objc_headers already wrote a modulemap, when no
+        # `-Swift.h` exists in DerivedData, or when the framework has
+        # no .swiftmodule (ObjC-only dep). Parallels the run_unit call
+        # site so deps and the primary unit produce equivalent bundles.
+        inject_pure_swift_clang_modulemap(
+            fw_path=fw_path,
+            fw_name=fw_name,
+            dd_path=device_slice.dd_path,
+            variant="device",
+            verbose=verbose,
+        )
+        inject_pure_swift_clang_modulemap(
+            fw_path=sim_fw,
+            fw_name=fw_name,
+            dd_path=sim_slice.dd_path,
+            variant="simulator",
             verbose=verbose,
         )
         inject_resource_bundles(

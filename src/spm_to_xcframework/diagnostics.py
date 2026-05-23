@@ -148,16 +148,93 @@ _PATTERNS: List[Tuple[str, str, str]] = [
         "`xcodebuild archive` doesn't grant. If the package has no plugin, "
         "look for a custom Run Script phase in the package or its deps.",
     ),
+    (
+        # Swift-interface resolution disambiguation collapse. Fires when
+        # a module and a type within it share a name (canonical: mixpanel-
+        # swift's vendored `JSON` module containing `public enum JSON`).
+        # The `.private.swiftinterface` writes the fully-qualified
+        # `JSON.JSON` which the resolver can't disambiguate against the
+        # module of the same name. We can't fix the upstream package, but
+        # we can tell the user what they're looking at and that the fix
+        # lives upstream. Verified against Xcode 26.3 on mixpanel-swift
+        # 6.3.0's `JSON` sibling 2026-05-22.
+        "is not a member type of enum",
+        "Module/type name collision in vendored swift-interface",
+        "A swift-interface emitted for a sibling module references its "
+        "own enum as `X.X` where the outer `X` is the module name. The "
+        "resolver can't decide which `X` is meant. Not a "
+        "spm-to-xcframework bug — the upstream package vendors a module "
+        "whose name shadows a top-level type inside it (canonical: "
+        "mixpanel-swift's `JSON` module). Workarounds: rename the "
+        "offending module upstream, or pin to a release predating the "
+        "collision. Filter the package down to just the products that "
+        "don't transitively need that module via --product.",
+    ),
+    (
+        # C++ header search-path miss. Fires when a `.hpp` (or `.h`
+        # included from C++ TUs) referenced by a clang TU isn't on the
+        # search path. Canonical case: realm-swift's RLM* ObjC++ files
+        # `#include "realm/object-store/thread_safe_reference.hpp"`,
+        # which lives in the realm-core C++ submodule whose include
+        # roots SPM doesn't propagate through the .binaryTarget overlay.
+        # Verified against realm-swift 20.0.3 / realm-core on Xcode 26.3
+        # 2026-05-22. Pattern is intentionally restricted to `.hpp` so
+        # we don't shadow the more useful `Module 'X' not found`
+        # diagnosis when a swift `import` fails to resolve.
+        ".hpp' file not found",
+        "C++ header not found — search path missing for a vendored C++ submodule",
+        "A C++ header (typically inside a vendored submodule like "
+        "realm-core) is referenced but its include root isn't on the "
+        "clang search path of the build unit. SPM doesn't propagate "
+        "C++ header search paths through .binaryTarget overlays; if the "
+        "package vendors a C++ implementation alongside its ObjC/Swift "
+        "shim, source-mode archive will hit this. There is no clean "
+        "workaround in spm-to-xcframework today — consume the upstream "
+        "xcframework directly, or pin to a release that ships a "
+        "pre-built artifact (e.g. realm's pre-built `RealmSwift` "
+        "xcframework distributions).",
+    ),
 ]
+
+
+# Clang/Swift "module not found" diagnostic. Most common cause in
+# transitive builds: the upstream package imports a cross-sibling module
+# (e.g. GoogleSignIn imports GTMAppAuth) that we either failed to
+# recognise as a transitive product or whose owning package wasn't
+# recursed into. Captured via regex (not the substring-matched
+# `_PATTERNS` table) so we can surface the offending module name in the
+# headline. Verified against GoogleSignIn-iOS 9.1.0 on Xcode 26.3
+# 2026-05-22. `Module` is matched case-sensitive because the lower-case
+# "module" appears in many adjacent diagnostics (e.g. "module map" hints)
+# where this suggestion would be misleading.
+_MODULE_NOT_FOUND = re.compile(r"Module '([^']+)' not found")
+
+
+# Distinct from `Module 'X' not found` and from the SwiftSyntax-specific
+# entry above: this fires when the swift driver / xcodebuild's explicit-
+# modules pipeline can't resolve a *dependency* module by name during
+# interface or module compilation. Canonical case: MapboxMaps's
+# swiftinterface references `MapboxCommon` (a vendored .binaryTarget
+# xcframework) that the umbrella's module-graph walker doesn't see in
+# its search paths — typically because the vendored xcframework's slice
+# set doesn't cover the active (platform, variant) pair, or because the
+# `.binaryTarget` was stripped/orphaned by an earlier Prepare pass.
+# Verified against mapbox-maps-ios on Xcode 26.3 2026-05-22.
+_MODULE_DEP_NOT_FOUND = re.compile(
+    r"Unable to find module dependency: '([^']+)'"
+)
 
 
 def scan(error_text: str) -> Optional[Diagnosis]:
     """Classify `error_text` against the known-pattern table.
 
     Returns the first matching `Diagnosis` (by table order), or None if
-    nothing matched. Matching is case-insensitive substring. Pure
-    function — no I/O, no module-level state, safe to call from any
-    thread / under the parallel slice scheduler.
+    nothing matched. Matching is case-insensitive substring against the
+    `_PATTERNS` table, then a small regex pass for entries that need to
+    extract a name from the error (e.g. the offending module on a
+    Clang/Swift `Module 'X' not found` diagnostic). Pure function — no
+    I/O, no module-level state, safe to call from any thread / under
+    the parallel slice scheduler.
 
     The expectation is that callers concatenate every available error
     source (xcresult-parsed errors, log tail) and pass the joined text
@@ -173,6 +250,49 @@ def scan(error_text: str) -> Optional[Diagnosis]:
                 suggestion=suggestion,
                 pattern=pattern,
             )
+    m = _MODULE_NOT_FOUND.search(error_text)
+    if m:
+        module = m.group(1)
+        return Diagnosis(
+            headline=f"Module {module!r} not found at archive time",
+            suggestion=(
+                f"The build can't resolve `import {module}`. In transitive "
+                f"builds this usually means the package that owns "
+                f"{module!r} either isn't being walked (its `.product(name:, "
+                f"package:)` reference is missing from the umbrella's "
+                f"REGULAR targets) or built (it's reached only via test/"
+                f"plugin/macro paths). Check the umbrella's regular-target "
+                f"imports of {module!r} and confirm the owning package "
+                f"identity appears in --inspect-only output. If "
+                f"{module!r} is a system framework, the package's linker "
+                f"settings are likely missing a `.linkedFramework(...)` "
+                f"entry."
+            ),
+            pattern=f"Module '{module}' not found",
+        )
+    m = _MODULE_DEP_NOT_FOUND.search(error_text)
+    if m:
+        module = m.group(1)
+        return Diagnosis(
+            headline=(
+                f"Swift driver can't find dependency module {module!r}"
+            ),
+            suggestion=(
+                f"The explicit-modules / swiftinterface compile pipeline "
+                f"couldn't locate {module!r} on its module search paths. "
+                f"Common cases: (1) {module!r} is a vendored "
+                f"`.binaryTarget` xcframework whose slice set doesn't cover "
+                f"the active (platform, variant) pair — check that the "
+                f"vendored xcframework declares an `ios-arm64-simulator` "
+                f"slice if you're archiving the simulator variant; (2) the "
+                f"`.binaryTarget` was orphaned by a manifest-edit pass "
+                f"(check the diff between `<work-dir>/staged/Package.swift` "
+                f"and `staged/.original-Package.swift`); (3) the owning "
+                f"package isn't being walked as a regular dependency "
+                f"(re-run with `--inspect-only` to see the resolved graph)."
+            ),
+            pattern=f"Unable to find module dependency: '{module}'",
+        )
     return None
 
 
@@ -182,6 +302,92 @@ def format_block(diagnosis: Diagnosis) -> str:
     grep for the `Diagnosis:` prefix.
     """
     return f"Diagnosis: {diagnosis.headline}\nTry: {diagnosis.suggestion}"
+
+
+# --------------------------------------------------------------------------
+# Plan-phase failure shaping
+#
+# Unlike archive-phase failures (which arrive as opaque xcodebuild +
+# xcresult output the archive-side `scan()` runs over), Plan-phase
+# failures are raised as `PlanError` strings inside the tool itself. We
+# already write actionable text into those messages; this layer reshapes
+# specific known shapes into the canonical "Diagnosis: ... \n Try: ..."
+# block so the wild-sample harness (and human readers scanning for the
+# `Diagnosis:` anchor) bucket them as `diagnosed` rather than
+# `undiagnosed`.
+
+# "Plan produced zero build units..." — raised from plan.py when the
+# planner finishes with no archivable units. Most common cause for
+# transitive children: the package's only library product is binary-
+# only but the binary-only auto-switch didn't fire (e.g. a `.binaryTarget`
+# library plus a separate non-library product like an executable or
+# plugin, which fails `_package_is_binary_only`'s "every product is
+# binary" check). Verified against amplitudecore-swift 1.x transitive
+# 2026-05-22.
+_PLAN_ZERO_UNITS = "Plan produced zero build units"
+
+# "Detected a binary-only Package.swift..." — raised from cli.py when
+# the binary-only auto-switch fires on a local-path package_source (no
+# URL + version available). The transitive-child path hits this when an
+# external dep is binary-only and we can't recover its remote URL+tag
+# from the SPM checkout. Verified against mapbox-maps-ios-binary's
+# `turf-swift` and adjust-ios-sdk's `adjust_signature_sdk` transitives
+# 2026-05-22.
+_PLAN_BINARY_LOCAL_PATH = "Auto-switching to --binary mode requires a remote package URL"
+
+
+def scan_plan_error(message: str) -> Optional[Diagnosis]:
+    """Classify a `PlanError` message body against the known Plan-phase
+    shapes. Returns a `Diagnosis` on first match, else None.
+
+    Kept separate from `scan()` so the Plan-error wording can be matched
+    on its full form (the archive-side table targets xcodebuild diagnostics
+    which are wholly different). Pure function; same threading contract
+    as `scan()`.
+    """
+    if not message:
+        return None
+    if _PLAN_ZERO_UNITS.lower() in message.lower():
+        return Diagnosis(
+            headline=(
+                "Plan produced zero build units — package has no archivable "
+                "library product"
+            ),
+            suggestion=(
+                "The planner saw no archivable product. Common causes: (a) "
+                "every library product is backed only by `.binaryTarget(...)` "
+                "but the package also declares a non-library product (plugin, "
+                "executable) so the whole-package binary-only auto-switch "
+                "doesn't fire — check --inspect-only and use --product to "
+                "pick a real library, or rerun with --binary against the "
+                "upstream URL+tag if the binaries are what you want; (b) a "
+                "--product filter that matched nothing reachable from the "
+                "archive path — run with --inspect-only to list declared "
+                "products and pick one that maps to a real library."
+            ),
+            pattern=_PLAN_ZERO_UNITS,
+        )
+    if _PLAN_BINARY_LOCAL_PATH.lower() in message.lower():
+        return Diagnosis(
+            headline=(
+                "Binary-only package detected but auto-switch needs a remote "
+                "URL + --version"
+            ),
+            suggestion=(
+                "spm-to-xcframework can route a binary-only package through "
+                "--binary mode automatically, but the route needs `--version "
+                "<tag>` and a remote `https://` / `git@` URL — the local "
+                "checkout has no way to identify the released tag. If you "
+                "fetched manually, re-invoke with the upstream URL + tag; "
+                "if this surfaced inside a transitive walk, the umbrella's "
+                "build can't compose with a binary-only sibling whose tag "
+                "we can't recover from `.build/checkouts/<id>/.git` — file "
+                "a bug with the umbrella package URL so we can extend the "
+                "git-config-driven recovery path."
+            ),
+            pattern=_PLAN_BINARY_LOCAL_PATH,
+        )
+    return None
 
 
 # --------------------------------------------------------------------------

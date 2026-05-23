@@ -192,6 +192,18 @@ class PrepareUserError(PrepareError):
     malformed manifest, etc. Surfaces as a one-line clean error."""
 
 
+class TargetCallNotFoundError(PrepareUserError):
+    """`edit_replace_with_binary_target` couldn't locate a literal
+    `.target(name: T, ...)` (or `.executableTarget`/`.testTarget`) call
+    to substitute, AND no existing `.binaryTarget(name: T, ...)` was
+    present either. Distinct from generic `PrepareUserError` so the
+    dedup-overlap router can catch it specifically and fall back to
+    the overlay branch (which doesn't require a literal call to find).
+
+    Subclass so existing `except PrepareUserError` sites still fire —
+    only the dedup-overlap router needs the narrower type."""
+
+
 class PrepareBug(PrepareError):
     """A real invariant violation inside Prepare — round-trip validator
     caught edit drift, the planner asked to edit a product Prepare
@@ -346,16 +358,93 @@ _PATTERNS: List[Tuple[str, str, str]] = [
         "`xcodebuild archive` doesn't grant. If the package has no plugin, "
         "look for a custom Run Script phase in the package or its deps.",
     ),
+    (
+        # Swift-interface resolution disambiguation collapse. Fires when
+        # a module and a type within it share a name (canonical: mixpanel-
+        # swift's vendored `JSON` module containing `public enum JSON`).
+        # The `.private.swiftinterface` writes the fully-qualified
+        # `JSON.JSON` which the resolver can't disambiguate against the
+        # module of the same name. We can't fix the upstream package, but
+        # we can tell the user what they're looking at and that the fix
+        # lives upstream. Verified against Xcode 26.3 on mixpanel-swift
+        # 6.3.0's `JSON` sibling 2026-05-22.
+        "is not a member type of enum",
+        "Module/type name collision in vendored swift-interface",
+        "A swift-interface emitted for a sibling module references its "
+        "own enum as `X.X` where the outer `X` is the module name. The "
+        "resolver can't decide which `X` is meant. Not a "
+        "spm-to-xcframework bug — the upstream package vendors a module "
+        "whose name shadows a top-level type inside it (canonical: "
+        "mixpanel-swift's `JSON` module). Workarounds: rename the "
+        "offending module upstream, or pin to a release predating the "
+        "collision. Filter the package down to just the products that "
+        "don't transitively need that module via --product.",
+    ),
+    (
+        # C++ header search-path miss. Fires when a `.hpp` (or `.h`
+        # included from C++ TUs) referenced by a clang TU isn't on the
+        # search path. Canonical case: realm-swift's RLM* ObjC++ files
+        # `#include "realm/object-store/thread_safe_reference.hpp"`,
+        # which lives in the realm-core C++ submodule whose include
+        # roots SPM doesn't propagate through the .binaryTarget overlay.
+        # Verified against realm-swift 20.0.3 / realm-core on Xcode 26.3
+        # 2026-05-22. Pattern is intentionally restricted to `.hpp` so
+        # we don't shadow the more useful `Module 'X' not found`
+        # diagnosis when a swift `import` fails to resolve.
+        ".hpp' file not found",
+        "C++ header not found — search path missing for a vendored C++ submodule",
+        "A C++ header (typically inside a vendored submodule like "
+        "realm-core) is referenced but its include root isn't on the "
+        "clang search path of the build unit. SPM doesn't propagate "
+        "C++ header search paths through .binaryTarget overlays; if the "
+        "package vendors a C++ implementation alongside its ObjC/Swift "
+        "shim, source-mode archive will hit this. There is no clean "
+        "workaround in spm-to-xcframework today — consume the upstream "
+        "xcframework directly, or pin to a release that ships a "
+        "pre-built artifact (e.g. realm's pre-built `RealmSwift` "
+        "xcframework distributions).",
+    ),
 ]
+
+
+# Clang/Swift "module not found" diagnostic. Most common cause in
+# transitive builds: the upstream package imports a cross-sibling module
+# (e.g. GoogleSignIn imports GTMAppAuth) that we either failed to
+# recognise as a transitive product or whose owning package wasn't
+# recursed into. Captured via regex (not the substring-matched
+# `_PATTERNS` table) so we can surface the offending module name in the
+# headline. Verified against GoogleSignIn-iOS 9.1.0 on Xcode 26.3
+# 2026-05-22. `Module` is matched case-sensitive because the lower-case
+# "module" appears in many adjacent diagnostics (e.g. "module map" hints)
+# where this suggestion would be misleading.
+_MODULE_NOT_FOUND = re.compile(r"Module '([^']+)' not found")
+
+
+# Distinct from `Module 'X' not found` and from the SwiftSyntax-specific
+# entry above: this fires when the swift driver / xcodebuild's explicit-
+# modules pipeline can't resolve a *dependency* module by name during
+# interface or module compilation. Canonical case: MapboxMaps's
+# swiftinterface references `MapboxCommon` (a vendored .binaryTarget
+# xcframework) that the umbrella's module-graph walker doesn't see in
+# its search paths — typically because the vendored xcframework's slice
+# set doesn't cover the active (platform, variant) pair, or because the
+# `.binaryTarget` was stripped/orphaned by an earlier Prepare pass.
+# Verified against mapbox-maps-ios on Xcode 26.3 2026-05-22.
+_MODULE_DEP_NOT_FOUND = re.compile(
+    r"Unable to find module dependency: '([^']+)'"
+)
 
 
 def scan(error_text: str) -> Optional[Diagnosis]:
     """Classify `error_text` against the known-pattern table.
 
     Returns the first matching `Diagnosis` (by table order), or None if
-    nothing matched. Matching is case-insensitive substring. Pure
-    function — no I/O, no module-level state, safe to call from any
-    thread / under the parallel slice scheduler.
+    nothing matched. Matching is case-insensitive substring against the
+    `_PATTERNS` table, then a small regex pass for entries that need to
+    extract a name from the error (e.g. the offending module on a
+    Clang/Swift `Module 'X' not found` diagnostic). Pure function — no
+    I/O, no module-level state, safe to call from any thread / under
+    the parallel slice scheduler.
 
     The expectation is that callers concatenate every available error
     source (xcresult-parsed errors, log tail) and pass the joined text
@@ -371,6 +460,49 @@ def scan(error_text: str) -> Optional[Diagnosis]:
                 suggestion=suggestion,
                 pattern=pattern,
             )
+    m = _MODULE_NOT_FOUND.search(error_text)
+    if m:
+        module = m.group(1)
+        return Diagnosis(
+            headline=f"Module {module!r} not found at archive time",
+            suggestion=(
+                f"The build can't resolve `import {module}`. In transitive "
+                f"builds this usually means the package that owns "
+                f"{module!r} either isn't being walked (its `.product(name:, "
+                f"package:)` reference is missing from the umbrella's "
+                f"REGULAR targets) or built (it's reached only via test/"
+                f"plugin/macro paths). Check the umbrella's regular-target "
+                f"imports of {module!r} and confirm the owning package "
+                f"identity appears in --inspect-only output. If "
+                f"{module!r} is a system framework, the package's linker "
+                f"settings are likely missing a `.linkedFramework(...)` "
+                f"entry."
+            ),
+            pattern=f"Module '{module}' not found",
+        )
+    m = _MODULE_DEP_NOT_FOUND.search(error_text)
+    if m:
+        module = m.group(1)
+        return Diagnosis(
+            headline=(
+                f"Swift driver can't find dependency module {module!r}"
+            ),
+            suggestion=(
+                f"The explicit-modules / swiftinterface compile pipeline "
+                f"couldn't locate {module!r} on its module search paths. "
+                f"Common cases: (1) {module!r} is a vendored "
+                f"`.binaryTarget` xcframework whose slice set doesn't cover "
+                f"the active (platform, variant) pair — check that the "
+                f"vendored xcframework declares an `ios-arm64-simulator` "
+                f"slice if you're archiving the simulator variant; (2) the "
+                f"`.binaryTarget` was orphaned by a manifest-edit pass "
+                f"(check the diff between `<work-dir>/staged/Package.swift` "
+                f"and `staged/.original-Package.swift`); (3) the owning "
+                f"package isn't being walked as a regular dependency "
+                f"(re-run with `--inspect-only` to see the resolved graph)."
+            ),
+            pattern=f"Unable to find module dependency: '{module}'",
+        )
     return None
 
 
@@ -380,6 +512,92 @@ def format_block(diagnosis: Diagnosis) -> str:
     grep for the `Diagnosis:` prefix.
     """
     return f"Diagnosis: {diagnosis.headline}\nTry: {diagnosis.suggestion}"
+
+
+# --------------------------------------------------------------------------
+# Plan-phase failure shaping
+#
+# Unlike archive-phase failures (which arrive as opaque xcodebuild +
+# xcresult output the archive-side `scan()` runs over), Plan-phase
+# failures are raised as `PlanError` strings inside the tool itself. We
+# already write actionable text into those messages; this layer reshapes
+# specific known shapes into the canonical "Diagnosis: ... \n Try: ..."
+# block so the wild-sample harness (and human readers scanning for the
+# `Diagnosis:` anchor) bucket them as `diagnosed` rather than
+# `undiagnosed`.
+
+# "Plan produced zero build units..." — raised from plan.py when the
+# planner finishes with no archivable units. Most common cause for
+# transitive children: the package's only library product is binary-
+# only but the binary-only auto-switch didn't fire (e.g. a `.binaryTarget`
+# library plus a separate non-library product like an executable or
+# plugin, which fails `_package_is_binary_only`'s "every product is
+# binary" check). Verified against amplitudecore-swift 1.x transitive
+# 2026-05-22.
+_PLAN_ZERO_UNITS = "Plan produced zero build units"
+
+# "Detected a binary-only Package.swift..." — raised from cli.py when
+# the binary-only auto-switch fires on a local-path package_source (no
+# URL + version available). The transitive-child path hits this when an
+# external dep is binary-only and we can't recover its remote URL+tag
+# from the SPM checkout. Verified against mapbox-maps-ios-binary's
+# `turf-swift` and adjust-ios-sdk's `adjust_signature_sdk` transitives
+# 2026-05-22.
+_PLAN_BINARY_LOCAL_PATH = "Auto-switching to --binary mode requires a remote package URL"
+
+
+def scan_plan_error(message: str) -> Optional[Diagnosis]:
+    """Classify a `PlanError` message body against the known Plan-phase
+    shapes. Returns a `Diagnosis` on first match, else None.
+
+    Kept separate from `scan()` so the Plan-error wording can be matched
+    on its full form (the archive-side table targets xcodebuild diagnostics
+    which are wholly different). Pure function; same threading contract
+    as `scan()`.
+    """
+    if not message:
+        return None
+    if _PLAN_ZERO_UNITS.lower() in message.lower():
+        return Diagnosis(
+            headline=(
+                "Plan produced zero build units — package has no archivable "
+                "library product"
+            ),
+            suggestion=(
+                "The planner saw no archivable product. Common causes: (a) "
+                "every library product is backed only by `.binaryTarget(...)` "
+                "but the package also declares a non-library product (plugin, "
+                "executable) so the whole-package binary-only auto-switch "
+                "doesn't fire — check --inspect-only and use --product to "
+                "pick a real library, or rerun with --binary against the "
+                "upstream URL+tag if the binaries are what you want; (b) a "
+                "--product filter that matched nothing reachable from the "
+                "archive path — run with --inspect-only to list declared "
+                "products and pick one that maps to a real library."
+            ),
+            pattern=_PLAN_ZERO_UNITS,
+        )
+    if _PLAN_BINARY_LOCAL_PATH.lower() in message.lower():
+        return Diagnosis(
+            headline=(
+                "Binary-only package detected but auto-switch needs a remote "
+                "URL + --version"
+            ),
+            suggestion=(
+                "spm-to-xcframework can route a binary-only package through "
+                "--binary mode automatically, but the route needs `--version "
+                "<tag>` and a remote `https://` / `git@` URL — the local "
+                "checkout has no way to identify the released tag. If you "
+                "fetched manually, re-invoke with the upstream URL + tag; "
+                "if this surfaced inside a transitive walk, the umbrella's "
+                "build can't compose with a binary-only sibling whose tag "
+                "we can't recover from `.build/checkouts/<id>/.git` — file "
+                "a bug with the umbrella package URL so we can extend the "
+                "git-config-driven recovery path."
+            ),
+            pattern=_PLAN_BINARY_LOCAL_PATH,
+        )
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -806,6 +1024,34 @@ class TransitivePackageInfo:
     # products would force the child to build BOTH products even if only one
     # caller is in the user's selection.
     product_to_root_targets: Dict[str, List[str]] = field(default_factory=dict)
+    # True iff every (non-system) product is backed only by binaryTarget
+    # targets — the transitive analogue of the umbrella's binary-only
+    # auto-switch. When True AND `origin_url` + `head_tag` are populated,
+    # the orchestrator routes the child through `_run_binary_mode` against
+    # the upstream URL+tag instead of cloning the pre-staged checkout.
+    # Without this, mapbox-maps-ios-binary's `turf-swift` and adjust-ios-
+    # sdk's `adjust_signature_sdk` transitives fail Plan with a binary-only-
+    # on-local-path refusal. Populated by Inspect.
+    is_binary_only: bool = False
+    # Names of every `.binaryTarget(...)` target this transitive declares.
+    # Lets the orchestrator detect "mixed-mode package, but the umbrella
+    # only references the binary side" cases that whole-package
+    # `is_binary_only` misses — see `_referenced_products_are_all_binary`
+    # for the Amplitude-Swift v1.18.3 example. Populated by Inspect from
+    # the same target dump used to compute `is_binary_only`.
+    binary_target_names: List[str] = field(default_factory=list)
+    # The transitive's upstream git remote URL, recovered from `git config
+    # --get remote.origin.url` on `checkout_path`. None if the checkout
+    # has no `.git` dir (rare — SPM's normal `.build/checkouts/<id>/` does
+    # have one) or the remote was renamed. Used by the binary-only
+    # auto-switch to point Fetch at the upstream URL instead of the local
+    # pre-staged dir.
+    origin_url: Optional[str] = None
+    # The exact tag the transitive's HEAD points at, recovered from `git
+    # describe --tags --exact-match HEAD`. None if HEAD is not on a tag
+    # (revision-pinned packages, branch-tracking deps). Used by the
+    # binary-only auto-switch to populate Fetch's `--version <tag>`.
+    head_tag: Optional[str] = None
 
 
 @dataclass
@@ -1634,7 +1880,7 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import List, Sequence, Tuple
+from typing import List, Sequence, Set, Tuple
 
 
 # Top-level (and any-depth) artifact directories that are unsafe to leave
@@ -1651,6 +1897,19 @@ TOXIC_NAMES = {
     "node_modules",
 }
 TOXIC_SUFFIXES = (".xcodeproj", ".xcworkspace")
+
+
+def _is_path_under(child: Path, parent: Path) -> bool:
+    """True iff `child` is `parent` or a descendant. Pure lexical
+    comparison — no filesystem access — and tolerates `Path(".")` as
+    a parent (which `PurePath.parts == ()`). Used by the staging
+    exclude-pass to refuse to delete a path that another target's
+    `path:` directive points into."""
+    if child == parent:
+        return True
+    if parent.parts == ():
+        return True
+    return child.parts[: len(parent.parts)] == parent.parts
 
 
 def _is_toxic_entry(name: str) -> bool:
@@ -1676,6 +1935,17 @@ def _git(args: Sequence[str], **kwargs) -> subprocess.CompletedProcess:
 # Allowed remote URL prefixes. Local filesystem paths are accepted
 # separately (they must resolve to an existing directory).
 _REMOTE_URL_PREFIXES = ("http://", "https://", "git@", "ssh://")
+
+# SPM manifest filenames at the root of a staged package. Used by the
+# exclude-list staging pass to refuse to delete the active manifest.
+# Realm 20.0.3 (and similar packages with `path: "."` targets) excludes
+# `Package.swift` from compilation — the exclude list is SPM's source-set
+# filter, NOT a filesystem-deletion list. Deleting the root manifest
+# breaks `swift package resolve` two lines later. Matches both the
+# canonical `Package.swift` and version-specific shapes that SPM accepts
+# (`Package@swift-5.swift`, `Package@swift-5.5.swift`).
+_ROOT_MANIFEST_RE = re.compile(r"^Package(?:@swift-\d+(?:\.\d+)?)?\.swift$")
+
 
 # Permissive but bounded tag pattern: letters, digits, dots, hyphens,
 # underscores, plus signs, and slashes (for `refs/heads/...`-style tags
@@ -1954,6 +2224,60 @@ def stage_source(config: Config, source_dir: Path) -> Path:
             "the manifest. This is a bug in spm-to-xcframework."
         )
 
+    # Pass 1.5: strip `.testTarget(...)` declarations from every staged
+    # manifest variant. Test targets contribute nothing to archive
+    # builds (we never run `swift test`), but they can be the SOLE
+    # reason SPM's `swift package describe` rejects an otherwise-fine
+    # package — analytics-connector-ios v1.3.0 declares an
+    # `AnalyticsConnectorTests` target whose source dir mixes Swift +
+    # Objective-C, and SPM aborts describe with `target ... contains
+    # mixed language source files; feature not supported` before plan
+    # or execute can run. Stripping at stage time lets us materialize a
+    # working xcframework for the library product even when the
+    # package's test-target shape would otherwise be fatal.
+    #
+    # Apply to every Package@swift-X.Y variant under the root, since
+    # SPM picks the active manifest based on the toolchain version and
+    # our edit needs to cover whichever one actually gets read.
+    for manifest_path in sorted(staged_dir.glob("Package*.swift")):
+        if not manifest_path.is_file():
+            continue
+        try:
+            original_text = manifest_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        stripped = edit_strip_test_targets(original_text)
+        if stripped != original_text:
+            manifest_path.write_text(stripped, encoding="utf-8")
+            verbose_log(
+                config.verbose,
+                f"  stage: stripped .testTarget(...) declaration(s) from "
+                f"{manifest_path.name}",
+            )
+            original_text = stripped
+        # Strip URL-based `.binaryTarget(...)` declarations whose name
+        # isn't referenced by any source target. When a package ships
+        # a source target alongside an "alternative binary distribution"
+        # of the same library (analytics-connector-ios v1.3.x:
+        # `.target("AnalyticsConnector")` + `.binaryTarget(name:
+        # "AnalyticsConnectorFramework", url: "...AnalyticsConnector
+        # .xcframework.zip")`), the prebuilt xcframework's slices get
+        # unpacked by SPM at resolve time and xcodebuild archive
+        # populates Products/.../AnalyticsConnector.framework/Modules/
+        # from the prebuilt instead of our fresh source compile — so
+        # the resulting framework ends up with the upstream's target-
+        # triple-named swiftinterfaces (e.g. arm64-apple-tvos) and the
+        # iOS umbrella build can't `import AnalyticsConnector` because
+        # there's no iOS swiftinterface inside.
+        stripped = edit_strip_unused_binary_targets(original_text)
+        if stripped != original_text:
+            manifest_path.write_text(stripped, encoding="utf-8")
+            verbose_log(
+                config.verbose,
+                f"  stage: stripped unused URL-based .binaryTarget(...) "
+                f"declaration(s) from {manifest_path.name}",
+            )
+
     # Pass 2: drop the package's own `exclude:` paths. We do this best-effort
     # — failure to dump-package here is the inspect phase's job to surface,
     # not ours. The exclude pass is purely a hygiene measure (it stops
@@ -1966,6 +2290,50 @@ def stage_source(config: Config, source_dir: Path) -> Path:
         # the staged tree as-is.
         return staged_dir
 
+    # Pre-compute every target's effective source root as a relative-to-
+    # staged-dir Path. Used below to refuse to delete an exclude path
+    # that overlaps with another target's `path:` directive (e.g. Realm
+    # 20.0.3's `Realm` target excludes `"RealmSwift"`, `"Realm/TestUtils"`,
+    # `"Realm/Tests"` — the path directives of three sibling targets in
+    # the same package). Deleting any of those breaks the sibling
+    # target's source enumeration the next time SPM walks the package.
+    sibling_target_paths: Set[Path] = set()
+    for tgt in dump.get("targets", []):
+        tp = tgt.get("path") or _default_target_path(
+            tgt.get("name", ""), tgt.get("type", "")
+        )
+        if not tp or tp == ".":
+            continue
+        sibling_target_paths.add(Path(tp))
+
+    # Pre-compute every target's effective publicHeadersPath as a
+    # relative-to-staged-dir Path. Same conceptual hazard as the
+    # sibling-target paths above — Realm 20.0.3 declares
+    # `publicHeadersPath: "include"` for its `Realm` target AND lists
+    # `"include"` in that same target's `exclude:`. SPM tolerates the
+    # apparent contradiction (the exclude is a source-set filter; the
+    # dir physically exists in the repo and is reachable as headers).
+    # Pass 2 must mirror that: refuse to delete a path that is — or
+    # contains — any target's publicHeadersPath, including the target's
+    # own. If we delete it, SPM fails at the next dump-package with
+    # "public headers directory path for 'X' is invalid or not
+    # contained in the target."
+    target_public_headers_paths: Set[Path] = set()
+    for tgt in dump.get("targets", []):
+        ph = tgt.get("publicHeadersPath")
+        if not isinstance(ph, str) or not ph:
+            continue
+        tp = tgt.get("path") or _default_target_path(
+            tgt.get("name", ""), tgt.get("type", "")
+        )
+        if not tp:
+            continue
+        # publicHeadersPath is documented as relative to the target's
+        # path directive. `Path(".") / "include"` collapses to
+        # `include`, which is what we want for `path: "."` + `ph:
+        # "include"` (Realm's exact shape).
+        target_public_headers_paths.add(Path(tp) / ph)
+
     removed_count = 0
     for tgt in dump.get("targets", []):
         target_path_str = tgt.get("path") or _default_target_path(
@@ -1973,6 +2341,7 @@ def stage_source(config: Config, source_dir: Path) -> Path:
         )
         if not target_path_str:
             continue
+        own_path = Path(target_path_str)
         for ex in tgt.get("exclude", []) or []:
             ex_rel = Path(target_path_str) / ex
             # Lexical containment check: refuse anything that escapes
@@ -1989,6 +2358,55 @@ def stage_source(config: Config, source_dir: Path) -> Path:
             except (TypeError, ValueError):
                 continue
             ex_path = staged_dir / ex_rel
+            # Refuse to delete the staged package's own root manifest.
+            # Some packages (e.g. realm-swift 20.0.3) declare a target
+            # with `path: "."` and exclude `Package.swift` from
+            # compilation — the exclude list is a source-set filter,
+            # not a filesystem-deletion list. Only the ROOT manifest is
+            # protected: a vendored sub-package's nested Package.swift
+            # at a deeper path can still be excluded by the host (its
+            # parent isn't staged_dir).
+            if (
+                ex_path.parent == staged_dir
+                and _ROOT_MANIFEST_RE.match(ex_path.name)
+            ):
+                continue
+            # Refuse to delete any path that is itself the `path:` of
+            # another target in the same package, OR a parent directory
+            # of such a path. Same conceptual fix as the root-manifest
+            # guard: the exclude list is a source-set filter (this
+            # target says "don't compile X"), but X may be a *sibling*
+            # target's source root, in which case deleting it breaks
+            # the sibling. Realm 20.0.3's `Realm` target excludes
+            # `"RealmSwift"`, `"Realm/Tests"`, `"Realm/TestUtils"` —
+            # the path directives of three sibling targets in the
+            # same package.
+            if any(
+                op == ex_rel
+                or _is_path_under(op, ex_rel)
+                or _is_path_under(ex_rel, op)
+                for op in sibling_target_paths
+                if op != own_path
+            ):
+                continue
+            # Refuse to delete any path that is — or contains, or is
+            # contained by — ANY target's publicHeadersPath, including
+            # the current target's. Realm 20.0.3 lists `"include"` in
+            # the `Realm` target's exclude AND declares
+            # `publicHeadersPath: "include"` for the same target;
+            # deleting the dir breaks SPM's next dump-package with
+            # "public headers directory path for 'Realm' is invalid
+            # or not contained in the target." Same bidirectional
+            # containment shape as the sibling-target guard above.
+            # (Codex P2 bidirectional pattern — applied symmetrically
+            # here from the outset.)
+            if any(
+                ph == ex_rel
+                or _is_path_under(ph, ex_rel)
+                or _is_path_under(ex_rel, ph)
+                for ph in target_public_headers_paths
+            ):
+                continue
             if ex_path.is_symlink():
                 # Drop the link, not its target.
                 ex_path.unlink()
@@ -2552,9 +2970,20 @@ def _show_dependencies(staged_dir: Path, verbose: bool) -> Optional[dict]:
 
 def _flatten_dependency_tree(tree: dict) -> dict:
     """Walk the `show-dependencies` JSON (which is recursive) and return a
-    flat dict mapping identity → checkout path string for every node
-    reachable from the root. The root itself is excluded — only its
+    flat dict mapping identity → (checkout_path, url, version) for every
+    node reachable from the root. The root itself is excluded — only its
     transitive deps appear.
+
+    `url` is the canonical upstream URL SPM resolved against (NOT the
+    local `.build/checkouts/<id>/.git/config` origin, which points at
+    SPM's intermediate `.build/repositories/<id>/` cache). `version` is
+    the resolved release string ("3.67.0" — no `v` prefix). Both fields
+    are required for the orchestrator's binary-only transitive auto-
+    switch to route through `_run_binary_mode` against the upstream
+    URL+tag. If show-dependencies omits a node's url or version (e.g.
+    revision-pinned deps where `version == "unspecified"`), that
+    entry's tuple still carries an entry but the binary-only auto-
+    switch will fall back to the source-mode child instead.
     """
     flat: dict = {}
 
@@ -2565,13 +2994,85 @@ def _flatten_dependency_tree(tree: dict) -> dict:
                 continue
             identity = dep.get("identity")
             path = dep.get("path")
+            url = dep.get("url")
+            version = dep.get("version")
             if isinstance(identity, str) and isinstance(path, str):
                 if identity not in flat:
-                    flat[identity] = path
+                    flat[identity] = (
+                        path,
+                        url if isinstance(url, str) else None,
+                        version if isinstance(version, str) else None,
+                    )
             walk(dep)
 
     walk(tree)
     return flat
+
+
+def _looks_remote_url(url: Optional[str]) -> bool:
+    """True for URLs we'd accept as `package_source` for binary mode.
+
+    show-dependencies sometimes echoes a local path as `url` (the root
+    package's own entry uses its on-disk path). We only want to treat a
+    transitive dep as binary-mode-routable when its URL is genuinely
+    remote — otherwise we'd loop back into the binary-only local-path
+    refusal the auto-switch was supposed to fix.
+    """
+    if not url:
+        return False
+    return (
+        url.startswith("http://")
+        or url.startswith("https://")
+        or url.startswith("git@")
+        or url.startswith("ssh://")
+    )
+
+
+def _looks_resolved_version(version: Optional[str]) -> bool:
+    """True for show-dependencies `version` values that look like a real
+    resolved release (SemVer-ish). Excludes the `"unspecified"`/`None`
+    cases (revision-pinned deps, root package, .package(name:, path:)
+    overrides) where we don't have a tag to feed `--binary` mode.
+    """
+    if not version or version == "unspecified":
+        return False
+    return True
+
+
+def _is_transitive_binary_only(
+    products: List[Product], targets: List[Target]
+) -> bool:
+    """Return True iff every non-system product in the transitive is
+    backed only by `.binaryTarget(...)` targets. Mirrors
+    `plan._package_is_binary_only` but operates directly on the
+    (products, targets) tuple Inspect already has for the transitive —
+    avoiding a transient Package construction here just to call the
+    Plan-side helper. Kept narrow on purpose; the only consumer is the
+    Inspect-time precompute that drives the orchestrator's binary-only
+    transitive auto-switch.
+    """
+    by_name = {t.name: t for t in targets}
+    binary_products = 0
+    for product in products:
+        if not product.targets:
+            # Malformed product — match the Plan-side helpers' policy
+            # of "not binary, not system" so xcodebuild surfaces the
+            # real complaint instead of us short-circuiting here.
+            return False
+        all_system = all(
+            (t := by_name.get(tn)) is not None and t.kind == TargetKind.SYSTEM
+            for tn in product.targets
+        )
+        if all_system:
+            continue
+        all_binary = all(
+            (t := by_name.get(tn)) is not None and t.kind == TargetKind.BINARY
+            for tn in product.targets
+        )
+        if not all_binary:
+            return False
+        binary_products += 1
+    return binary_products > 0
 
 
 def _discover_transitive_packages(
@@ -2622,7 +3123,7 @@ def _discover_transitive_packages(
                 f"not present in show-dependencies output (skipping)",
             )
             continue
-        identity, checkout_str = match
+        identity, (checkout_str, upstream_url, resolved_version) = match
         checkout_path = Path(checkout_str)
         if not (checkout_path / "Package.swift").is_file() and not any(
             checkout_path.glob("Package@swift-*.swift")
@@ -2634,7 +3135,7 @@ def _discover_transitive_packages(
             )
             continue
         try:
-            t_raw, t_products, _t_targets, _t_platforms, _t_name, t_tools = (
+            t_raw, t_products, t_targets, _t_platforms, _t_name, t_tools = (
                 dump_package(checkout_path)
             )
         except Exception as exc:  # noqa: BLE001 — Inspect must not crash
@@ -2643,6 +3144,22 @@ def _discover_transitive_packages(
                 f"  transitive: dump-package failed for {identity!r}: {exc}",
             )
             continue
+        # Precompute the binary-only flag so the orchestrator can route a
+        # binary-only transitive through `_run_binary_mode`. The URL +
+        # tag come from show-dependencies' parsed JSON (NOT the local
+        # checkout's `.git/config`, which points at SPM's bare-repo
+        # cache under `.build/repositories/<id>/` rather than the
+        # canonical upstream). Both fields are best-effort — a
+        # revision-pinned dep (`version == "unspecified"`) or a
+        # `.package(name:, path:)` override returns None for the
+        # affected field and the orchestrator falls back to the
+        # pre-staged-dir source path.
+        is_binary = _is_transitive_binary_only(t_products, t_targets)
+        binary_target_names = [
+            t.name for t in t_targets if t.kind == TargetKind.BINARY
+        ]
+        origin_url = upstream_url if _looks_remote_url(upstream_url) else None
+        head_tag = resolved_version if _looks_resolved_version(resolved_version) else None
         out.append(
             TransitivePackageInfo(
                 identity=identity,
@@ -2654,6 +3171,10 @@ def _discover_transitive_packages(
                 product_to_root_targets={
                     p: list(rts) for p, rts in ref_p2rt.items()
                 },
+                is_binary_only=is_binary,
+                binary_target_names=binary_target_names,
+                origin_url=origin_url,
+                head_tag=head_tag,
             )
         )
     return out
@@ -4854,6 +5375,65 @@ def edit_append_synth_product_to_package(
     )
 
 
+# Detect a file-scope `<var>.products = [` assignment — the post-init
+# mutation shape that overwrites whatever `products:` value was passed to
+# the `Package(...)` initializer. The `(?<![.\w])` lookbehind keeps us
+# from matching `self.pkg.products` or any other dotted prefix; the `\1`
+# capture gives us the variable name so we can emit a matching
+# `<var>.products.append(...)` statement.
+_POST_INIT_PRODUCTS_ASSIGN_RE = re.compile(
+    r"(?<![.\w])(\w+)\.products\s*=\s*\["
+)
+
+
+def edit_append_synth_to_post_init_products(
+    manifest_text: str, product_name: str, targets: Sequence[str]
+) -> Optional[str]:
+    """If `manifest_text` contains a file-scope `<var>.products = [...]`
+    assignment, append our synthetic dynamic library via
+    `<var>.products.append(.library(name: <product>, type: .dynamic,
+    targets: [...]))` right after the assignment. Returns the edited
+    manifest, or `None` if no such assignment exists (caller should fall
+    through to the regular add-product flow).
+
+    Why this exists: `swift package add-product` injects `products:` into
+    the `Package(...)` initializer's argument list. When the manifest
+    then overwrites `pkg.products = [...]` AFTER the initializer returns
+    (PromiseKit 8.1.2's shape), the injection is silently clobbered and
+    our synth library vanishes from `dump-package`. Detecting and
+    appending here keeps the author's product list intact AND ensures
+    our synth survives.
+
+    The LAST matching assignment wins — sequential Swift evaluation
+    means a later assignment would overwrite an earlier one, so we
+    splice past the last `<var>.products = [...]` we can find.
+    """
+    code_view = _make_code_token_view(manifest_text)
+    last_match = None
+    for m in _POST_INIT_PRODUCTS_ASSIGN_RE.finditer(code_view):
+        last_match = m
+    if last_match is None:
+        return None
+
+    var_name = last_match.group(1)
+    bracket_open = last_match.end() - 1  # points at `[`
+    bracket_close = _balanced_close(manifest_text, bracket_open)
+    if bracket_close == -1:
+        return None
+
+    insert_at = bracket_close + 1
+    if insert_at < len(manifest_text) and manifest_text[insert_at] == ";":
+        insert_at += 1
+
+    targets_list = ", ".join(_swift_string_literal(t) for t in targets)
+    append_stmt = (
+        f"\n{var_name}.products.append("
+        f".library(name: {_swift_string_literal(product_name)}, "
+        f"type: .dynamic, targets: [{targets_list}]))"
+    )
+    return manifest_text[:insert_at] + append_stmt + manifest_text[insert_at:]
+
+
 def edit_replace_with_binary_target(
     manifest_text: str, target_name: str, xcframework_path: str
 ) -> str:
@@ -4892,7 +5472,13 @@ def edit_replace_with_binary_target(
     if kind_start == -1:
         if binary_present:
             return manifest_text  # already a binaryTarget; idempotent no-op
-        raise PrepareUserError(
+        # Raise the narrower TargetCallNotFoundError so the dedup-overlap
+        # router can catch it specifically and fall back to the overlay
+        # branch (manifests whose targets come from a factory wrapper like
+        # RxSwift's `static func rxTarget(...) -> Target` have no literal
+        # `.target(name: T, ...)` for us to find — the overlay path
+        # doesn't need one).
+        raise TargetCallNotFoundError(
             f"replace_with_binary_target: no `.target(name: {target_name!r}, "
             f"...)` (or .executableTarget/.testTarget) found in the manifest. "
             f"There is also no existing `.binaryTarget(name: {target_name!r}, "
@@ -4994,7 +5580,7 @@ def edit_inject_or_extend_overlay_binary_targets(
       1. First call (no sentinel block present): injects the overlay
          block immediately before the top-level `Package(...)` call AND
          wraps the `targets:` argument expression as
-         `targets: (<orig>).filter { !_SPM2XC_OVERLAY_NAMES.contains($0.name) } + _SPM2XC_OVERLAY_TARGETS`.
+         `targets: (<orig>).filter { t in !_SPM2XC_OVERLAY_NAMES.contains(where: { $0 == t.name }) } + _SPM2XC_OVERLAY_TARGETS`.
       2. Subsequent calls (sentinel block present): parses the existing
          entries, merges with `substitutions` (last-wins by target
          name), and re-renders the block in place. The `targets:`
@@ -5104,8 +5690,17 @@ def edit_inject_or_extend_overlay_binary_targets(
     line_start = manifest_text.rfind("\n", 0, pkg_open) + 1
 
     wrap_prefix = "("
+    # `.contains(where: { $0 == t.name })` — NOT `.contains(t.name)`. Under
+    # Swift 5.9+ the `Collection.contains<C: Collection>(_ other:)` overload
+    # (Self.Element == C.Element) can shadow `Set.contains(_ member:)` when
+    # the receiver expression is complex (e.g., a closure-returning array as
+    # in Nimble's targets-builder shape). The type-checker then resolves to
+    # the Collection-of-Collection overload and emits
+    # "instance method 'contains' requires the types 'String' and
+    # 'String.Element' (aka 'Character') be equivalent". `contains(where:)`
+    # has no such overload, so it stays unambiguous.
     wrap_suffix = (
-        f").filter {{ !{_OVERLAY_NAMES_VAR}.contains($0.name) }} "
+        f").filter {{ t in !{_OVERLAY_NAMES_VAR}.contains(where: {{ $0 == t.name }}) }} "
         f"+ {_OVERLAY_TARGETS_VAR}"
     )
 
@@ -5133,9 +5728,9 @@ _TARGET_LOOP_RE = re.compile(
 
 def edit_guard_target_loops_from_overlay(manifest_text: str) -> str:
     """Augment any top-level `for <var> in package.targets [where <expr>]`
-    loop with a `_SPM2XC_OVERLAY_NAMES.contains(<var>.name)` exclusion,
-    so overlay-injected binaryTargets aren't subjected to settings
-    mutations the post-loop applies to "all" non-system targets.
+    loop with a `_SPM2XC_OVERLAY_NAMES.contains(where: { $0 == <var>.name })`
+    exclusion, so overlay-injected binaryTargets aren't subjected to
+    settings mutations the post-loop applies to "all" non-system targets.
 
     Real-world trigger: swift-perception 1.6.0 ends its manifest with
 
@@ -5155,9 +5750,13 @@ def edit_guard_target_loops_from_overlay(manifest_text: str) -> str:
     Behaviour:
       - No-op if the manifest has no overlay sentinel (no overlay block
         present → nothing to guard).
-      - For each matched loop, AND `!_SPM2XC_OVERLAY_NAMES.contains(<var>.name)`
+      - For each matched loop, AND
+        `!_SPM2XC_OVERLAY_NAMES.contains(where: { $0 == <var>.name })`
         into the existing `where` clause, or insert the clause when no
-        `where` is present.
+        `where` is present. `.contains(where:)` is used (not the simpler
+        `.contains(_:)`) for the same reason as the targets-arg wrap:
+        the latter trips an overload-resolution failure under certain
+        receiver-expression shapes on Swift 5.9+.
       - Idempotent: a loop whose `where` clause already mentions
         `_SPM2XC_OVERLAY_NAMES` is left untouched.
       - Skips matches inside strings or comments (uses
@@ -5228,13 +5827,13 @@ def edit_guard_target_loops_from_overlay(manifest_text: str) -> str:
                 continue
             replacement = (
                 f"({existing_expr.strip()})"
-                f" && !{_OVERLAY_NAMES_VAR}.contains({var_name}.name)"
+                f" && !{_OVERLAY_NAMES_VAR}.contains(where: {{ $0 == {var_name}.name }})"
             )
             edits.append((where_expr_start, where_expr_end, replacement))
         else:
             insert_at = m.end()
             replacement = (
-                f" where !{_OVERLAY_NAMES_VAR}.contains({var_name}.name)"
+                f" where !{_OVERLAY_NAMES_VAR}.contains(where: {{ $0 == {var_name}.name }})"
             )
             edits.append((insert_at, insert_at, replacement))
 
@@ -6005,7 +6604,20 @@ def _depth_zero_product_calls_with_name_and_package(
                     package_val = _top_level_keyword_string_value(
                         call_span, "package"
                     )
-                    if package_val == package_identity or (
+                    # `package:` is matched case-insensitively against the
+                    # SPM-normalised identity. Manifests like Nimble's
+                    # `package: "CwlPreconditionTesting"` or Moya's
+                    # `package: "Alamofire"` carry the PascalCase package
+                    # name; the identity we plan against is the lowercased
+                    # URL last component ("cwlpreconditiontesting" /
+                    # "alamofire"). SPM accepts either spelling at resolve
+                    # time, so we mirror that here. `package_identity` is
+                    # documented as already lowercased, but call .lower()
+                    # on both sides defensively.
+                    if (
+                        package_val is not None
+                        and package_val.lower() == package_identity.lower()
+                    ) or (
                         package_val is None and package_identity == ""
                     ):
                         matches.append((i, close_idx))
@@ -6428,7 +7040,15 @@ def _depth_zero_product_calls_with_package_in_set(
                 package_val = _top_level_keyword_string_value(
                     call_span, "package"
                 )
-                if package_val is not None and package_val in package_identities:
+                # Case-insensitive match — manifests can spell `package:`
+                # with either the PascalCase name (Nimble's
+                # "CwlPreconditionTesting") or the SPM-normalised lowercase
+                # identity. `package_identities` carries the lowercased
+                # form; normalise the manifest side to match.
+                if (
+                    package_val is not None
+                    and package_val.lower() in package_identities
+                ):
                     matches.append((i, close_idx))
                 i = close_idx + 1
                 continue
@@ -6472,6 +7092,10 @@ def edit_strip_orphan_product_refs_for_identities_in_target(
     """
     if not identities:
         return manifest_text
+    # Normalise once at the boundary so `_depth_zero_product_calls_with_package_in_set`'s
+    # case-insensitive membership check works regardless of how the
+    # caller spells the identities.
+    identities_lower = {ident.lower() for ident in identities}
     kind_start, close_idx, _kind = _find_target_call_for_name(
         manifest_text, target_name
     )
@@ -6497,7 +7121,7 @@ def edit_strip_orphan_product_refs_for_identities_in_target(
     interior_start = deps_open + 1
     interior_end = deps_close
     matches = _depth_zero_product_calls_with_package_in_set(
-        body, interior_start, interior_end, identities
+        body, interior_start, interior_end, identities_lower
     )
     if not matches:
         return manifest_text
@@ -6876,6 +7500,243 @@ def edit_strip_post_init_package_mutations(manifest_text: str) -> str:
         result = result[:absorb_start] + result[absorb_end:]
 
     return result
+
+
+_TEST_TARGET_CALL_RE = re.compile(r"\.testTarget\s*\(")
+
+
+def edit_strip_test_targets(manifest_text: str) -> str:
+    """Remove every `.testTarget(...)` call from the manifest's targets
+    array, along with the trailing comma (or leading comma if it's the
+    final element).
+
+    Why strip:
+      Test targets contribute nothing to archive builds — we never run
+      `swift test`, only `xcodebuild archive` against generated schemes
+      for library products. But SPM's `swift package describe` and the
+      Xcode build setup both scan every declared target's source tree,
+      and a test target can have its own toolchain-incompatible shapes
+      that abort the whole describe call. Canonical case: amplitude's
+      analytics-connector-ios v1.3.0 declares an `AnalyticsConnectorTests`
+      test target whose Tests/AnalyticsConnectorTests dir has both Swift
+      and Objective-C sources — SPM refuses with `target ... contains
+      mixed language source files; feature not supported`, and inspect
+      bails before plan/execute ever run. Removing the test target call
+      makes describe succeed and unblocks the umbrella build that
+      doesn't care about tests in the first place.
+
+    Idempotent: re-running on already-stripped manifest is a no-op.
+
+    Code-only matching: comments and string literals are blanked via
+    `_make_code_token_view` before scanning, so a stray `.testTarget(`
+    inside a doc-comment or string literal can't false-positive.
+    """
+    code_view = _make_code_token_view(manifest_text)
+    spans_to_remove: List[Tuple[int, int]] = []
+    pos = 0
+    while True:
+        m = _TEST_TARGET_CALL_RE.search(code_view, pos)
+        if not m:
+            break
+        call_start = m.start()
+        open_idx = m.end() - 1
+        close_idx = _balanced_close(manifest_text, open_idx)
+        if close_idx == -1:
+            # Malformed manifest — let the downstream parser surface the
+            # real complaint rather than silently mutating something we
+            # don't fully understand.
+            break
+        # Extend the removal to absorb either the trailing comma (when
+        # the testTarget has siblings after it) or the leading comma
+        # (when it's the last element of the array). Without this, we
+        # leave a dangling `,` that breaks Swift array syntax.
+        remove_start = call_start
+        remove_end = close_idx + 1
+        scan = remove_end
+        while scan < len(manifest_text) and manifest_text[scan] in " \t":
+            scan += 1
+        if scan < len(manifest_text) and manifest_text[scan] == ",":
+            remove_end = scan + 1
+        else:
+            # No trailing comma — this is the last array element. Walk
+            # backward to absorb the leading comma + any whitespace
+            # between it and our call start.
+            back = call_start - 1
+            while back >= 0 and manifest_text[back] in " \t\n":
+                back -= 1
+            if back >= 0 and manifest_text[back] == ",":
+                remove_start = back
+        spans_to_remove.append((remove_start, remove_end))
+        pos = close_idx + 1
+
+    if not spans_to_remove:
+        return manifest_text
+    # Apply removals in reverse so earlier offsets remain valid.
+    out = manifest_text
+    for start, end in reversed(spans_to_remove):
+        out = out[:start] + out[end:]
+    return out
+
+
+_BINARY_TARGET_URL_LABEL_RE = re.compile(r"\burl\s*:")
+_LIBRARY_TARGETS_LIST_RE = re.compile(
+    r"\btargets\s*:\s*\[([^\[\]]*)\]", re.DOTALL
+)
+
+
+def edit_strip_unused_binary_targets(manifest_text: str) -> str:
+    """Remove every `.binaryTarget(name: X, url: ..., checksum: ...)`
+    declaration whose name X is NOT referenced by any source target's
+    dependency list, plus any `.library(...)` product whose targets list
+    is made entirely of stripped-binary-target names.
+
+    Why strip:
+      Some packages declare BOTH a source product and a URL-based binary
+      alternative of the same library (canonical: analytics-connector-ios
+      v1.3.x ships `.target("AnalyticsConnector", path: "Sources/...")`
+      AND `.binaryTarget("AnalyticsConnectorFramework", url:
+      ".../AnalyticsConnector.xcframework.zip")`). When we synth a
+      dynamic library targeting the source target and run `xcodebuild
+      archive`, SwiftPM downloads the .binaryTarget's prebuilt
+      xcframework (because the manifest still declares it) and
+      xcodebuild's archive populates `Products/.../AnalyticsConnector
+      .framework/Modules/AnalyticsConnector.swiftmodule/` from the
+      prebuilt's xcframework slice — which is named with the prebuilt's
+      target triple (e.g. `arm64-apple-tvos`) and not our iOS slice.
+      The resulting framework has zero iOS swiftinterfaces, so the
+      umbrella build's `import AnalyticsConnector` fails with `Cannot
+      find type 'AnalyticsConnector' in scope`.
+
+    Why only URL-based:
+      A `.binaryTarget(name: X, path: "Vendored.xcframework")` is a
+      local artifact bundled INTO the package source tree (no SPM
+      download). Stripping it would break any source target that
+      `dependencies: [.target(name: X)]` against the vendored library —
+      a real use case. URL-based binary targets are SPM downloads of
+      external xcframeworks; if no source target depends on them they
+      are "alternative distribution" products, safe to remove.
+
+    "Depended-on" detection: scan every non-binary target call body for
+    a quoted occurrence of the binary target name (excluding the
+    target's own `name:` field). This intentionally over-counts (e.g.
+    a target's `path: "AnalyticsConnector"` would protect a binary
+    target with the same name) — over-counting is the safe direction:
+    it just keeps the binary target where stripping is uncertain.
+
+    Idempotent: re-running on already-stripped manifest is a no-op.
+
+    Code-only matching: comments and string literals are blanked via
+    `_make_code_token_view` before scanning, so a `.binaryTarget(`
+    inside a doc-comment can't false-positive.
+    """
+    code_view = _make_code_token_view(manifest_text)
+
+    # 1. Collect URL-based binary target spans + names.
+    bin_targets: List[Tuple[int, int, str]] = []  # (start, end_exclusive, name)
+    for m in _BINARY_TARGET_CALL_RE.finditer(code_view):
+        open_idx = m.end() - 1
+        close_idx = _balanced_close(manifest_text, open_idx)
+        if close_idx == -1:
+            continue
+        body = manifest_text[open_idx + 1:close_idx]
+        flat = _flatten_to_top_level(body)
+        name_m = _TOP_LEVEL_NAME_LABEL_RE.search(flat)
+        if name_m is None:
+            continue
+        if _BINARY_TARGET_URL_LABEL_RE.search(flat) is None:
+            continue  # path-based vendored xcframework — leave alone
+        bin_targets.append((m.start(), close_idx + 1, name_m.group(1)))
+
+    if not bin_targets:
+        return manifest_text
+
+    bin_names = {name for _, _, name in bin_targets}
+
+    # 2. Walk source target calls (.target / .executableTarget). For
+    #    each, find quoted occurrences of any binary target name. If
+    #    present, that binary target is considered "depended-on" and we
+    #    leave it alone.
+    depended: set[str] = set()
+    for m in _TARGET_CALL_KIND_RE.finditer(code_view):
+        kind = m.group(1)
+        if kind == "testTarget":
+            continue  # tests are stripped separately and don't pin deps
+        open_idx = m.end() - 1
+        close_idx = _balanced_close(manifest_text, open_idx)
+        if close_idx == -1:
+            continue
+        body = manifest_text[open_idx + 1:close_idx]
+        # Exclude the target's own `name: "X"` literal from matching:
+        # collapse to a flat view of the top-level body, find name, then
+        # strip that literal from the body before scanning. Cheap
+        # heuristic — the raw body's first `name: "<name>"` match is
+        # the call's own name in every well-formed manifest.
+        flat = _flatten_to_top_level(body)
+        my_name_m = _TOP_LEVEL_NAME_LABEL_RE.search(flat)
+        my_name = my_name_m.group(1) if my_name_m else None
+        for bn in bin_names:
+            if bn == my_name:
+                continue
+            # Search the raw body for the quoted binary target name.
+            # `f'"{bn}"'` matches forms `"X"`, `byName(name: "X")`,
+            # `.target(name: "X")`, `.product(name: "X", ...)`. False
+            # positives (e.g. `path: "X"`) just keep the binary target.
+            if f'"{bn}"' in body:
+                depended.add(bn)
+
+    # 3. Strip binary targets not in the depended set.
+    targets_to_strip = [
+        (s, e, n) for s, e, n in bin_targets if n not in depended
+    ]
+    if not targets_to_strip:
+        return manifest_text
+    stripped_names = {n for _, _, n in targets_to_strip}
+
+    # 4. Find `.library(name: P, ..., targets: [...])` products whose
+    #    targets list is entirely stripped binary target names — those
+    #    products no longer have a valid backing target, so SPM will
+    #    reject the manifest unless we strip them too.
+    products_to_strip: List[Tuple[int, int]] = []
+    for m in _LIBRARY_CALL_RE.finditer(code_view):
+        open_idx = m.end() - 1
+        close_idx = _balanced_close(manifest_text, open_idx)
+        if close_idx == -1:
+            continue
+        body = manifest_text[open_idx + 1:close_idx]
+        list_m = _LIBRARY_TARGETS_LIST_RE.search(body)
+        if list_m is None:
+            continue
+        target_names = re.findall(r'"([^"\\\n]*)"', list_m.group(1))
+        if target_names and all(t in stripped_names for t in target_names):
+            products_to_strip.append((m.start(), close_idx + 1))
+
+    # 5. Compute final removal spans with comma absorption (mirrors
+    #    `edit_strip_test_targets`).
+    raw_spans: List[Tuple[int, int]] = (
+        [(s, e) for s, e, _ in targets_to_strip] + products_to_strip
+    )
+    raw_spans.sort()
+    spans_to_remove: List[Tuple[int, int]] = []
+    for call_start, call_end in raw_spans:
+        remove_start = call_start
+        remove_end = call_end
+        scan = remove_end
+        while scan < len(manifest_text) and manifest_text[scan] in " \t":
+            scan += 1
+        if scan < len(manifest_text) and manifest_text[scan] == ",":
+            remove_end = scan + 1
+        else:
+            back = call_start - 1
+            while back >= 0 and manifest_text[back] in " \t\n":
+                back -= 1
+            if back >= 0 and manifest_text[back] == ",":
+                remove_start = back
+        spans_to_remove.append((remove_start, remove_end))
+
+    out = manifest_text
+    for start, end in reversed(spans_to_remove):
+        out = out[:start] + out[end:]
+    return out
 
 
 def _find_dependencies_array_in_package_call(
@@ -7369,7 +8230,23 @@ def _apply_single_synth_edit(
     to `edit_append_synth_product_to_package`, which appends the
     synthetic entry via a `+ [...]` expression that works for both
     literal arrays and non-literal expressions.
+
+    Before either of those paths, we first check for a post-init
+    `<var>.products = [...]` assignment that would silently clobber the
+    add-product injection. PromiseKit 8.1.2 ships this shape: the
+    `Package(...)` initializer takes no `products:` argument, then
+    `pkg.products = [...]` runs at file scope and overwrites whatever
+    add-product just injected. `edit_append_synth_to_post_init_products`
+    handles that case by appending `<var>.products.append(.library(...))`
+    after the assignment.
     """
+    post_init_edited = edit_append_synth_to_post_init_products(
+        active_manifest.read_text(), product_name, targets
+    )
+    if post_init_edited is not None:
+        active_manifest.write_text(post_init_edited)
+        return
+
     try:
         _add_product_via_active_manifest_proxy(
             staged_dir, active_manifest, product_name, targets
@@ -9775,7 +10652,7 @@ import os
 import re
 import shutil
 from pathlib import Path
-from typing import Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 
 
@@ -9822,6 +10699,53 @@ def _strip_package_name_from_swiftinterfaces(swiftmod_dir: Path) -> None:
                 changed = True
         if changed:
             iface.write_text("".join(lines), encoding="utf-8")
+
+
+def _strip_self_module_qualifier_from_swiftinterface(
+    text: str, module_name: str
+) -> str:
+    """Remove leading `<module_name>.` qualifier from type references in
+    the swiftinterface OF that module. Within module M's own emitted
+    interface, every `M.X` qualifies type X in module M — the bare `X`
+    resolves to the same thing in this lexical scope. Stripping the
+    qualifier is the documented workaround for the Swift compiler bug
+    where a type whose name shadows the module name causes the
+    swiftinterface re-parser to bind `M.X` as "nested type X inside
+    type M" (the shadowing class) instead of "top-level type X in
+    module M", producing errors like
+    "'EventBridge' is not a member type of class 'AnalyticsConnector.AnalyticsConnector'"
+    (Swift issue #56573 / SR-14195; canonical packages: mixpanel-swift's
+    `JSON.JSON`, analytics-connector-ios's `AnalyticsConnector.AnalyticsConnector`).
+
+    Scope:
+    - Substitution runs over the code-only view of the swiftinterface so
+      comments (`//` lines including the `swift-module-flags` header,
+      `/* */` blocks) and string literals (deprecation messages in
+      `@available(..., message: "...")`, etc.) are left untouched.
+    - Lookbehind `(?<![\\w.])` ensures we only strip the FIRST `M.` of
+      any qualified chain, so a legitimate nested-type reference
+      `M.M.X` (where the second `M` is a real nested type inside the
+      shadowing top-level type) survives as `M.X` rather than collapsing
+      to `X`. The shadowing-class case `M.M` still collapses to `M`,
+      which is what we want.
+    - The lookahead `(?=[A-Z_])` requires the next character after the
+      dot to start an identifier (uppercase or underscore by Swift
+      convention for type names) — guards against substitutions inside
+      attribute syntax like `@frozen` or numeric suffixes.
+    """
+    code_view = _make_code_token_view(text)
+    pattern = re.compile(
+        r"(?<![\w.])" + re.escape(module_name) + r"\.(?=[A-Z_])"
+    )
+    out: List[str] = []
+    last = 0
+    for m in pattern.finditer(code_view):
+        out.append(text[last:m.start()])
+        last = m.end()  # drop `<module_name>.`, keep the looked-ahead char
+    if last == 0:
+        return text
+    out.append(text[last:])
+    return "".join(out)
 
 
 def _find_swiftmodule_in_dd(
@@ -9990,9 +10914,23 @@ def inject_swiftmodule(
     if dest.exists():
         shutil.rmtree(dest)
     shutil.copytree(swiftmod, dest)
+    _disambiguate_self_module_qualifier_in_swiftmodule(dest, module_name)
     _strip_package_name_from_swiftinterfaces(dest)
     _ensure_root_symlink(fw_path, "Modules")
     return True
+
+
+def _disambiguate_self_module_qualifier_in_swiftmodule(
+    swiftmod_dir: Path, module_name: str
+) -> None:
+    for iface in swiftmod_dir.glob("*.swiftinterface"):
+        try:
+            text = iface.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        rewritten = _strip_self_module_qualifier_from_swiftinterface(text, module_name)
+        if rewritten != text:
+            iface.write_text(rewritten, encoding="utf-8")
 
 
 # ============================================================================
@@ -10086,8 +11024,19 @@ def _find_objc_headers_dir(
             return None
         target_dir = package.staged_dir / target_path
         # 1. Explicit `publicHeadersPath` always wins (the legacy contract).
-        if target.public_headers_path:
-            full_path = target_dir / target.public_headers_path
+        #    Empty string is also explicit: SPM treats `publicHeadersPath: ""`
+        #    as "the target's own root directory is the public headers
+        #    dir," which is how AppAuth-iOS ships its ObjC API (every .h
+        #    sits next to its .m at the target root with no `include/`
+        #    subdir and no umbrella header). Without this branch the
+        #    empty string is falsy in Python, so we fell through to the
+        #    implicit-layout fallback, found neither `include/` nor an
+        #    `<TargetName>.h` umbrella, and gave up — leaving AppAuth /
+        #    AppAuthCore xcframeworks with no Headers/ and Verify
+        #    rejecting them as broken ObjC frameworks.
+        if target.public_headers_path is not None:
+            rel = target.public_headers_path
+            full_path = target_dir if rel == "" else target_dir / rel
             if full_path.is_dir() and _has_h_files_recursive(full_path):
                 return full_path
             return None
@@ -10286,6 +11235,88 @@ def inject_objc_headers(
     _ensure_root_symlink(fw_path, "Headers")
     _ensure_root_symlink(fw_path, "Modules")
     verbose_log(verbose, f"  Injected {copied} header(s) + modulemap")
+    return True
+
+
+def inject_pure_swift_clang_modulemap(
+    *,
+    fw_path: Path,
+    fw_name: str,
+    dd_path: Path,
+    variant: str,
+    verbose: bool,
+) -> bool:
+    """For a pure-Swift framework, expose its `@objc`-bridged surface to
+    Clang `@import` consumers by synthesizing a minimal Clang modulemap
+    referencing the Swift-generated `<fw_name>-Swift.h`.
+
+    SPM builds with `BUILD_LIBRARY_FOR_DISTRIBUTION=YES` emit a
+    `<Name>.swiftmodule/<arch>.swiftinterface` but NO Clang
+    `module.modulemap` for pure-Swift targets. Swift consumers don't
+    need one (swiftc finds the framework by name + swiftmodule
+    directory), but Objective-C consumers that do `@import <Name>` or
+    `#import <Name/Name-Swift.h>` fail with `Module '<Name>' not found`
+    because Clang has no module declaration to bind. Real-world trigger:
+    GoogleSignIn-iOS's `GIDEMMSupport.h` does `@import GTMAppAuth`; with
+    no modulemap inside GTMAppAuth.framework the umbrella build fails.
+
+    No-op when:
+    - The framework already has `Modules/module.modulemap` (ObjC pass
+      already generated one, or xcodebuild emitted one for a mixed
+      target).
+    - The framework has no `Modules/*.swiftmodule/` (not a Swift
+      framework — nothing to expose).
+    - No `<fw_name>-Swift.h` is found in DerivedData (Swift target
+      exposes nothing to ObjC, so a modulemap referencing the bridge
+      header would point at a nonexistent file).
+
+    `requires objc` matches what Xcode itself emits for Swift-built
+    `module.modulemap` — the bridge header is full of `@interface` /
+    `@protocol` declarations only valid when ObjC interop is enabled.
+    """
+    content_root = _framework_content_root(fw_path)
+    modules_dir = content_root / "Modules"
+    existing_modulemap = modules_dir / "module.modulemap"
+    if existing_modulemap.is_file():
+        return False
+
+    swiftmodule_dirs = list(modules_dir.glob("*.swiftmodule")) if modules_dir.is_dir() else []
+    if not any(d.is_dir() for d in swiftmodule_dirs):
+        return False
+
+    bridge_header_name = f"{fw_name}-Swift.h"
+    bridge_header_src: Optional[Path] = None
+    if dd_path.is_dir():
+        for candidate in dd_path.rglob(bridge_header_name):
+            if candidate.is_file():
+                bridge_header_src = candidate
+                break
+    if bridge_header_src is None:
+        verbose_log(
+            verbose,
+            f"  No {bridge_header_name} in DerivedData; skipping pure-Swift "
+            f"modulemap synth ({variant})",
+        )
+        return False
+
+    headers_dir = content_root / "Headers"
+    headers_dir.mkdir(parents=True, exist_ok=True)
+    bridge_header_dest = headers_dir / bridge_header_name
+    if not bridge_header_dest.is_file():
+        shutil.copy2(bridge_header_src, bridge_header_dest)
+
+    modules_dir.mkdir(parents=True, exist_ok=True)
+    text = (
+        f"framework module {fw_name} {{\n"
+        f"  header \"{bridge_header_name}\"\n"
+        f"  requires objc\n"
+        f"}}\n"
+    )
+    existing_modulemap.write_text(text)
+
+    _ensure_root_symlink(fw_path, "Headers")
+    _ensure_root_symlink(fw_path, "Modules")
+    dim(f"  Injected pure-Swift Clang modulemap ({variant}): {fw_name}")
     return True
 
 
@@ -11199,6 +12230,27 @@ def _build_dependency_xcframeworks(
             fw_path=sim_fw,
             verbose=verbose,
         )
+        # Synthesize a Clang modulemap when the dep is pure-Swift with
+        # @objc surface so the umbrella's ObjC code (or another mixed
+        # dep) can `@import Dep` / `#import <Dep/Dep-Swift.h>`. No-op
+        # when inject_objc_headers already wrote a modulemap, when no
+        # `-Swift.h` exists in DerivedData, or when the framework has
+        # no .swiftmodule (ObjC-only dep). Parallels the run_unit call
+        # site so deps and the primary unit produce equivalent bundles.
+        inject_pure_swift_clang_modulemap(
+            fw_path=fw_path,
+            fw_name=fw_name,
+            dd_path=device_slice.dd_path,
+            variant="device",
+            verbose=verbose,
+        )
+        inject_pure_swift_clang_modulemap(
+            fw_path=sim_fw,
+            fw_name=fw_name,
+            dd_path=sim_slice.dd_path,
+            variant="simulator",
+            verbose=verbose,
+        )
         inject_resource_bundles(
             fw_path=fw_path,
             fw_name=fw_name,
@@ -11284,6 +12336,53 @@ def _synth_dynamic_protected_targets(
     return protected
 
 
+def _author_explicit_linkage_protected_targets(
+    products: Iterable[Product],
+) -> Set[str]:
+    """Return every target referenced by an AUTHOR-declared library
+    product whose linkage is EXPLICIT (`.dynamic` or `.static`).
+
+    SPM's binary-only-product rule is symmetric on linkage:
+
+        "invalid type for binary product; products referencing only
+         binary targets must be executable or AUTOMATIC library
+         products"
+
+    `.automatic` is the legal sink — SPM picks the linkage at build
+    time and accepts a binary-only target list. Both `.dynamic` AND
+    `.static` are explicit-linkage products and BOTH would be rejected
+    if their target list collapsed to `.binaryTarget` entries.
+
+    Examples:
+        RxSwift 6.x: `.library(name: "RxSwift-Dynamic", type: .dynamic,
+        targets: ["RxSwift"])`. The dynamic library is the canonical
+        case and the one that surfaced in wild-sample harness
+        (2026-05-22).
+
+        Hypothetical static case: `.library(name: "FooStatic",
+        type: .static, targets: ["Foo"])`. No observed binding
+        candidate has triggered this shape yet (Grok flagged it as a
+        latent narrow gap), but the SPM rejection is identical so the
+        helper covers it for free. (Codex P1 final-review catch.)
+
+    These products never get demoted by our run — the author asked for
+    explicit linkage — so the corresponding targets stay protected
+    for the entire run. The call site keeps the returned set in a
+    frozen container and unions it in fresh on every dedup pass, so
+    the post-unit `synth_dynamic_protected.discard(t)` loop can't
+    touch it.
+
+    Planner-injected synth products are ALWAYS `.dynamic`, never
+    `.static`, so the symmetric extension changes no existing
+    behavior — it only catches the hypothetical author-static case.
+    """
+    protected: Set[str] = set()
+    for prod in products:
+        if prod.linkage in (Linkage.DYNAMIC, Linkage.STATIC):
+            protected.update(prod.targets)
+    return protected
+
+
 def _compute_dedup_substitutions(
     *,
     unit: BuildUnit,
@@ -11317,19 +12416,38 @@ def _compute_dedup_substitutions(
          path to point at). If the sibling hasn't run yet — cycle in
          the unit graph, or filtered out of this run — leaving the
          source target alone is the safe fallback.
-      4. T is NOT currently in `synth_dynamic_protected`. The set
-         starts with every target wrapped by a planner-injected synth
-         (`synth_dynamic_library` or `synth_library`) and shrinks
-         after each synth unit finishes — `execute_source_plan`
-         demotes the now-built synth product to automatic-library
-         shape (strips `type: .dynamic`) and drops the unit's targets
-         from the set. While T is still protected (its owning synth
-         hasn't built yet), rewriting `.target(name: T)` to
-         `.binaryTarget` would leave a still-`.dynamic` product
-         pointing at a binary-only target — SPM rejects that at the
-         next manifest parse. Skipping here is the conservative
-         fallback; once protection drops, the next round's dedup
-         pass picks T up normally. (Codex round-3 High.)
+      4. T is NOT currently in `synth_dynamic_protected`. The set is
+         the UNION of two protection groups, both of which would be
+         invalidated by rewriting T to `.binaryTarget` while a
+         `.library(type: .dynamic, targets: [T])` product still
+         survives in the manifest:
+           a. Planner-injected synth dynamic libraries
+              (`synth_dynamic_library` / `synth_library` edits). This
+              group shrinks after each synth unit finishes —
+              `execute_source_plan` demotes the now-built synth
+              product to automatic-library shape (strips `type:
+              .dynamic`) and drops the unit's targets from the set.
+              Once protection drops, the next round's dedup pass
+              picks T up normally. (Codex round-3 High.)
+           b. AUTHOR-declared library products with EXPLICIT
+              linkage — `.dynamic` (e.g. RxSwift 6.x's
+              `RxSwift-Dynamic`) OR `.static` (latent narrow case,
+              not yet observed in wild-sample). These never get
+              demoted — the author asked for explicit linkage — so
+              the corresponding entries stay protected for the
+              entire run. SPM's binary-only-product rule allows
+              only executable or AUTOMATIC library products to
+              reference a binary-only target list, so both
+              `.dynamic` and `.static` author products gate dedup.
+              The call site keeps them in a frozen set and unions
+              them in fresh each call, so the post-unit shrink
+              can't touch them.
+         While T is still protected (under either rule), rewriting
+         `.target(name: T)` to `.binaryTarget` would leave a still-
+         `.dynamic` product pointing at a binary-only target — SPM
+         rejects that at the next manifest parse with "invalid type
+         for binary product." Skipping here is the conservative
+         fallback.
 
     Returned pairs are deduplicated and emitted in deterministic
     sort order (the inner loop walks `sorted(target_deps[src_t])`),
@@ -11528,6 +12646,58 @@ def _apply_dedup_overlap_substitutions(
     for target_name, abs_path, rel_path in rel_subs:
         try:
             new_text = edit_replace_with_binary_target(edited, target_name, rel_path)
+        except TargetCallNotFoundError as exc:
+            # The literal `.target(name: T, ...)` doesn't exist in the
+            # manifest text — most often because targets come from a
+            # factory wrapper (e.g. RxSwift's `static func rxTarget(name:,
+            # ...) -> Target`). The plan-time wrapper-signal check
+            # (`_CUSTOM_TARGET_WRAPPER_SIGNALS`) didn't flag this shape
+            # because the wrapper returns `Target`, not a custom type.
+            #
+            # Fall back to the overlay path, which doesn't need a literal
+            # call to find: it appends new entries to a sentinel-wrapped
+            # `_SPM2XC_OVERLAY_TARGETS` block and wraps `targets:` with a
+            # name-keyed `filter + concat`. Re-run from the ORIGINAL
+            # `text`, not `edited`, so we don't mix strategies on a
+            # partially-rewritten manifest.
+            verbose_log(
+                verbose,
+                f"  {unit_name}: dedup-overlap in-place rewrite couldn't "
+                f"find literal `.target(name: {target_name!r}, ...)` — "
+                f"falling back to overlay path for all {len(rel_subs)} "
+                f"sibling target(s). ({exc})",
+            )
+            delta = [(name, rel) for name, _abs, rel in rel_subs]
+            try:
+                edited_overlay = edit_inject_or_extend_overlay_binary_targets(
+                    text, delta
+                )
+            except PrepareUserError as overlay_exc:
+                raise ExecuteError(
+                    f"dedup-overlap substitution failed for unit {unit_name!r}: "
+                    f"in-place rewrite couldn't find `.target(name: "
+                    f"{target_name!r}, ...)` and overlay fallback also "
+                    f"failed: {overlay_exc}"
+                ) from overlay_exc
+            edited_overlay = edit_guard_target_loops_from_overlay(edited_overlay)
+            if edited_overlay != text:
+                manifest_path.write_text(edited_overlay)
+                applied_overlay = [
+                    f"{name} -> {abs_path.name}" for name, abs_path, _ in rel_subs
+                ]
+                info(
+                    f"  {unit_name}: dedup-overlap (overlay fallback) "
+                    f"added {len(applied_overlay)} sibling target(s) to "
+                    f"the overlay: " + ", ".join(applied_overlay)
+                )
+            else:
+                verbose_log(
+                    verbose,
+                    f"  {unit_name}: dedup-overlap (overlay fallback) "
+                    f"no-op — all {len(rel_subs)} target(s) already "
+                    f"present in the overlay",
+                )
+            return
         except PrepareUserError as exc:
             raise ExecuteError(
                 f"dedup-overlap substitution failed for unit {unit_name!r} "
@@ -11915,6 +13085,22 @@ def _run_one_unit(
             fw_path=s.framework_path,
             verbose=config.verbose,
         )
+        # Pure-Swift frameworks (no ObjC headers in the source tree) emerge
+        # from xcodebuild with `Modules/<X>.swiftmodule/` but no Clang
+        # `module.modulemap`. Swift consumers don't need one, but ObjC
+        # consumers that do `@import <Name>` fail to resolve the module
+        # without it. Synthesize a minimal modulemap pointing at the
+        # Swift-generated `<Name>-Swift.h` so ObjC sites can import the
+        # framework's @objc surface. Runs after `inject_objc_headers` so
+        # that pass's umbrella-based modulemap takes precedence whenever
+        # the source tree did ship ObjC public headers.
+        inject_pure_swift_clang_modulemap(
+            fw_path=s.framework_path,
+            fw_name=fw_name,
+            dd_path=s.dd_path,
+            variant=sid,
+            verbose=config.verbose,
+        )
         inject_resource_bundles(
             fw_path=s.framework_path,
             fw_name=fw_name,
@@ -12053,6 +13239,22 @@ def execute_source_plan(
         if not config.no_dedup_overlap
         else set()
     )
+    # Author-declared `.library(type: .dynamic | .static, targets:[T])`
+    # products are NEVER demoted by our run — the author asked for
+    # explicit linkage — so T must stay protected from `.binaryTarget`
+    # substitution for the entire run. Frozen so the post-unit shrink
+    # at `synth_dynamic_protected.discard(t)` below physically cannot
+    # touch it; the union of both sets is what guards each dedup pass.
+    # (Triggered by RxSwift 6.x which ships both an automatic
+    # `RxSwift` library AND a dynamic `RxSwift-Dynamic` library
+    # backed by the same target. The `.static` case is symmetric:
+    # SPM rejects binary-only products that aren't executable or
+    # AUTOMATIC libraries — Codex P1 catch.)
+    author_explicit_linkage_protected: frozenset = (
+        frozenset(_author_explicit_linkage_protected_targets(prepared.package.products))
+        if not config.no_dedup_overlap
+        else frozenset()
+    )
     # Build the unit → planner-injected synth product mapping once.
     # synth_dynamic_library edits: unit.scheme == edit.product_name
     # (and unit.framework_name is the original product name, post-
@@ -12136,7 +13338,9 @@ def execute_source_plan(
                 target_to_unit=target_to_unit,
                 built_by_unit=built_by_unit,
                 target_deps=target_deps,
-                synth_dynamic_protected=synth_dynamic_protected,
+                synth_dynamic_protected=(
+                    synth_dynamic_protected | author_explicit_linkage_protected
+                ),
             )
             if substitutions:
                 # The apply helper writes only when at least one
@@ -12451,6 +13655,21 @@ def _filter_xcframework_slices_to_requested_platforms(
         data["AvailableLibraries"] = kept
         with info_plist.open("wb") as fh:
             plistlib.dump(data, fh)
+        # An upstream-signed xcframework (e.g. Mapbox's Turf) carries a
+        # top-level `_CodeSignature/CodeResources` manifest that hashes
+        # `Info.plist` plus every slice directory it shipped. Once we
+        # rewrite `Info.plist` and delete unrequested slice dirs the
+        # manifest no longer matches reality, and any downstream archive
+        # that runs Xcode's `SignatureCollection` build phase on the
+        # consumed sibling fails with an opaque `SWBUtil.CodeSignatureInfo.
+        # Error error 0`. We can't re-sign with the upstream identity, so
+        # drop the now-invalid manifest — the kept per-slice
+        # `Framework/_CodeSignature/` entries still describe their own
+        # binaries correctly, and the final app archive will re-sign on
+        # embed.
+        top_sig = xcframework_path / "_CodeSignature"
+        if top_sig.is_dir():
+            shutil.rmtree(top_sig, ignore_errors=True)
         verbose_log(
             verbose,
             f"  Dropped {len(removed)} unrequested slice(s) from "
@@ -13750,6 +14969,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # phase-specific code. No traceback. See REWRITE_DESIGN.md §7.
             phase = _phase_label_for(exc)
             print(_wrap(f"Error ({phase}): {exc}", "red"), file=sys.stderr)
+            if isinstance(exc, PlanError):
+                diag = scan_plan_error(str(exc))
+                if diag is not None:
+                    print(format_block(diag), file=sys.stderr)
             return exc.exit_code
         except _BUG_CLASS_ERRORS:
             # Tool bugs (Prepare, Verify) and uncaught exceptions deliberately
@@ -14208,6 +15431,119 @@ def _compute_selected_target_closure(
     return {n for n in closure if targets_by_name[n].kind == TargetKind.REGULAR}
 
 
+def _referenced_products_are_all_binary(tp) -> bool:
+    """True iff every product in `tp.referenced_products` is backed only by
+    `.binaryTarget(...)` targets within the transitive. Companion to
+    Inspect's `is_binary_only`, but scoped to the subset the umbrella
+    actually consumes — handles mixed-mode packages that ship both
+    source and binary products, where the umbrella only depends on the
+    binary side.
+
+    Canonical case: Amplitude-Swift v1.18.3 depends on AmplitudeCore-Swift,
+    a mixed package that ships AmplitudeCore (source), AmplitudeCoreNoUIKit
+    (source), AmplitudeCoreFramework (binary), and
+    AmplitudeCoreNoUIKitFramework (binary). The umbrella's target only
+    imports the binary product `AmplitudeCoreFramework`. Inspect's
+    whole-package `is_binary_only` returns False (the package has source
+    products too), so without this helper the orchestrator hands the
+    child a source-mode plan with `product_filter=[AmplitudeCoreFramework]`,
+    which the planner refuses (`Plan produced zero build units`).
+
+    Returns False when `referenced_products` is empty — we want the
+    existing source-mode path for transitives the umbrella doesn't
+    reference at all (cross-sibling discovery may attach later, but at
+    that point the expansion pass will repopulate the list).
+    """
+    if not tp.referenced_products:
+        return False
+    binary_names = set(tp.binary_target_names)
+    by_product = {p.name: p for p in tp.products}
+    for pname in tp.referenced_products:
+        prod = by_product.get(pname)
+        if prod is None or not prod.targets:
+            return False
+        if not all(tn in binary_names for tn in prod.targets):
+            return False
+    return True
+
+
+def _make_binary_only_transitive_child_config(
+    parent: Config, tp, child_work_dir: Path
+) -> Config:
+    """Build a child Config that runs `_run_binary_mode` against the
+    upstream URL+tag for a binary-only transitive.
+
+    Source mode can't service a binary-only transitive — its
+    `_package_is_binary_only` auto-switch refuses to fire from a local
+    path (we have no URL+tag to feed `--binary` mode's resolver).
+    Inspect now precomputes `is_binary_only` plus the `(origin_url,
+    head_tag)` recovered from the checkout's `.git`; when all three are
+    populated the orchestrator routes through here.
+
+    The child inherits the parent's output dir + platform flags +
+    keep-work + verbosity. `package_source` and `user_version` come
+    from the recovered git origin so Fetch's binary-resolver shim can
+    `.package(url:, exact:)` against the upstream tag instead of the
+    pre-staged dir. `product_filters` is left empty — see the body for
+    the rationale (SPM target name ≠ artifact-bundle xcframework
+    filename, so we can't reliably translate umbrella-side product
+    references into a binary-mode `--product` filter).
+
+    Asserts `tp.origin_url`/`tp.head_tag` are non-None so callers see a
+    clear failure instead of a confusing downstream FetchError if they
+    routed a non-binary-only transitive here.
+    """
+    from dataclasses import replace
+
+    assert tp.is_binary_only or _referenced_products_are_all_binary(tp), (
+        f"_make_binary_only_transitive_child_config called for transitive "
+        f"{tp.identity!r} whose neither whole package nor referenced-product "
+        f"subset is binary-only — orchestrator should have routed through "
+        f"_make_transitive_child_config instead"
+    )
+    assert tp.origin_url and tp.head_tag, (
+        f"_make_binary_only_transitive_child_config called for transitive "
+        f"{tp.identity!r} without recovered origin_url/head_tag "
+        f"(url={tp.origin_url!r}, tag={tp.head_tag!r})"
+    )
+
+    # No product filter in binary-only transitive mode. In binary mode,
+    # `--product` filters by the xcframework directory name unpacked
+    # under `.build/artifacts/`, which can differ from BOTH the umbrella's
+    # `.product(name:, package:)` symbol AND the `.binaryTarget(name:)`.
+    # Canonical case: adjust_signature_sdk declares product
+    # `AdjustSignature` backed by target `AdjustSignature` (binary), but
+    # the SPM artifact bundle unpacks to `AdjustSigSdk.xcframework` —
+    # neither the product nor the target name matches the on-disk
+    # filename. Without an authoritative mapping from SPM symbol to
+    # artifact-bundle internal filename, the safe option is to ship all
+    # xcframeworks the upstream produces (harmless file copies; binding
+    # consumers ignore unreferenced .xcframeworks).
+    return replace(
+        parent,
+        package_source=tp.origin_url,
+        user_version=tp.head_tag,
+        resolved_version=tp.head_tag,
+        product_filters=[],
+        target_filters=[],
+        revision=None,
+        include_deps=False,
+        inspect_only=False,
+        dry_run=False,
+        binary_mode=True,
+        no_transitive_products=True,
+        best_effort_transitives=False,
+        # Same rationale as _make_transitive_child_config: child runs
+        # contribute their built artifacts to the umbrella's merged
+        # manifest. binary mode is independent of dedup-overlap, but
+        # leave the flag flipped to match the source-mode child's shape.
+        no_dedup_overlap=True,
+        child_run=True,
+        collected_entries=[],
+        work_dir=child_work_dir,
+    )
+
+
 def _make_transitive_child_config(parent: Config, tp, child_work_dir: Path) -> Config:
     """Build a child Config for a transitive checkout.
 
@@ -14315,6 +15651,7 @@ def _build_prebuilt_sibling_index(
     output_dir: Path,
     entries: Sequence["ManifestEntry"],
     package: "Package",
+    binary_routed_identity_by_product: Optional[Dict[str, str]] = None,
 ) -> Tuple[Dict[str, Path], Dict[str, str]]:
     """Build the two indexes the umbrella's planner consumes via
     `Config.prebuilt_sibling_xcframeworks` and
@@ -14379,6 +15716,26 @@ def _build_prebuilt_sibling_index(
         if not xcfx.exists():
             continue
         paths[prod] = xcfx
+
+    # Layer in identities recovered from binary-mode transitive routing.
+    # When a transitive is binary-only (whole-package or
+    # referenced-subset binary-only) we route it through `_run_binary_mode`
+    # against the upstream URL, and the unpacked xcframework's on-disk
+    # basename frequently differs from the SPM product name the umbrella
+    # references (Adjust's `.binaryTarget(name: AdjustSignature, url:
+    # .../AdjustSigSdk.zip)`, Amplitude's `.binaryTarget(name:
+    # AmplitudeCoreFramework, url: .../AmplitudeCore.zip)`). Without this
+    # layer the basename-keyed `paths` entry has no companion `identities`
+    # entry, Prepare treats the sibling as `(unknown package)`, and the
+    # original `.package(url:)` dep never gets stripped — xcodebuild
+    # then aborts with `multiple packages ... declare targets with a
+    # conflicting name`. Trust the orchestrator's mapping (it knows the
+    # transitive identity that produced each child entry) over the
+    # `referenced_products` lookup above for these basenames.
+    if binary_routed_identity_by_product:
+        for prod, ident in binary_routed_identity_by_product.items():
+            if prod in paths:
+                identities[prod] = ident
 
     # Drop identities for products that aren't actually in `paths` (no
     # corresponding xcframework on disk) — keeps the two indexes
@@ -14677,6 +16034,13 @@ def _run_source_mode_with_transitives(config: Config) -> int:
 
     old_manifest = _read_output_manifest(config.output_dir)
     all_entries: List[ManifestEntry] = []
+    # For binary-routed transitives, on-disk xcframework basenames can
+    # differ from the SPM product name the umbrella references (Amplitude's
+    # AmplitudeCoreFramework → AmplitudeCore.xcframework). Track basename →
+    # transitive_identity so `_build_prebuilt_sibling_index` can tag those
+    # consumed siblings with their owning package, letting Prepare strip
+    # the now-redundant `.package(url: …)` dep from the umbrella manifest.
+    binary_routed_identity_by_product: Dict[str, str] = {}
     # Seed `visited` with the root's own identity computed the same way
     # `_collect_referenced_package_products` keys its entries — by SPM
     # identity. `_identity_from_url` mirrors SPM's normalisation (last URL
@@ -14716,24 +16080,49 @@ def _run_source_mode_with_transitives(config: Config) -> int:
         # so prep failures honour the fail-fast / best-effort contract
         # and are attributed to the offending transitive identity.
         try:
-            child_config = _make_transitive_child_config(config, tp, child_work_dir)
-            # Make earlier-built transitives visible to this child's planner.
-            # Without this, a transitive whose targets reference another
-            # transitive's product (e.g. swift-navigation imports CasePaths
-            # from swift-case-paths) forces xcodebuild to compile the owning
-            # package's macros from source in the nested workspace — where
-            # swift-syntax is not resolved and the build fails. Refreshing
-            # the index from `all_entries` after each successful iteration
-            # lets the child consume already-built siblings as binaryTarget
-            # overlays, matching what the umbrella does at the end of the
-            # loop.
-            (
-                child_config.prebuilt_sibling_xcframeworks,
-                child_config.prebuilt_sibling_identities,
-            ) = _build_prebuilt_sibling_index(
-                config.output_dir, all_entries, package
-            )
-            result = _run_source_mode(child_config)
+            route_binary = (
+                tp.is_binary_only or _referenced_products_are_all_binary(tp)
+            ) and tp.origin_url and tp.head_tag
+            if route_binary:
+                # Binary-only transitive — skip the source-mode child
+                # entirely and run `_run_binary_mode` against the
+                # recovered upstream URL+tag. Saves the pre-stage
+                # copytree/prune work and lets us produce a real
+                # xcframework for packages source-mode can't service
+                # (turf-swift inside mapbox-maps-ios-binary,
+                # adjust_signature_sdk inside adjust-ios-sdk). Prebuilt
+                # siblings don't apply here — binary mode discovers
+                # artifacts via SPM's resolver, not by reading the
+                # umbrella's manifest.
+                info(
+                    f"  transitive {tp.identity!r} is binary-only — "
+                    f"routing through --binary mode against "
+                    f"{tp.origin_url} @ {tp.head_tag}"
+                )
+                child_config = _make_binary_only_transitive_child_config(
+                    config, tp, child_work_dir
+                )
+                result = _run_binary_mode(child_config)
+            else:
+                child_config = _make_transitive_child_config(config, tp, child_work_dir)
+                # Make earlier-built transitives visible to this child's planner.
+                # Without this, a transitive whose targets reference another
+                # transitive's product (e.g. swift-navigation imports CasePaths
+                # from swift-case-paths) forces xcodebuild to compile the owning
+                # package's macros from source in the nested workspace — where
+                # swift-syntax is not resolved and the build fails. Refreshing
+                # the index from `all_entries` after each successful iteration
+                # lets the child consume already-built siblings as binaryTarget
+                # overlays, matching what the umbrella does at the end of the
+                # loop.
+                (
+                    child_config.prebuilt_sibling_xcframeworks,
+                    child_config.prebuilt_sibling_identities,
+                ) = _build_prebuilt_sibling_index(
+                    config.output_dir, all_entries, package,
+                    binary_routed_identity_by_product,
+                )
+                result = _run_source_mode(child_config)
         except _USER_FACING_ERRORS as exc:
             # Mirror main()'s clean-error path: a child's Fetch / Inspect /
             # Plan / Execute / Prepare error shouldn't crash with a
@@ -14744,6 +16133,10 @@ def _run_source_mode_with_transitives(config: Config) -> int:
                 _wrap(f"Error ({phase}, transitive {tp.identity!r}): {exc}", "red"),
                 file=sys.stderr,
             )
+            if isinstance(exc, PlanError):
+                diag = scan_plan_error(str(exc))
+                if diag is not None:
+                    print(format_block(diag), file=sys.stderr)
             if config.best_effort_transitives:
                 warn(
                     f"  continuing per --best-effort-transitives; "
@@ -14764,6 +16157,13 @@ def _run_source_mode_with_transitives(config: Config) -> int:
                 continue
             return result
         all_entries.extend(child_config.collected_entries)
+        if route_binary:
+            for entry in child_config.collected_entries:
+                if entry.name.endswith(".xcframework"):
+                    prod = entry.name[: -len(".xcframework")]
+                    binary_routed_identity_by_product.setdefault(
+                        prod, tp.identity
+                    )
 
     # Build the umbrella last, as a child run so it deposits its entries
     # in the same merge bucket and skips the per-call manifest write.
@@ -14781,7 +16181,8 @@ def _run_source_mode_with_transitives(config: Config) -> int:
         config.prebuilt_sibling_xcframeworks,
         config.prebuilt_sibling_identities,
     ) = _build_prebuilt_sibling_index(
-        config.output_dir, all_entries, package
+        config.output_dir, all_entries, package,
+        binary_routed_identity_by_product,
     )
     umbrella_result = _source_mode_after_inspect(
         config, source_dir, staged_dir, package

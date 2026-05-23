@@ -431,9 +431,20 @@ def _show_dependencies(staged_dir: Path, verbose: bool) -> Optional[dict]:
 
 def _flatten_dependency_tree(tree: dict) -> dict:
     """Walk the `show-dependencies` JSON (which is recursive) and return a
-    flat dict mapping identity → checkout path string for every node
-    reachable from the root. The root itself is excluded — only its
+    flat dict mapping identity → (checkout_path, url, version) for every
+    node reachable from the root. The root itself is excluded — only its
     transitive deps appear.
+
+    `url` is the canonical upstream URL SPM resolved against (NOT the
+    local `.build/checkouts/<id>/.git/config` origin, which points at
+    SPM's intermediate `.build/repositories/<id>/` cache). `version` is
+    the resolved release string ("3.67.0" — no `v` prefix). Both fields
+    are required for the orchestrator's binary-only transitive auto-
+    switch to route through `_run_binary_mode` against the upstream
+    URL+tag. If show-dependencies omits a node's url or version (e.g.
+    revision-pinned deps where `version == "unspecified"`), that
+    entry's tuple still carries an entry but the binary-only auto-
+    switch will fall back to the source-mode child instead.
     """
     flat: dict = {}
 
@@ -444,13 +455,85 @@ def _flatten_dependency_tree(tree: dict) -> dict:
                 continue
             identity = dep.get("identity")
             path = dep.get("path")
+            url = dep.get("url")
+            version = dep.get("version")
             if isinstance(identity, str) and isinstance(path, str):
                 if identity not in flat:
-                    flat[identity] = path
+                    flat[identity] = (
+                        path,
+                        url if isinstance(url, str) else None,
+                        version if isinstance(version, str) else None,
+                    )
             walk(dep)
 
     walk(tree)
     return flat
+
+
+def _looks_remote_url(url: Optional[str]) -> bool:
+    """True for URLs we'd accept as `package_source` for binary mode.
+
+    show-dependencies sometimes echoes a local path as `url` (the root
+    package's own entry uses its on-disk path). We only want to treat a
+    transitive dep as binary-mode-routable when its URL is genuinely
+    remote — otherwise we'd loop back into the binary-only local-path
+    refusal the auto-switch was supposed to fix.
+    """
+    if not url:
+        return False
+    return (
+        url.startswith("http://")
+        or url.startswith("https://")
+        or url.startswith("git@")
+        or url.startswith("ssh://")
+    )
+
+
+def _looks_resolved_version(version: Optional[str]) -> bool:
+    """True for show-dependencies `version` values that look like a real
+    resolved release (SemVer-ish). Excludes the `"unspecified"`/`None`
+    cases (revision-pinned deps, root package, .package(name:, path:)
+    overrides) where we don't have a tag to feed `--binary` mode.
+    """
+    if not version or version == "unspecified":
+        return False
+    return True
+
+
+def _is_transitive_binary_only(
+    products: List[Product], targets: List[Target]
+) -> bool:
+    """Return True iff every non-system product in the transitive is
+    backed only by `.binaryTarget(...)` targets. Mirrors
+    `plan._package_is_binary_only` but operates directly on the
+    (products, targets) tuple Inspect already has for the transitive —
+    avoiding a transient Package construction here just to call the
+    Plan-side helper. Kept narrow on purpose; the only consumer is the
+    Inspect-time precompute that drives the orchestrator's binary-only
+    transitive auto-switch.
+    """
+    by_name = {t.name: t for t in targets}
+    binary_products = 0
+    for product in products:
+        if not product.targets:
+            # Malformed product — match the Plan-side helpers' policy
+            # of "not binary, not system" so xcodebuild surfaces the
+            # real complaint instead of us short-circuiting here.
+            return False
+        all_system = all(
+            (t := by_name.get(tn)) is not None and t.kind == TargetKind.SYSTEM
+            for tn in product.targets
+        )
+        if all_system:
+            continue
+        all_binary = all(
+            (t := by_name.get(tn)) is not None and t.kind == TargetKind.BINARY
+            for tn in product.targets
+        )
+        if not all_binary:
+            return False
+        binary_products += 1
+    return binary_products > 0
 
 
 def _discover_transitive_packages(
@@ -501,7 +584,7 @@ def _discover_transitive_packages(
                 f"not present in show-dependencies output (skipping)",
             )
             continue
-        identity, checkout_str = match
+        identity, (checkout_str, upstream_url, resolved_version) = match
         checkout_path = Path(checkout_str)
         if not (checkout_path / "Package.swift").is_file() and not any(
             checkout_path.glob("Package@swift-*.swift")
@@ -513,7 +596,7 @@ def _discover_transitive_packages(
             )
             continue
         try:
-            t_raw, t_products, _t_targets, _t_platforms, _t_name, t_tools = (
+            t_raw, t_products, t_targets, _t_platforms, _t_name, t_tools = (
                 dump_package(checkout_path)
             )
         except Exception as exc:  # noqa: BLE001 — Inspect must not crash
@@ -522,6 +605,22 @@ def _discover_transitive_packages(
                 f"  transitive: dump-package failed for {identity!r}: {exc}",
             )
             continue
+        # Precompute the binary-only flag so the orchestrator can route a
+        # binary-only transitive through `_run_binary_mode`. The URL +
+        # tag come from show-dependencies' parsed JSON (NOT the local
+        # checkout's `.git/config`, which points at SPM's bare-repo
+        # cache under `.build/repositories/<id>/` rather than the
+        # canonical upstream). Both fields are best-effort — a
+        # revision-pinned dep (`version == "unspecified"`) or a
+        # `.package(name:, path:)` override returns None for the
+        # affected field and the orchestrator falls back to the
+        # pre-staged-dir source path.
+        is_binary = _is_transitive_binary_only(t_products, t_targets)
+        binary_target_names = [
+            t.name for t in t_targets if t.kind == TargetKind.BINARY
+        ]
+        origin_url = upstream_url if _looks_remote_url(upstream_url) else None
+        head_tag = resolved_version if _looks_resolved_version(resolved_version) else None
         out.append(
             TransitivePackageInfo(
                 identity=identity,
@@ -533,6 +632,10 @@ def _discover_transitive_packages(
                 product_to_root_targets={
                     p: list(rts) for p, rts in ref_p2rt.items()
                 },
+                is_binary_only=is_binary,
+                binary_target_names=binary_target_names,
+                origin_url=origin_url,
+                head_tag=head_tag,
             )
         )
     return out

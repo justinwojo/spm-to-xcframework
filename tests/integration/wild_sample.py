@@ -76,47 +76,22 @@ class Candidate:
 # the Fetch step will fail with a clean error and that entry shows up
 # in the report as a Fetch failure — the rest of the campaign continues.
 CANDIDATES: List[Candidate] = [
-    # Apple ecosystem — well-maintained SPM canon
-    Candidate("swift-log", "https://github.com/apple/swift-log", "1.6.4",
-              notes="simple pure-Swift logging API"),
-    Candidate("swift-metrics", "https://github.com/apple/swift-metrics", "2.7.0",
-              notes="simple pure-Swift metrics API"),
+    # Apple ecosystem — kept entries are realistic binding targets. Others
+    # (swift-log, swift-metrics, swift-crypto, swift-atomics, swift-numerics,
+    # swift-algorithms, swift-protobuf, swift-nio) were dropped because every
+    # one has a first-class .NET equivalent (System.IO, Microsoft.Extensions.
+    # Logging, System.Security.Cryptography, System.Numerics, Google.Protobuf,
+    # etc.) — no .NET mobile developer would ever bind them.
     Candidate("swift-system", "https://github.com/apple/swift-system", "1.5.0",
               notes="low-level system bindings"),
-    Candidate("swift-protobuf", "https://github.com/apple/swift-protobuf", "1.32.0",
-              notes="codegen + runtime"),
-    Candidate("swift-crypto", "https://github.com/apple/swift-crypto", "4.5.0",
-              notes="crypto primitives, large graph"),
-    Candidate("swift-nio", "https://github.com/apple/swift-nio", "2.86.0",
-              notes="networking, complex multi-product graph"),
-    Candidate("swift-atomics", "https://github.com/apple/swift-atomics", "1.3.0",
-              notes="atomic primitives"),
-    Candidate("swift-numerics", "https://github.com/apple/swift-numerics", "1.0.3",
-              notes="numerics primitives"),
-    Candidate("swift-algorithms", "https://github.com/apple/swift-algorithms", "1.2.1",
-              notes="algorithms library"),
-    Candidate("swift-format", "https://github.com/apple/swift-format", "601.0.0",
-              notes="formatter + lib, build-tool plugin candidate"),
 
-    # PointFree — frequently uses macros, has deep transitive graphs
-    Candidate("swift-snapshot-testing",
-              "https://github.com/pointfreeco/swift-snapshot-testing", "1.18.7",
-              notes="snapshot testing, simple pure-Swift"),
-    Candidate("swift-perception",
-              "https://github.com/pointfreeco/swift-perception", "2.0.6",
-              notes="macros, observation backport"),
-    Candidate("combine-schedulers",
-              "https://github.com/pointfreeco/combine-schedulers", "1.0.3",
-              notes="reactive helpers"),
-    Candidate("swift-clocks",
-              "https://github.com/pointfreeco/swift-clocks", "1.0.6",
-              notes="testing-friendly clocks"),
+    # PointFree — kept the one collection-shaped lib that's a real binding
+    # candidate; dropped the devx ones (swift-perception, combine-schedulers,
+    # swift-clocks, swift-tagged) — Swift-idiomatic patterns with no .NET
+    # binding meaning.
     Candidate("swift-identified-collections",
               "https://github.com/pointfreeco/swift-identified-collections", "1.1.1",
               notes="ordered keyed collections"),
-    Candidate("swift-tagged",
-              "https://github.com/pointfreeco/swift-tagged", "0.10.0",
-              notes="newtype-like tagged values"),
 
     # Networking / common ecosystem libs
     Candidate("alamofire-image",
@@ -127,9 +102,9 @@ CANDIDATES: List[Candidate] = [
     Candidate("SDWebImage",
               "https://github.com/SDWebImage/SDWebImage", "5.21.4",
               notes="largely ObjC image library, exercises ObjC path"),
-    Candidate("swift-collections-rx",
+    Candidate("RxSwift",
               "https://github.com/ReactiveX/RxSwift", "6.9.0",
-              notes="reactive streams, large graph"),
+              notes="reactive streams, large graph; real binding candidate per Grok"),
     Candidate("PromiseKit", "https://github.com/mxcl/PromiseKit", "8.1.2",
               notes="promises, multi-product"),
     Candidate("Get", "https://github.com/kean/Get", "2.2.1",
@@ -148,9 +123,12 @@ CANDIDATES: List[Candidate] = [
               notes="charts library, complex product"),
     Candidate("Hero", "https://github.com/HeroTransitions/Hero", "1.6.4",
               notes="transition library"),
-    Candidate("SwiftUI-Introspect",
-              "https://github.com/siteline/swiftui-introspect", "1.3.0",
-              notes="SwiftUI helper, multi-product"),
+    Candidate("PanModal",
+              "https://github.com/slackhq/PanModal", "1.2.7",
+              notes="bottom sheets / presentation controllers"),
+    Candidate("IQKeyboardManager",
+              "https://github.com/hackiftekhar/IQKeyboardManager", "7.2.0",
+              notes="ObjC-heavy keyboard handling; fills ObjC coverage gap"),
     Candidate("Then", "https://github.com/devxoul/Then", "3.0.0",
               notes="tiny utility lib"),
 
@@ -158,17 +136,14 @@ CANDIDATES: List[Candidate] = [
     Candidate("CocoaLumberjack",
               "https://github.com/CocoaLumberjack/CocoaLumberjack", "3.8.5",
               notes="mixed ObjC/Swift logger"),
+    Candidate("SwiftyBeaver",
+              "https://github.com/SwiftyBeaver/SwiftyBeaver", "2.1.1",
+              notes="lightweight pure-Swift logger (Grok's pick over CocoaLumberjack)"),
 
     # Crypto
     Candidate("CryptoSwift",
               "https://github.com/krzyzanowskim/CryptoSwift", "1.8.4",
               notes="pure-Swift crypto, large module"),
-
-    # Testing
-    Candidate("Quick", "https://github.com/Quick/Quick", "7.6.2",
-              notes="BDD testing framework"),
-    Candidate("Nimble", "https://github.com/Quick/Nimble", "13.7.1",
-              notes="matchers library"),
 
     # Web / Realtime
     Candidate("Starscream",
@@ -185,12 +160,11 @@ CANDIDATES: List[Candidate] = [
     Candidate("SwiftyJSON",
               "https://github.com/SwiftyJSON/SwiftyJSON", "5.0.2",
               notes="JSON wrapper"),
+    Candidate("Yams",
+              "https://github.com/jpsim/Yams", "5.1.3",
+              notes="small/fast pure-Swift YAML canary"),
     Candidate("Files", "https://github.com/JohnSundell/Files", "4.3.0",
               notes="file system wrapper"),
-    Candidate("ShellOut", "https://github.com/JohnSundell/ShellOut", "2.3.0",
-              notes="shell wrapper, tiny lib"),
-    Candidate("Defaults", "https://github.com/sindresorhus/Defaults", "9.0.4",
-              notes="UserDefaults wrapper"),
     Candidate("KeychainAccess",
               "https://github.com/kishikawakatsumi/KeychainAccess", "4.2.2",
               notes="keychain wrapper"),
@@ -201,11 +175,105 @@ CANDIDATES: List[Candidate] = [
               notes="GraphQL client, multi-product, build-tool plugin",
               args=["--product", "Apollo"]),
 
+    # Auth / monetization
+    Candidate("RevenueCat",
+              "https://github.com/RevenueCat/purchases-ios", "5.15.0",
+              notes="in-app subscriptions; very common for mobile monetization"),
+
+    # Analytics / backend — Firebase is Grok's top MAUI binding candidate
+    Candidate("firebase-ios-sdk",
+              "https://github.com/firebase/firebase-ios-sdk", "11.13.0",
+              notes="top MAUI binding candidate; ships pre-built xcframeworks via "
+                    ".binaryTarget(url:, checksum:) — uses --binary discovery path",
+              args=["--binary", "--product", "FirebaseAnalytics"]),
+
     # Realm — known mixed Swift/ObjC, may surface known issues
     Candidate("realm-swift",
               "https://github.com/realm/realm-swift", "20.0.3",
               notes="mixed Swift/ObjC, may have binary dependencies",
               args=["--product", "RealmSwift"]),
+
+    # Auth / identity — the canonical iOS OAuth clients that .NET MAUI
+    # devs bind any time they need third-party login. Covers both the
+    # standalone (AppAuth) and the wrapper-on-top (GoogleSignIn) paths.
+    Candidate("AppAuth-iOS",
+              "https://github.com/openid/AppAuth-iOS", "2.0.0",
+              notes="OAuth/OIDC client, mixed Swift+ObjC, transitively bound by many SDKs"),
+    Candidate("GoogleSignIn-iOS",
+              "https://github.com/google/GoogleSignIn-iOS", "9.1.0",
+              notes="depends on AppAuth + GTMAppAuth — exercises multi-package external dep chain"),
+
+    # Facebook SDK — multi-product monolith (Core/Login/Share/Gaming),
+    # heavy ObjC, ships ~6 sibling library products
+    # (FacebookCore/Login/Share/Gaming/AEM/Basics). --product
+    # FacebookLogin narrows to the realistic auth-binding case (Core
+    # is implicit transitive dep). Product names use the Facebook
+    # prefix, not the FBSDK source-class prefix.
+    Candidate("facebook-ios-sdk",
+              "https://github.com/facebook/facebook-ios-sdk", "v18.0.3",
+              notes="multi-product ObjC-heavy social SDK; tests sibling-product fan-out and `--product` filtering",
+              args=["--product", "FacebookLogin"]),
+
+    # Analytics — Mixpanel + Amplitude are the two most-bound iOS
+    # analytics packages in cross-platform .NET MAUI / Xamarin
+    # codebases. Both pure-Swift but with different module shapes —
+    # Mixpanel is a single-target lib, Amplitude pulls in transitive
+    # SPM packages (AnalyticsConnector etc.).
+    Candidate("mixpanel-swift",
+              "https://github.com/mixpanel/mixpanel-swift", "v6.3.0",
+              notes="single-target pure-Swift analytics; minimal SDK baseline"),
+    Candidate("Amplitude-Swift",
+              "https://github.com/amplitude/Amplitude-Swift", "v1.18.3",
+              notes="pure-Swift analytics with transitive SPM deps (AnalyticsConnector)"),
+
+    # Push / engagement — OneSignal ships multiple `.binaryTarget`
+    # entries plus thin Swift wrapper targets in one manifest.
+    # Exercises the multi-binaryTarget-per-manifest shape that the
+    # existing firebase-ios-sdk entry (single primary binaryTarget)
+    # doesn't reach. (Grok recommendation.)
+    Candidate("OneSignal-XCFramework",
+              "https://github.com/OneSignal/OneSignal-XCFramework", "5.5.1",
+              notes="multi .binaryTarget + wrapper targets; modular binary SDK distribution"),
+
+    # Support / messaging — Intercom uses a dedicated SPM packaging
+    # repo (their primary intercom-ios repo is ~1.5 GB). Classic
+    # industry pattern: small wrapper repo holding only a Package.swift
+    # that references binary artifacts. (Grok recommendation.)
+    Candidate("intercom-ios-sp",
+              "https://github.com/intercom/intercom-ios-sp", "19.6.0",
+              notes="dedicated SPM packaging repo pattern (parent repo too large for SPM)"),
+
+    # Attribution — Branch SDK ships an SPM wrapper repo with rich
+    # target config: cSettings include paths, resources/PrivacyInfo,
+    # multiple linkerSettings, publicHeadersPath. Tests the
+    # target-modifier-rich path that pure-Swift candidates skip.
+    # (Grok recommendation.)
+    Candidate("ios-branch-sdk-spm",
+              "https://github.com/BranchMetrics/ios-branch-sdk-spm", "3.14.0",
+              notes="rich cSettings/linkerSettings/publicHeadersPath/resources target config"),
+
+    # Maps — Mapbox iOS Maps SDK as prebuilt XCFramework. Large
+    # Metal/C++ underlying SDK that ships exclusively as binary
+    # artifacts in this SPM repo. Cross-platform .NET MAUI location
+    # apps bind this directly. (Grok recommendation.)
+    Candidate("mapbox-maps-ios-binary",
+              "https://github.com/mapbox/mapbox-maps-ios-binary", "v11.24.2",
+              notes="prebuilt XCFramework distribution of Metal/C++ maps SDK; binary-only SPM shim"),
+
+    # Monetization / ads — Google AdMob via the official SPM shim
+    # repo. Top mobile ad SDK; another instance of Google's pattern
+    # of shipping SPM via dedicated wrapper repos. (Grok recommendation.)
+    Candidate("google-mobile-ads-spm",
+              "https://github.com/googleads/swift-package-manager-google-mobile-ads", "13.4.0",
+              notes="Google's SPM shim repo pattern for binary-heavy ad SDK"),
+
+    # Attribution / measurement — Adjust SDK with in-repo
+    # Package.swift (no separate shim repo). Major mobile attribution
+    # platform; another growth-stack staple .NET MAUI devs bind for
+    # cross-platform parity with Android. (Grok recommendation.)
+    Candidate("adjust-ios-sdk",
+              "https://github.com/adjust/ios_sdk", "v5.6.2",
+              notes="attribution SDK with in-repo Package.swift; platform-specific deps"),
 ]
 
 

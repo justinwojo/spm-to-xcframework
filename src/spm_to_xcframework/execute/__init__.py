@@ -23,7 +23,7 @@ from .create_xcframework import (
 )
 from .inject_clang_bridge import inject_bridge_clang_modules
 from .inject_clang_system import inject_system_clang_modules
-from .inject_objc import inject_objc_headers
+from .inject_objc import inject_objc_headers, inject_pure_swift_clang_modulemap
 from .inject_resources import inject_resource_bundles
 from .inject_swiftmodule import inject_swiftmodule
 from .rename_framework import rename_framework_bundle
@@ -36,6 +36,7 @@ __all__ = [
     "execute_source_plan",
     "inject_bridge_clang_modules",
     "inject_objc_headers",
+    "inject_pure_swift_clang_modulemap",
     "inject_resource_bundles",
     "inject_swiftmodule",
     "inject_system_clang_modules",

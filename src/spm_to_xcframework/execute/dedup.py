@@ -17,9 +17,9 @@ import os
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Sequence, Set, Tuple
 
-from ..errors import ExecuteError, PrepareUserError
+from ..errors import ExecuteError, PrepareUserError, TargetCallNotFoundError
 from ..log import info, verbose_log
-from ..model import BuildUnit, ExecutedUnit, Package, PackageSwiftEdit
+from ..model import BuildUnit, ExecutedUnit, Linkage, Package, PackageSwiftEdit, Product
 
 
 def _synth_dynamic_protected_targets(
@@ -47,6 +47,53 @@ def _synth_dynamic_protected_targets(
     for edit in edits:
         if edit.kind in ("synth_dynamic_library", "synth_library"):
             protected.update(edit.targets)
+    return protected
+
+
+def _author_explicit_linkage_protected_targets(
+    products: Iterable[Product],
+) -> Set[str]:
+    """Return every target referenced by an AUTHOR-declared library
+    product whose linkage is EXPLICIT (`.dynamic` or `.static`).
+
+    SPM's binary-only-product rule is symmetric on linkage:
+
+        "invalid type for binary product; products referencing only
+         binary targets must be executable or AUTOMATIC library
+         products"
+
+    `.automatic` is the legal sink — SPM picks the linkage at build
+    time and accepts a binary-only target list. Both `.dynamic` AND
+    `.static` are explicit-linkage products and BOTH would be rejected
+    if their target list collapsed to `.binaryTarget` entries.
+
+    Examples:
+        RxSwift 6.x: `.library(name: "RxSwift-Dynamic", type: .dynamic,
+        targets: ["RxSwift"])`. The dynamic library is the canonical
+        case and the one that surfaced in wild-sample harness
+        (2026-05-22).
+
+        Hypothetical static case: `.library(name: "FooStatic",
+        type: .static, targets: ["Foo"])`. No observed binding
+        candidate has triggered this shape yet (Grok flagged it as a
+        latent narrow gap), but the SPM rejection is identical so the
+        helper covers it for free. (Codex P1 final-review catch.)
+
+    These products never get demoted by our run — the author asked for
+    explicit linkage — so the corresponding targets stay protected
+    for the entire run. The call site keeps the returned set in a
+    frozen container and unions it in fresh on every dedup pass, so
+    the post-unit `synth_dynamic_protected.discard(t)` loop can't
+    touch it.
+
+    Planner-injected synth products are ALWAYS `.dynamic`, never
+    `.static`, so the symmetric extension changes no existing
+    behavior — it only catches the hypothetical author-static case.
+    """
+    protected: Set[str] = set()
+    for prod in products:
+        if prod.linkage in (Linkage.DYNAMIC, Linkage.STATIC):
+            protected.update(prod.targets)
     return protected
 
 
@@ -83,19 +130,38 @@ def _compute_dedup_substitutions(
          path to point at). If the sibling hasn't run yet — cycle in
          the unit graph, or filtered out of this run — leaving the
          source target alone is the safe fallback.
-      4. T is NOT currently in `synth_dynamic_protected`. The set
-         starts with every target wrapped by a planner-injected synth
-         (`synth_dynamic_library` or `synth_library`) and shrinks
-         after each synth unit finishes — `execute_source_plan`
-         demotes the now-built synth product to automatic-library
-         shape (strips `type: .dynamic`) and drops the unit's targets
-         from the set. While T is still protected (its owning synth
-         hasn't built yet), rewriting `.target(name: T)` to
-         `.binaryTarget` would leave a still-`.dynamic` product
-         pointing at a binary-only target — SPM rejects that at the
-         next manifest parse. Skipping here is the conservative
-         fallback; once protection drops, the next round's dedup
-         pass picks T up normally. (Codex round-3 High.)
+      4. T is NOT currently in `synth_dynamic_protected`. The set is
+         the UNION of two protection groups, both of which would be
+         invalidated by rewriting T to `.binaryTarget` while a
+         `.library(type: .dynamic, targets: [T])` product still
+         survives in the manifest:
+           a. Planner-injected synth dynamic libraries
+              (`synth_dynamic_library` / `synth_library` edits). This
+              group shrinks after each synth unit finishes —
+              `execute_source_plan` demotes the now-built synth
+              product to automatic-library shape (strips `type:
+              .dynamic`) and drops the unit's targets from the set.
+              Once protection drops, the next round's dedup pass
+              picks T up normally. (Codex round-3 High.)
+           b. AUTHOR-declared library products with EXPLICIT
+              linkage — `.dynamic` (e.g. RxSwift 6.x's
+              `RxSwift-Dynamic`) OR `.static` (latent narrow case,
+              not yet observed in wild-sample). These never get
+              demoted — the author asked for explicit linkage — so
+              the corresponding entries stay protected for the
+              entire run. SPM's binary-only-product rule allows
+              only executable or AUTOMATIC library products to
+              reference a binary-only target list, so both
+              `.dynamic` and `.static` author products gate dedup.
+              The call site keeps them in a frozen set and unions
+              them in fresh each call, so the post-unit shrink
+              can't touch them.
+         While T is still protected (under either rule), rewriting
+         `.target(name: T)` to `.binaryTarget` would leave a still-
+         `.dynamic` product pointing at a binary-only target — SPM
+         rejects that at the next manifest parse with "invalid type
+         for binary product." Skipping here is the conservative
+         fallback.
 
     Returned pairs are deduplicated and emitted in deterministic
     sort order (the inner loop walks `sorted(target_deps[src_t])`),
@@ -304,6 +370,58 @@ def _apply_dedup_overlap_substitutions(
     for target_name, abs_path, rel_path in rel_subs:
         try:
             new_text = edit_replace_with_binary_target(edited, target_name, rel_path)
+        except TargetCallNotFoundError as exc:
+            # The literal `.target(name: T, ...)` doesn't exist in the
+            # manifest text — most often because targets come from a
+            # factory wrapper (e.g. RxSwift's `static func rxTarget(name:,
+            # ...) -> Target`). The plan-time wrapper-signal check
+            # (`_CUSTOM_TARGET_WRAPPER_SIGNALS`) didn't flag this shape
+            # because the wrapper returns `Target`, not a custom type.
+            #
+            # Fall back to the overlay path, which doesn't need a literal
+            # call to find: it appends new entries to a sentinel-wrapped
+            # `_SPM2XC_OVERLAY_TARGETS` block and wraps `targets:` with a
+            # name-keyed `filter + concat`. Re-run from the ORIGINAL
+            # `text`, not `edited`, so we don't mix strategies on a
+            # partially-rewritten manifest.
+            verbose_log(
+                verbose,
+                f"  {unit_name}: dedup-overlap in-place rewrite couldn't "
+                f"find literal `.target(name: {target_name!r}, ...)` — "
+                f"falling back to overlay path for all {len(rel_subs)} "
+                f"sibling target(s). ({exc})",
+            )
+            delta = [(name, rel) for name, _abs, rel in rel_subs]
+            try:
+                edited_overlay = edit_inject_or_extend_overlay_binary_targets(
+                    text, delta
+                )
+            except PrepareUserError as overlay_exc:
+                raise ExecuteError(
+                    f"dedup-overlap substitution failed for unit {unit_name!r}: "
+                    f"in-place rewrite couldn't find `.target(name: "
+                    f"{target_name!r}, ...)` and overlay fallback also "
+                    f"failed: {overlay_exc}"
+                ) from overlay_exc
+            edited_overlay = edit_guard_target_loops_from_overlay(edited_overlay)
+            if edited_overlay != text:
+                manifest_path.write_text(edited_overlay)
+                applied_overlay = [
+                    f"{name} -> {abs_path.name}" for name, abs_path, _ in rel_subs
+                ]
+                info(
+                    f"  {unit_name}: dedup-overlap (overlay fallback) "
+                    f"added {len(applied_overlay)} sibling target(s) to "
+                    f"the overlay: " + ", ".join(applied_overlay)
+                )
+            else:
+                verbose_log(
+                    verbose,
+                    f"  {unit_name}: dedup-overlap (overlay fallback) "
+                    f"no-op — all {len(rel_subs)} target(s) already "
+                    f"present in the overlay",
+                )
+            return
         except PrepareUserError as exc:
             raise ExecuteError(
                 f"dedup-overlap substitution failed for unit {unit_name!r} "

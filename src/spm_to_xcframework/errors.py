@@ -58,6 +58,18 @@ class PrepareUserError(PrepareError):
     malformed manifest, etc. Surfaces as a one-line clean error."""
 
 
+class TargetCallNotFoundError(PrepareUserError):
+    """`edit_replace_with_binary_target` couldn't locate a literal
+    `.target(name: T, ...)` (or `.executableTarget`/`.testTarget`) call
+    to substitute, AND no existing `.binaryTarget(name: T, ...)` was
+    present either. Distinct from generic `PrepareUserError` so the
+    dedup-overlap router can catch it specifically and fall back to
+    the overlay branch (which doesn't require a literal call to find).
+
+    Subclass so existing `except PrepareUserError` sites still fire —
+    only the dedup-overlap router needs the narrower type."""
+
+
 class PrepareBug(PrepareError):
     """A real invariant violation inside Prepare — round-trip validator
     caught edit drift, the planner asked to edit a product Prepare

@@ -99,8 +99,19 @@ def _find_objc_headers_dir(
             return None
         target_dir = package.staged_dir / target_path
         # 1. Explicit `publicHeadersPath` always wins (the legacy contract).
-        if target.public_headers_path:
-            full_path = target_dir / target.public_headers_path
+        #    Empty string is also explicit: SPM treats `publicHeadersPath: ""`
+        #    as "the target's own root directory is the public headers
+        #    dir," which is how AppAuth-iOS ships its ObjC API (every .h
+        #    sits next to its .m at the target root with no `include/`
+        #    subdir and no umbrella header). Without this branch the
+        #    empty string is falsy in Python, so we fell through to the
+        #    implicit-layout fallback, found neither `include/` nor an
+        #    `<TargetName>.h` umbrella, and gave up — leaving AppAuth /
+        #    AppAuthCore xcframeworks with no Headers/ and Verify
+        #    rejecting them as broken ObjC frameworks.
+        if target.public_headers_path is not None:
+            rel = target.public_headers_path
+            full_path = target_dir if rel == "" else target_dir / rel
             if full_path.is_dir() and _has_h_files_recursive(full_path):
                 return full_path
             return None
@@ -299,4 +310,86 @@ def inject_objc_headers(
     _ensure_root_symlink(fw_path, "Headers")
     _ensure_root_symlink(fw_path, "Modules")
     verbose_log(verbose, f"  Injected {copied} header(s) + modulemap")
+    return True
+
+
+def inject_pure_swift_clang_modulemap(
+    *,
+    fw_path: Path,
+    fw_name: str,
+    dd_path: Path,
+    variant: str,
+    verbose: bool,
+) -> bool:
+    """For a pure-Swift framework, expose its `@objc`-bridged surface to
+    Clang `@import` consumers by synthesizing a minimal Clang modulemap
+    referencing the Swift-generated `<fw_name>-Swift.h`.
+
+    SPM builds with `BUILD_LIBRARY_FOR_DISTRIBUTION=YES` emit a
+    `<Name>.swiftmodule/<arch>.swiftinterface` but NO Clang
+    `module.modulemap` for pure-Swift targets. Swift consumers don't
+    need one (swiftc finds the framework by name + swiftmodule
+    directory), but Objective-C consumers that do `@import <Name>` or
+    `#import <Name/Name-Swift.h>` fail with `Module '<Name>' not found`
+    because Clang has no module declaration to bind. Real-world trigger:
+    GoogleSignIn-iOS's `GIDEMMSupport.h` does `@import GTMAppAuth`; with
+    no modulemap inside GTMAppAuth.framework the umbrella build fails.
+
+    No-op when:
+    - The framework already has `Modules/module.modulemap` (ObjC pass
+      already generated one, or xcodebuild emitted one for a mixed
+      target).
+    - The framework has no `Modules/*.swiftmodule/` (not a Swift
+      framework — nothing to expose).
+    - No `<fw_name>-Swift.h` is found in DerivedData (Swift target
+      exposes nothing to ObjC, so a modulemap referencing the bridge
+      header would point at a nonexistent file).
+
+    `requires objc` matches what Xcode itself emits for Swift-built
+    `module.modulemap` — the bridge header is full of `@interface` /
+    `@protocol` declarations only valid when ObjC interop is enabled.
+    """
+    content_root = _framework_content_root(fw_path)
+    modules_dir = content_root / "Modules"
+    existing_modulemap = modules_dir / "module.modulemap"
+    if existing_modulemap.is_file():
+        return False
+
+    swiftmodule_dirs = list(modules_dir.glob("*.swiftmodule")) if modules_dir.is_dir() else []
+    if not any(d.is_dir() for d in swiftmodule_dirs):
+        return False
+
+    bridge_header_name = f"{fw_name}-Swift.h"
+    bridge_header_src: Optional[Path] = None
+    if dd_path.is_dir():
+        for candidate in dd_path.rglob(bridge_header_name):
+            if candidate.is_file():
+                bridge_header_src = candidate
+                break
+    if bridge_header_src is None:
+        verbose_log(
+            verbose,
+            f"  No {bridge_header_name} in DerivedData; skipping pure-Swift "
+            f"modulemap synth ({variant})",
+        )
+        return False
+
+    headers_dir = content_root / "Headers"
+    headers_dir.mkdir(parents=True, exist_ok=True)
+    bridge_header_dest = headers_dir / bridge_header_name
+    if not bridge_header_dest.is_file():
+        shutil.copy2(bridge_header_src, bridge_header_dest)
+
+    modules_dir.mkdir(parents=True, exist_ok=True)
+    text = (
+        f"framework module {fw_name} {{\n"
+        f"  header \"{bridge_header_name}\"\n"
+        f"  requires objc\n"
+        f"}}\n"
+    )
+    existing_modulemap.write_text(text)
+
+    _ensure_root_symlink(fw_path, "Headers")
+    _ensure_root_symlink(fw_path, "Modules")
+    dim(f"  Injected pure-Swift Clang modulemap ({variant}): {fw_name}")
     return True

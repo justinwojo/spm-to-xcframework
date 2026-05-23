@@ -26,7 +26,7 @@ import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-from .errors import InspectError, PrepareBug, PrepareUserError
+from .errors import InspectError, PrepareBug, PrepareUserError, TargetCallNotFoundError
 from .inspect import dump_package
 from .log import info, success, verbose_log
 from .model import (
@@ -916,6 +916,65 @@ def edit_append_synth_product_to_package(
     )
 
 
+# Detect a file-scope `<var>.products = [` assignment — the post-init
+# mutation shape that overwrites whatever `products:` value was passed to
+# the `Package(...)` initializer. The `(?<![.\w])` lookbehind keeps us
+# from matching `self.pkg.products` or any other dotted prefix; the `\1`
+# capture gives us the variable name so we can emit a matching
+# `<var>.products.append(...)` statement.
+_POST_INIT_PRODUCTS_ASSIGN_RE = re.compile(
+    r"(?<![.\w])(\w+)\.products\s*=\s*\["
+)
+
+
+def edit_append_synth_to_post_init_products(
+    manifest_text: str, product_name: str, targets: Sequence[str]
+) -> Optional[str]:
+    """If `manifest_text` contains a file-scope `<var>.products = [...]`
+    assignment, append our synthetic dynamic library via
+    `<var>.products.append(.library(name: <product>, type: .dynamic,
+    targets: [...]))` right after the assignment. Returns the edited
+    manifest, or `None` if no such assignment exists (caller should fall
+    through to the regular add-product flow).
+
+    Why this exists: `swift package add-product` injects `products:` into
+    the `Package(...)` initializer's argument list. When the manifest
+    then overwrites `pkg.products = [...]` AFTER the initializer returns
+    (PromiseKit 8.1.2's shape), the injection is silently clobbered and
+    our synth library vanishes from `dump-package`. Detecting and
+    appending here keeps the author's product list intact AND ensures
+    our synth survives.
+
+    The LAST matching assignment wins — sequential Swift evaluation
+    means a later assignment would overwrite an earlier one, so we
+    splice past the last `<var>.products = [...]` we can find.
+    """
+    code_view = _make_code_token_view(manifest_text)
+    last_match = None
+    for m in _POST_INIT_PRODUCTS_ASSIGN_RE.finditer(code_view):
+        last_match = m
+    if last_match is None:
+        return None
+
+    var_name = last_match.group(1)
+    bracket_open = last_match.end() - 1  # points at `[`
+    bracket_close = _balanced_close(manifest_text, bracket_open)
+    if bracket_close == -1:
+        return None
+
+    insert_at = bracket_close + 1
+    if insert_at < len(manifest_text) and manifest_text[insert_at] == ";":
+        insert_at += 1
+
+    targets_list = ", ".join(_swift_string_literal(t) for t in targets)
+    append_stmt = (
+        f"\n{var_name}.products.append("
+        f".library(name: {_swift_string_literal(product_name)}, "
+        f"type: .dynamic, targets: [{targets_list}]))"
+    )
+    return manifest_text[:insert_at] + append_stmt + manifest_text[insert_at:]
+
+
 def edit_replace_with_binary_target(
     manifest_text: str, target_name: str, xcframework_path: str
 ) -> str:
@@ -954,7 +1013,13 @@ def edit_replace_with_binary_target(
     if kind_start == -1:
         if binary_present:
             return manifest_text  # already a binaryTarget; idempotent no-op
-        raise PrepareUserError(
+        # Raise the narrower TargetCallNotFoundError so the dedup-overlap
+        # router can catch it specifically and fall back to the overlay
+        # branch (manifests whose targets come from a factory wrapper like
+        # RxSwift's `static func rxTarget(...) -> Target` have no literal
+        # `.target(name: T, ...)` for us to find — the overlay path
+        # doesn't need one).
+        raise TargetCallNotFoundError(
             f"replace_with_binary_target: no `.target(name: {target_name!r}, "
             f"...)` (or .executableTarget/.testTarget) found in the manifest. "
             f"There is also no existing `.binaryTarget(name: {target_name!r}, "
@@ -1056,7 +1121,7 @@ def edit_inject_or_extend_overlay_binary_targets(
       1. First call (no sentinel block present): injects the overlay
          block immediately before the top-level `Package(...)` call AND
          wraps the `targets:` argument expression as
-         `targets: (<orig>).filter { !_SPM2XC_OVERLAY_NAMES.contains($0.name) } + _SPM2XC_OVERLAY_TARGETS`.
+         `targets: (<orig>).filter { t in !_SPM2XC_OVERLAY_NAMES.contains(where: { $0 == t.name }) } + _SPM2XC_OVERLAY_TARGETS`.
       2. Subsequent calls (sentinel block present): parses the existing
          entries, merges with `substitutions` (last-wins by target
          name), and re-renders the block in place. The `targets:`
@@ -1166,8 +1231,17 @@ def edit_inject_or_extend_overlay_binary_targets(
     line_start = manifest_text.rfind("\n", 0, pkg_open) + 1
 
     wrap_prefix = "("
+    # `.contains(where: { $0 == t.name })` — NOT `.contains(t.name)`. Under
+    # Swift 5.9+ the `Collection.contains<C: Collection>(_ other:)` overload
+    # (Self.Element == C.Element) can shadow `Set.contains(_ member:)` when
+    # the receiver expression is complex (e.g., a closure-returning array as
+    # in Nimble's targets-builder shape). The type-checker then resolves to
+    # the Collection-of-Collection overload and emits
+    # "instance method 'contains' requires the types 'String' and
+    # 'String.Element' (aka 'Character') be equivalent". `contains(where:)`
+    # has no such overload, so it stays unambiguous.
     wrap_suffix = (
-        f").filter {{ !{_OVERLAY_NAMES_VAR}.contains($0.name) }} "
+        f").filter {{ t in !{_OVERLAY_NAMES_VAR}.contains(where: {{ $0 == t.name }}) }} "
         f"+ {_OVERLAY_TARGETS_VAR}"
     )
 
@@ -1195,9 +1269,9 @@ _TARGET_LOOP_RE = re.compile(
 
 def edit_guard_target_loops_from_overlay(manifest_text: str) -> str:
     """Augment any top-level `for <var> in package.targets [where <expr>]`
-    loop with a `_SPM2XC_OVERLAY_NAMES.contains(<var>.name)` exclusion,
-    so overlay-injected binaryTargets aren't subjected to settings
-    mutations the post-loop applies to "all" non-system targets.
+    loop with a `_SPM2XC_OVERLAY_NAMES.contains(where: { $0 == <var>.name })`
+    exclusion, so overlay-injected binaryTargets aren't subjected to
+    settings mutations the post-loop applies to "all" non-system targets.
 
     Real-world trigger: swift-perception 1.6.0 ends its manifest with
 
@@ -1217,9 +1291,13 @@ def edit_guard_target_loops_from_overlay(manifest_text: str) -> str:
     Behaviour:
       - No-op if the manifest has no overlay sentinel (no overlay block
         present → nothing to guard).
-      - For each matched loop, AND `!_SPM2XC_OVERLAY_NAMES.contains(<var>.name)`
+      - For each matched loop, AND
+        `!_SPM2XC_OVERLAY_NAMES.contains(where: { $0 == <var>.name })`
         into the existing `where` clause, or insert the clause when no
-        `where` is present.
+        `where` is present. `.contains(where:)` is used (not the simpler
+        `.contains(_:)`) for the same reason as the targets-arg wrap:
+        the latter trips an overload-resolution failure under certain
+        receiver-expression shapes on Swift 5.9+.
       - Idempotent: a loop whose `where` clause already mentions
         `_SPM2XC_OVERLAY_NAMES` is left untouched.
       - Skips matches inside strings or comments (uses
@@ -1290,13 +1368,13 @@ def edit_guard_target_loops_from_overlay(manifest_text: str) -> str:
                 continue
             replacement = (
                 f"({existing_expr.strip()})"
-                f" && !{_OVERLAY_NAMES_VAR}.contains({var_name}.name)"
+                f" && !{_OVERLAY_NAMES_VAR}.contains(where: {{ $0 == {var_name}.name }})"
             )
             edits.append((where_expr_start, where_expr_end, replacement))
         else:
             insert_at = m.end()
             replacement = (
-                f" where !{_OVERLAY_NAMES_VAR}.contains({var_name}.name)"
+                f" where !{_OVERLAY_NAMES_VAR}.contains(where: {{ $0 == {var_name}.name }})"
             )
             edits.append((insert_at, insert_at, replacement))
 
@@ -2067,7 +2145,20 @@ def _depth_zero_product_calls_with_name_and_package(
                     package_val = _top_level_keyword_string_value(
                         call_span, "package"
                     )
-                    if package_val == package_identity or (
+                    # `package:` is matched case-insensitively against the
+                    # SPM-normalised identity. Manifests like Nimble's
+                    # `package: "CwlPreconditionTesting"` or Moya's
+                    # `package: "Alamofire"` carry the PascalCase package
+                    # name; the identity we plan against is the lowercased
+                    # URL last component ("cwlpreconditiontesting" /
+                    # "alamofire"). SPM accepts either spelling at resolve
+                    # time, so we mirror that here. `package_identity` is
+                    # documented as already lowercased, but call .lower()
+                    # on both sides defensively.
+                    if (
+                        package_val is not None
+                        and package_val.lower() == package_identity.lower()
+                    ) or (
                         package_val is None and package_identity == ""
                     ):
                         matches.append((i, close_idx))
@@ -2490,7 +2581,15 @@ def _depth_zero_product_calls_with_package_in_set(
                 package_val = _top_level_keyword_string_value(
                     call_span, "package"
                 )
-                if package_val is not None and package_val in package_identities:
+                # Case-insensitive match — manifests can spell `package:`
+                # with either the PascalCase name (Nimble's
+                # "CwlPreconditionTesting") or the SPM-normalised lowercase
+                # identity. `package_identities` carries the lowercased
+                # form; normalise the manifest side to match.
+                if (
+                    package_val is not None
+                    and package_val.lower() in package_identities
+                ):
                     matches.append((i, close_idx))
                 i = close_idx + 1
                 continue
@@ -2534,6 +2633,10 @@ def edit_strip_orphan_product_refs_for_identities_in_target(
     """
     if not identities:
         return manifest_text
+    # Normalise once at the boundary so `_depth_zero_product_calls_with_package_in_set`'s
+    # case-insensitive membership check works regardless of how the
+    # caller spells the identities.
+    identities_lower = {ident.lower() for ident in identities}
     kind_start, close_idx, _kind = _find_target_call_for_name(
         manifest_text, target_name
     )
@@ -2559,7 +2662,7 @@ def edit_strip_orphan_product_refs_for_identities_in_target(
     interior_start = deps_open + 1
     interior_end = deps_close
     matches = _depth_zero_product_calls_with_package_in_set(
-        body, interior_start, interior_end, identities
+        body, interior_start, interior_end, identities_lower
     )
     if not matches:
         return manifest_text
@@ -2938,6 +3041,243 @@ def edit_strip_post_init_package_mutations(manifest_text: str) -> str:
         result = result[:absorb_start] + result[absorb_end:]
 
     return result
+
+
+_TEST_TARGET_CALL_RE = re.compile(r"\.testTarget\s*\(")
+
+
+def edit_strip_test_targets(manifest_text: str) -> str:
+    """Remove every `.testTarget(...)` call from the manifest's targets
+    array, along with the trailing comma (or leading comma if it's the
+    final element).
+
+    Why strip:
+      Test targets contribute nothing to archive builds — we never run
+      `swift test`, only `xcodebuild archive` against generated schemes
+      for library products. But SPM's `swift package describe` and the
+      Xcode build setup both scan every declared target's source tree,
+      and a test target can have its own toolchain-incompatible shapes
+      that abort the whole describe call. Canonical case: amplitude's
+      analytics-connector-ios v1.3.0 declares an `AnalyticsConnectorTests`
+      test target whose Tests/AnalyticsConnectorTests dir has both Swift
+      and Objective-C sources — SPM refuses with `target ... contains
+      mixed language source files; feature not supported`, and inspect
+      bails before plan/execute ever run. Removing the test target call
+      makes describe succeed and unblocks the umbrella build that
+      doesn't care about tests in the first place.
+
+    Idempotent: re-running on already-stripped manifest is a no-op.
+
+    Code-only matching: comments and string literals are blanked via
+    `_make_code_token_view` before scanning, so a stray `.testTarget(`
+    inside a doc-comment or string literal can't false-positive.
+    """
+    code_view = _make_code_token_view(manifest_text)
+    spans_to_remove: List[Tuple[int, int]] = []
+    pos = 0
+    while True:
+        m = _TEST_TARGET_CALL_RE.search(code_view, pos)
+        if not m:
+            break
+        call_start = m.start()
+        open_idx = m.end() - 1
+        close_idx = _balanced_close(manifest_text, open_idx)
+        if close_idx == -1:
+            # Malformed manifest — let the downstream parser surface the
+            # real complaint rather than silently mutating something we
+            # don't fully understand.
+            break
+        # Extend the removal to absorb either the trailing comma (when
+        # the testTarget has siblings after it) or the leading comma
+        # (when it's the last element of the array). Without this, we
+        # leave a dangling `,` that breaks Swift array syntax.
+        remove_start = call_start
+        remove_end = close_idx + 1
+        scan = remove_end
+        while scan < len(manifest_text) and manifest_text[scan] in " \t":
+            scan += 1
+        if scan < len(manifest_text) and manifest_text[scan] == ",":
+            remove_end = scan + 1
+        else:
+            # No trailing comma — this is the last array element. Walk
+            # backward to absorb the leading comma + any whitespace
+            # between it and our call start.
+            back = call_start - 1
+            while back >= 0 and manifest_text[back] in " \t\n":
+                back -= 1
+            if back >= 0 and manifest_text[back] == ",":
+                remove_start = back
+        spans_to_remove.append((remove_start, remove_end))
+        pos = close_idx + 1
+
+    if not spans_to_remove:
+        return manifest_text
+    # Apply removals in reverse so earlier offsets remain valid.
+    out = manifest_text
+    for start, end in reversed(spans_to_remove):
+        out = out[:start] + out[end:]
+    return out
+
+
+_BINARY_TARGET_URL_LABEL_RE = re.compile(r"\burl\s*:")
+_LIBRARY_TARGETS_LIST_RE = re.compile(
+    r"\btargets\s*:\s*\[([^\[\]]*)\]", re.DOTALL
+)
+
+
+def edit_strip_unused_binary_targets(manifest_text: str) -> str:
+    """Remove every `.binaryTarget(name: X, url: ..., checksum: ...)`
+    declaration whose name X is NOT referenced by any source target's
+    dependency list, plus any `.library(...)` product whose targets list
+    is made entirely of stripped-binary-target names.
+
+    Why strip:
+      Some packages declare BOTH a source product and a URL-based binary
+      alternative of the same library (canonical: analytics-connector-ios
+      v1.3.x ships `.target("AnalyticsConnector", path: "Sources/...")`
+      AND `.binaryTarget("AnalyticsConnectorFramework", url:
+      ".../AnalyticsConnector.xcframework.zip")`). When we synth a
+      dynamic library targeting the source target and run `xcodebuild
+      archive`, SwiftPM downloads the .binaryTarget's prebuilt
+      xcframework (because the manifest still declares it) and
+      xcodebuild's archive populates `Products/.../AnalyticsConnector
+      .framework/Modules/AnalyticsConnector.swiftmodule/` from the
+      prebuilt's xcframework slice — which is named with the prebuilt's
+      target triple (e.g. `arm64-apple-tvos`) and not our iOS slice.
+      The resulting framework has zero iOS swiftinterfaces, so the
+      umbrella build's `import AnalyticsConnector` fails with `Cannot
+      find type 'AnalyticsConnector' in scope`.
+
+    Why only URL-based:
+      A `.binaryTarget(name: X, path: "Vendored.xcframework")` is a
+      local artifact bundled INTO the package source tree (no SPM
+      download). Stripping it would break any source target that
+      `dependencies: [.target(name: X)]` against the vendored library —
+      a real use case. URL-based binary targets are SPM downloads of
+      external xcframeworks; if no source target depends on them they
+      are "alternative distribution" products, safe to remove.
+
+    "Depended-on" detection: scan every non-binary target call body for
+    a quoted occurrence of the binary target name (excluding the
+    target's own `name:` field). This intentionally over-counts (e.g.
+    a target's `path: "AnalyticsConnector"` would protect a binary
+    target with the same name) — over-counting is the safe direction:
+    it just keeps the binary target where stripping is uncertain.
+
+    Idempotent: re-running on already-stripped manifest is a no-op.
+
+    Code-only matching: comments and string literals are blanked via
+    `_make_code_token_view` before scanning, so a `.binaryTarget(`
+    inside a doc-comment can't false-positive.
+    """
+    code_view = _make_code_token_view(manifest_text)
+
+    # 1. Collect URL-based binary target spans + names.
+    bin_targets: List[Tuple[int, int, str]] = []  # (start, end_exclusive, name)
+    for m in _BINARY_TARGET_CALL_RE.finditer(code_view):
+        open_idx = m.end() - 1
+        close_idx = _balanced_close(manifest_text, open_idx)
+        if close_idx == -1:
+            continue
+        body = manifest_text[open_idx + 1:close_idx]
+        flat = _flatten_to_top_level(body)
+        name_m = _TOP_LEVEL_NAME_LABEL_RE.search(flat)
+        if name_m is None:
+            continue
+        if _BINARY_TARGET_URL_LABEL_RE.search(flat) is None:
+            continue  # path-based vendored xcframework — leave alone
+        bin_targets.append((m.start(), close_idx + 1, name_m.group(1)))
+
+    if not bin_targets:
+        return manifest_text
+
+    bin_names = {name for _, _, name in bin_targets}
+
+    # 2. Walk source target calls (.target / .executableTarget). For
+    #    each, find quoted occurrences of any binary target name. If
+    #    present, that binary target is considered "depended-on" and we
+    #    leave it alone.
+    depended: set[str] = set()
+    for m in _TARGET_CALL_KIND_RE.finditer(code_view):
+        kind = m.group(1)
+        if kind == "testTarget":
+            continue  # tests are stripped separately and don't pin deps
+        open_idx = m.end() - 1
+        close_idx = _balanced_close(manifest_text, open_idx)
+        if close_idx == -1:
+            continue
+        body = manifest_text[open_idx + 1:close_idx]
+        # Exclude the target's own `name: "X"` literal from matching:
+        # collapse to a flat view of the top-level body, find name, then
+        # strip that literal from the body before scanning. Cheap
+        # heuristic — the raw body's first `name: "<name>"` match is
+        # the call's own name in every well-formed manifest.
+        flat = _flatten_to_top_level(body)
+        my_name_m = _TOP_LEVEL_NAME_LABEL_RE.search(flat)
+        my_name = my_name_m.group(1) if my_name_m else None
+        for bn in bin_names:
+            if bn == my_name:
+                continue
+            # Search the raw body for the quoted binary target name.
+            # `f'"{bn}"'` matches forms `"X"`, `byName(name: "X")`,
+            # `.target(name: "X")`, `.product(name: "X", ...)`. False
+            # positives (e.g. `path: "X"`) just keep the binary target.
+            if f'"{bn}"' in body:
+                depended.add(bn)
+
+    # 3. Strip binary targets not in the depended set.
+    targets_to_strip = [
+        (s, e, n) for s, e, n in bin_targets if n not in depended
+    ]
+    if not targets_to_strip:
+        return manifest_text
+    stripped_names = {n for _, _, n in targets_to_strip}
+
+    # 4. Find `.library(name: P, ..., targets: [...])` products whose
+    #    targets list is entirely stripped binary target names — those
+    #    products no longer have a valid backing target, so SPM will
+    #    reject the manifest unless we strip them too.
+    products_to_strip: List[Tuple[int, int]] = []
+    for m in _LIBRARY_CALL_RE.finditer(code_view):
+        open_idx = m.end() - 1
+        close_idx = _balanced_close(manifest_text, open_idx)
+        if close_idx == -1:
+            continue
+        body = manifest_text[open_idx + 1:close_idx]
+        list_m = _LIBRARY_TARGETS_LIST_RE.search(body)
+        if list_m is None:
+            continue
+        target_names = re.findall(r'"([^"\\\n]*)"', list_m.group(1))
+        if target_names and all(t in stripped_names for t in target_names):
+            products_to_strip.append((m.start(), close_idx + 1))
+
+    # 5. Compute final removal spans with comma absorption (mirrors
+    #    `edit_strip_test_targets`).
+    raw_spans: List[Tuple[int, int]] = (
+        [(s, e) for s, e, _ in targets_to_strip] + products_to_strip
+    )
+    raw_spans.sort()
+    spans_to_remove: List[Tuple[int, int]] = []
+    for call_start, call_end in raw_spans:
+        remove_start = call_start
+        remove_end = call_end
+        scan = remove_end
+        while scan < len(manifest_text) and manifest_text[scan] in " \t":
+            scan += 1
+        if scan < len(manifest_text) and manifest_text[scan] == ",":
+            remove_end = scan + 1
+        else:
+            back = call_start - 1
+            while back >= 0 and manifest_text[back] in " \t\n":
+                back -= 1
+            if back >= 0 and manifest_text[back] == ",":
+                remove_start = back
+        spans_to_remove.append((remove_start, remove_end))
+
+    out = manifest_text
+    for start, end in reversed(spans_to_remove):
+        out = out[:start] + out[end:]
+    return out
 
 
 def _find_dependencies_array_in_package_call(
@@ -3432,7 +3772,23 @@ def _apply_single_synth_edit(
     to `edit_append_synth_product_to_package`, which appends the
     synthetic entry via a `+ [...]` expression that works for both
     literal arrays and non-literal expressions.
+
+    Before either of those paths, we first check for a post-init
+    `<var>.products = [...]` assignment that would silently clobber the
+    add-product injection. PromiseKit 8.1.2 ships this shape: the
+    `Package(...)` initializer takes no `products:` argument, then
+    `pkg.products = [...]` runs at file scope and overwrites whatever
+    add-product just injected. `edit_append_synth_to_post_init_products`
+    handles that case by appending `<var>.products.append(.library(...))`
+    after the assignment.
     """
+    post_init_edited = edit_append_synth_to_post_init_products(
+        active_manifest.read_text(), product_name, targets
+    )
+    if post_init_edited is not None:
+        active_manifest.write_text(post_init_edited)
+        return
+
     try:
         _add_product_via_active_manifest_proxy(
             staged_dir, active_manifest, product_name, targets

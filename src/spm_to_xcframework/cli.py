@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from .config import Config
+from .diagnostics import format_block, scan_plan_error
 from .errors import (
     ExecuteError,
     FetchError,
@@ -370,6 +371,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # phase-specific code. No traceback. See REWRITE_DESIGN.md §7.
             phase = _phase_label_for(exc)
             print(_wrap(f"Error ({phase}): {exc}", "red"), file=sys.stderr)
+            if isinstance(exc, PlanError):
+                diag = scan_plan_error(str(exc))
+                if diag is not None:
+                    print(format_block(diag), file=sys.stderr)
             return exc.exit_code
         except _BUG_CLASS_ERRORS:
             # Tool bugs (Prepare, Verify) and uncaught exceptions deliberately
@@ -828,6 +833,119 @@ def _compute_selected_target_closure(
     return {n for n in closure if targets_by_name[n].kind == TargetKind.REGULAR}
 
 
+def _referenced_products_are_all_binary(tp) -> bool:
+    """True iff every product in `tp.referenced_products` is backed only by
+    `.binaryTarget(...)` targets within the transitive. Companion to
+    Inspect's `is_binary_only`, but scoped to the subset the umbrella
+    actually consumes — handles mixed-mode packages that ship both
+    source and binary products, where the umbrella only depends on the
+    binary side.
+
+    Canonical case: Amplitude-Swift v1.18.3 depends on AmplitudeCore-Swift,
+    a mixed package that ships AmplitudeCore (source), AmplitudeCoreNoUIKit
+    (source), AmplitudeCoreFramework (binary), and
+    AmplitudeCoreNoUIKitFramework (binary). The umbrella's target only
+    imports the binary product `AmplitudeCoreFramework`. Inspect's
+    whole-package `is_binary_only` returns False (the package has source
+    products too), so without this helper the orchestrator hands the
+    child a source-mode plan with `product_filter=[AmplitudeCoreFramework]`,
+    which the planner refuses (`Plan produced zero build units`).
+
+    Returns False when `referenced_products` is empty — we want the
+    existing source-mode path for transitives the umbrella doesn't
+    reference at all (cross-sibling discovery may attach later, but at
+    that point the expansion pass will repopulate the list).
+    """
+    if not tp.referenced_products:
+        return False
+    binary_names = set(tp.binary_target_names)
+    by_product = {p.name: p for p in tp.products}
+    for pname in tp.referenced_products:
+        prod = by_product.get(pname)
+        if prod is None or not prod.targets:
+            return False
+        if not all(tn in binary_names for tn in prod.targets):
+            return False
+    return True
+
+
+def _make_binary_only_transitive_child_config(
+    parent: Config, tp, child_work_dir: Path
+) -> Config:
+    """Build a child Config that runs `_run_binary_mode` against the
+    upstream URL+tag for a binary-only transitive.
+
+    Source mode can't service a binary-only transitive — its
+    `_package_is_binary_only` auto-switch refuses to fire from a local
+    path (we have no URL+tag to feed `--binary` mode's resolver).
+    Inspect now precomputes `is_binary_only` plus the `(origin_url,
+    head_tag)` recovered from the checkout's `.git`; when all three are
+    populated the orchestrator routes through here.
+
+    The child inherits the parent's output dir + platform flags +
+    keep-work + verbosity. `package_source` and `user_version` come
+    from the recovered git origin so Fetch's binary-resolver shim can
+    `.package(url:, exact:)` against the upstream tag instead of the
+    pre-staged dir. `product_filters` is left empty — see the body for
+    the rationale (SPM target name ≠ artifact-bundle xcframework
+    filename, so we can't reliably translate umbrella-side product
+    references into a binary-mode `--product` filter).
+
+    Asserts `tp.origin_url`/`tp.head_tag` are non-None so callers see a
+    clear failure instead of a confusing downstream FetchError if they
+    routed a non-binary-only transitive here.
+    """
+    from dataclasses import replace
+
+    assert tp.is_binary_only or _referenced_products_are_all_binary(tp), (
+        f"_make_binary_only_transitive_child_config called for transitive "
+        f"{tp.identity!r} whose neither whole package nor referenced-product "
+        f"subset is binary-only — orchestrator should have routed through "
+        f"_make_transitive_child_config instead"
+    )
+    assert tp.origin_url and tp.head_tag, (
+        f"_make_binary_only_transitive_child_config called for transitive "
+        f"{tp.identity!r} without recovered origin_url/head_tag "
+        f"(url={tp.origin_url!r}, tag={tp.head_tag!r})"
+    )
+
+    # No product filter in binary-only transitive mode. In binary mode,
+    # `--product` filters by the xcframework directory name unpacked
+    # under `.build/artifacts/`, which can differ from BOTH the umbrella's
+    # `.product(name:, package:)` symbol AND the `.binaryTarget(name:)`.
+    # Canonical case: adjust_signature_sdk declares product
+    # `AdjustSignature` backed by target `AdjustSignature` (binary), but
+    # the SPM artifact bundle unpacks to `AdjustSigSdk.xcframework` —
+    # neither the product nor the target name matches the on-disk
+    # filename. Without an authoritative mapping from SPM symbol to
+    # artifact-bundle internal filename, the safe option is to ship all
+    # xcframeworks the upstream produces (harmless file copies; binding
+    # consumers ignore unreferenced .xcframeworks).
+    return replace(
+        parent,
+        package_source=tp.origin_url,
+        user_version=tp.head_tag,
+        resolved_version=tp.head_tag,
+        product_filters=[],
+        target_filters=[],
+        revision=None,
+        include_deps=False,
+        inspect_only=False,
+        dry_run=False,
+        binary_mode=True,
+        no_transitive_products=True,
+        best_effort_transitives=False,
+        # Same rationale as _make_transitive_child_config: child runs
+        # contribute their built artifacts to the umbrella's merged
+        # manifest. binary mode is independent of dedup-overlap, but
+        # leave the flag flipped to match the source-mode child's shape.
+        no_dedup_overlap=True,
+        child_run=True,
+        collected_entries=[],
+        work_dir=child_work_dir,
+    )
+
+
 def _make_transitive_child_config(parent: Config, tp, child_work_dir: Path) -> Config:
     """Build a child Config for a transitive checkout.
 
@@ -935,6 +1053,7 @@ def _build_prebuilt_sibling_index(
     output_dir: Path,
     entries: Sequence["ManifestEntry"],
     package: "Package",
+    binary_routed_identity_by_product: Optional[Dict[str, str]] = None,
 ) -> Tuple[Dict[str, Path], Dict[str, str]]:
     """Build the two indexes the umbrella's planner consumes via
     `Config.prebuilt_sibling_xcframeworks` and
@@ -999,6 +1118,26 @@ def _build_prebuilt_sibling_index(
         if not xcfx.exists():
             continue
         paths[prod] = xcfx
+
+    # Layer in identities recovered from binary-mode transitive routing.
+    # When a transitive is binary-only (whole-package or
+    # referenced-subset binary-only) we route it through `_run_binary_mode`
+    # against the upstream URL, and the unpacked xcframework's on-disk
+    # basename frequently differs from the SPM product name the umbrella
+    # references (Adjust's `.binaryTarget(name: AdjustSignature, url:
+    # .../AdjustSigSdk.zip)`, Amplitude's `.binaryTarget(name:
+    # AmplitudeCoreFramework, url: .../AmplitudeCore.zip)`). Without this
+    # layer the basename-keyed `paths` entry has no companion `identities`
+    # entry, Prepare treats the sibling as `(unknown package)`, and the
+    # original `.package(url:)` dep never gets stripped — xcodebuild
+    # then aborts with `multiple packages ... declare targets with a
+    # conflicting name`. Trust the orchestrator's mapping (it knows the
+    # transitive identity that produced each child entry) over the
+    # `referenced_products` lookup above for these basenames.
+    if binary_routed_identity_by_product:
+        for prod, ident in binary_routed_identity_by_product.items():
+            if prod in paths:
+                identities[prod] = ident
 
     # Drop identities for products that aren't actually in `paths` (no
     # corresponding xcframework on disk) — keeps the two indexes
@@ -1298,6 +1437,13 @@ def _run_source_mode_with_transitives(config: Config) -> int:
 
     old_manifest = _read_output_manifest(config.output_dir)
     all_entries: List[ManifestEntry] = []
+    # For binary-routed transitives, on-disk xcframework basenames can
+    # differ from the SPM product name the umbrella references (Amplitude's
+    # AmplitudeCoreFramework → AmplitudeCore.xcframework). Track basename →
+    # transitive_identity so `_build_prebuilt_sibling_index` can tag those
+    # consumed siblings with their owning package, letting Prepare strip
+    # the now-redundant `.package(url: …)` dep from the umbrella manifest.
+    binary_routed_identity_by_product: Dict[str, str] = {}
     # Seed `visited` with the root's own identity computed the same way
     # `_collect_referenced_package_products` keys its entries — by SPM
     # identity. `_identity_from_url` mirrors SPM's normalisation (last URL
@@ -1337,24 +1483,49 @@ def _run_source_mode_with_transitives(config: Config) -> int:
         # so prep failures honour the fail-fast / best-effort contract
         # and are attributed to the offending transitive identity.
         try:
-            child_config = _make_transitive_child_config(config, tp, child_work_dir)
-            # Make earlier-built transitives visible to this child's planner.
-            # Without this, a transitive whose targets reference another
-            # transitive's product (e.g. swift-navigation imports CasePaths
-            # from swift-case-paths) forces xcodebuild to compile the owning
-            # package's macros from source in the nested workspace — where
-            # swift-syntax is not resolved and the build fails. Refreshing
-            # the index from `all_entries` after each successful iteration
-            # lets the child consume already-built siblings as binaryTarget
-            # overlays, matching what the umbrella does at the end of the
-            # loop.
-            (
-                child_config.prebuilt_sibling_xcframeworks,
-                child_config.prebuilt_sibling_identities,
-            ) = _build_prebuilt_sibling_index(
-                config.output_dir, all_entries, package
-            )
-            result = _run_source_mode(child_config)
+            route_binary = (
+                tp.is_binary_only or _referenced_products_are_all_binary(tp)
+            ) and tp.origin_url and tp.head_tag
+            if route_binary:
+                # Binary-only transitive — skip the source-mode child
+                # entirely and run `_run_binary_mode` against the
+                # recovered upstream URL+tag. Saves the pre-stage
+                # copytree/prune work and lets us produce a real
+                # xcframework for packages source-mode can't service
+                # (turf-swift inside mapbox-maps-ios-binary,
+                # adjust_signature_sdk inside adjust-ios-sdk). Prebuilt
+                # siblings don't apply here — binary mode discovers
+                # artifacts via SPM's resolver, not by reading the
+                # umbrella's manifest.
+                info(
+                    f"  transitive {tp.identity!r} is binary-only — "
+                    f"routing through --binary mode against "
+                    f"{tp.origin_url} @ {tp.head_tag}"
+                )
+                child_config = _make_binary_only_transitive_child_config(
+                    config, tp, child_work_dir
+                )
+                result = _run_binary_mode(child_config)
+            else:
+                child_config = _make_transitive_child_config(config, tp, child_work_dir)
+                # Make earlier-built transitives visible to this child's planner.
+                # Without this, a transitive whose targets reference another
+                # transitive's product (e.g. swift-navigation imports CasePaths
+                # from swift-case-paths) forces xcodebuild to compile the owning
+                # package's macros from source in the nested workspace — where
+                # swift-syntax is not resolved and the build fails. Refreshing
+                # the index from `all_entries` after each successful iteration
+                # lets the child consume already-built siblings as binaryTarget
+                # overlays, matching what the umbrella does at the end of the
+                # loop.
+                (
+                    child_config.prebuilt_sibling_xcframeworks,
+                    child_config.prebuilt_sibling_identities,
+                ) = _build_prebuilt_sibling_index(
+                    config.output_dir, all_entries, package,
+                    binary_routed_identity_by_product,
+                )
+                result = _run_source_mode(child_config)
         except _USER_FACING_ERRORS as exc:
             # Mirror main()'s clean-error path: a child's Fetch / Inspect /
             # Plan / Execute / Prepare error shouldn't crash with a
@@ -1365,6 +1536,10 @@ def _run_source_mode_with_transitives(config: Config) -> int:
                 _wrap(f"Error ({phase}, transitive {tp.identity!r}): {exc}", "red"),
                 file=sys.stderr,
             )
+            if isinstance(exc, PlanError):
+                diag = scan_plan_error(str(exc))
+                if diag is not None:
+                    print(format_block(diag), file=sys.stderr)
             if config.best_effort_transitives:
                 warn(
                     f"  continuing per --best-effort-transitives; "
@@ -1385,6 +1560,13 @@ def _run_source_mode_with_transitives(config: Config) -> int:
                 continue
             return result
         all_entries.extend(child_config.collected_entries)
+        if route_binary:
+            for entry in child_config.collected_entries:
+                if entry.name.endswith(".xcframework"):
+                    prod = entry.name[: -len(".xcframework")]
+                    binary_routed_identity_by_product.setdefault(
+                        prod, tp.identity
+                    )
 
     # Build the umbrella last, as a child run so it deposits its entries
     # in the same merge bucket and skips the per-call manifest write.
@@ -1402,7 +1584,8 @@ def _run_source_mode_with_transitives(config: Config) -> int:
         config.prebuilt_sibling_xcframeworks,
         config.prebuilt_sibling_identities,
     ) = _build_prebuilt_sibling_index(
-        config.output_dir, all_entries, package
+        config.output_dir, all_entries, package,
+        binary_routed_identity_by_product,
     )
     umbrella_result = _source_mode_after_inspect(
         config, source_dir, staged_dir, package

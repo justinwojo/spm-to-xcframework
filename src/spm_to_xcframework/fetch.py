@@ -17,7 +17,7 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import List, Sequence, Tuple
+from typing import List, Sequence, Set, Tuple
 
 from .config import Config
 from .errors import FetchError, InspectError
@@ -39,6 +39,19 @@ TOXIC_NAMES = {
     "node_modules",
 }
 TOXIC_SUFFIXES = (".xcodeproj", ".xcworkspace")
+
+
+def _is_path_under(child: Path, parent: Path) -> bool:
+    """True iff `child` is `parent` or a descendant. Pure lexical
+    comparison — no filesystem access — and tolerates `Path(".")` as
+    a parent (which `PurePath.parts == ()`). Used by the staging
+    exclude-pass to refuse to delete a path that another target's
+    `path:` directive points into."""
+    if child == parent:
+        return True
+    if parent.parts == ():
+        return True
+    return child.parts[: len(parent.parts)] == parent.parts
 
 
 def _is_toxic_entry(name: str) -> bool:
@@ -64,6 +77,17 @@ def _git(args: Sequence[str], **kwargs) -> subprocess.CompletedProcess:
 # Allowed remote URL prefixes. Local filesystem paths are accepted
 # separately (they must resolve to an existing directory).
 _REMOTE_URL_PREFIXES = ("http://", "https://", "git@", "ssh://")
+
+# SPM manifest filenames at the root of a staged package. Used by the
+# exclude-list staging pass to refuse to delete the active manifest.
+# Realm 20.0.3 (and similar packages with `path: "."` targets) excludes
+# `Package.swift` from compilation — the exclude list is SPM's source-set
+# filter, NOT a filesystem-deletion list. Deleting the root manifest
+# breaks `swift package resolve` two lines later. Matches both the
+# canonical `Package.swift` and version-specific shapes that SPM accepts
+# (`Package@swift-5.swift`, `Package@swift-5.5.swift`).
+_ROOT_MANIFEST_RE = re.compile(r"^Package(?:@swift-\d+(?:\.\d+)?)?\.swift$")
+
 
 # Permissive but bounded tag pattern: letters, digits, dots, hyphens,
 # underscores, plus signs, and slashes (for `refs/heads/...`-style tags
@@ -343,6 +367,64 @@ def stage_source(config: Config, source_dir: Path) -> Path:
             "the manifest. This is a bug in spm-to-xcframework."
         )
 
+    # Pass 1.5: strip `.testTarget(...)` declarations from every staged
+    # manifest variant. Test targets contribute nothing to archive
+    # builds (we never run `swift test`), but they can be the SOLE
+    # reason SPM's `swift package describe` rejects an otherwise-fine
+    # package — analytics-connector-ios v1.3.0 declares an
+    # `AnalyticsConnectorTests` target whose source dir mixes Swift +
+    # Objective-C, and SPM aborts describe with `target ... contains
+    # mixed language source files; feature not supported` before plan
+    # or execute can run. Stripping at stage time lets us materialize a
+    # working xcframework for the library product even when the
+    # package's test-target shape would otherwise be fatal.
+    #
+    # Apply to every Package@swift-X.Y variant under the root, since
+    # SPM picks the active manifest based on the toolchain version and
+    # our edit needs to cover whichever one actually gets read.
+    from .prepare import (
+        edit_strip_test_targets,
+        edit_strip_unused_binary_targets,
+    )
+    for manifest_path in sorted(staged_dir.glob("Package*.swift")):
+        if not manifest_path.is_file():
+            continue
+        try:
+            original_text = manifest_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        stripped = edit_strip_test_targets(original_text)
+        if stripped != original_text:
+            manifest_path.write_text(stripped, encoding="utf-8")
+            verbose_log(
+                config.verbose,
+                f"  stage: stripped .testTarget(...) declaration(s) from "
+                f"{manifest_path.name}",
+            )
+            original_text = stripped
+        # Strip URL-based `.binaryTarget(...)` declarations whose name
+        # isn't referenced by any source target. When a package ships
+        # a source target alongside an "alternative binary distribution"
+        # of the same library (analytics-connector-ios v1.3.x:
+        # `.target("AnalyticsConnector")` + `.binaryTarget(name:
+        # "AnalyticsConnectorFramework", url: "...AnalyticsConnector
+        # .xcframework.zip")`), the prebuilt xcframework's slices get
+        # unpacked by SPM at resolve time and xcodebuild archive
+        # populates Products/.../AnalyticsConnector.framework/Modules/
+        # from the prebuilt instead of our fresh source compile — so
+        # the resulting framework ends up with the upstream's target-
+        # triple-named swiftinterfaces (e.g. arm64-apple-tvos) and the
+        # iOS umbrella build can't `import AnalyticsConnector` because
+        # there's no iOS swiftinterface inside.
+        stripped = edit_strip_unused_binary_targets(original_text)
+        if stripped != original_text:
+            manifest_path.write_text(stripped, encoding="utf-8")
+            verbose_log(
+                config.verbose,
+                f"  stage: stripped unused URL-based .binaryTarget(...) "
+                f"declaration(s) from {manifest_path.name}",
+            )
+
     # Pass 2: drop the package's own `exclude:` paths. We do this best-effort
     # — failure to dump-package here is the inspect phase's job to surface,
     # not ours. The exclude pass is purely a hygiene measure (it stops
@@ -355,6 +437,50 @@ def stage_source(config: Config, source_dir: Path) -> Path:
         # the staged tree as-is.
         return staged_dir
 
+    # Pre-compute every target's effective source root as a relative-to-
+    # staged-dir Path. Used below to refuse to delete an exclude path
+    # that overlaps with another target's `path:` directive (e.g. Realm
+    # 20.0.3's `Realm` target excludes `"RealmSwift"`, `"Realm/TestUtils"`,
+    # `"Realm/Tests"` — the path directives of three sibling targets in
+    # the same package). Deleting any of those breaks the sibling
+    # target's source enumeration the next time SPM walks the package.
+    sibling_target_paths: Set[Path] = set()
+    for tgt in dump.get("targets", []):
+        tp = tgt.get("path") or _default_target_path(
+            tgt.get("name", ""), tgt.get("type", "")
+        )
+        if not tp or tp == ".":
+            continue
+        sibling_target_paths.add(Path(tp))
+
+    # Pre-compute every target's effective publicHeadersPath as a
+    # relative-to-staged-dir Path. Same conceptual hazard as the
+    # sibling-target paths above — Realm 20.0.3 declares
+    # `publicHeadersPath: "include"` for its `Realm` target AND lists
+    # `"include"` in that same target's `exclude:`. SPM tolerates the
+    # apparent contradiction (the exclude is a source-set filter; the
+    # dir physically exists in the repo and is reachable as headers).
+    # Pass 2 must mirror that: refuse to delete a path that is — or
+    # contains — any target's publicHeadersPath, including the target's
+    # own. If we delete it, SPM fails at the next dump-package with
+    # "public headers directory path for 'X' is invalid or not
+    # contained in the target."
+    target_public_headers_paths: Set[Path] = set()
+    for tgt in dump.get("targets", []):
+        ph = tgt.get("publicHeadersPath")
+        if not isinstance(ph, str) or not ph:
+            continue
+        tp = tgt.get("path") or _default_target_path(
+            tgt.get("name", ""), tgt.get("type", "")
+        )
+        if not tp:
+            continue
+        # publicHeadersPath is documented as relative to the target's
+        # path directive. `Path(".") / "include"` collapses to
+        # `include`, which is what we want for `path: "."` + `ph:
+        # "include"` (Realm's exact shape).
+        target_public_headers_paths.add(Path(tp) / ph)
+
     removed_count = 0
     for tgt in dump.get("targets", []):
         target_path_str = tgt.get("path") or _default_target_path(
@@ -362,6 +488,7 @@ def stage_source(config: Config, source_dir: Path) -> Path:
         )
         if not target_path_str:
             continue
+        own_path = Path(target_path_str)
         for ex in tgt.get("exclude", []) or []:
             ex_rel = Path(target_path_str) / ex
             # Lexical containment check: refuse anything that escapes
@@ -378,6 +505,55 @@ def stage_source(config: Config, source_dir: Path) -> Path:
             except (TypeError, ValueError):
                 continue
             ex_path = staged_dir / ex_rel
+            # Refuse to delete the staged package's own root manifest.
+            # Some packages (e.g. realm-swift 20.0.3) declare a target
+            # with `path: "."` and exclude `Package.swift` from
+            # compilation — the exclude list is a source-set filter,
+            # not a filesystem-deletion list. Only the ROOT manifest is
+            # protected: a vendored sub-package's nested Package.swift
+            # at a deeper path can still be excluded by the host (its
+            # parent isn't staged_dir).
+            if (
+                ex_path.parent == staged_dir
+                and _ROOT_MANIFEST_RE.match(ex_path.name)
+            ):
+                continue
+            # Refuse to delete any path that is itself the `path:` of
+            # another target in the same package, OR a parent directory
+            # of such a path. Same conceptual fix as the root-manifest
+            # guard: the exclude list is a source-set filter (this
+            # target says "don't compile X"), but X may be a *sibling*
+            # target's source root, in which case deleting it breaks
+            # the sibling. Realm 20.0.3's `Realm` target excludes
+            # `"RealmSwift"`, `"Realm/Tests"`, `"Realm/TestUtils"` —
+            # the path directives of three sibling targets in the
+            # same package.
+            if any(
+                op == ex_rel
+                or _is_path_under(op, ex_rel)
+                or _is_path_under(ex_rel, op)
+                for op in sibling_target_paths
+                if op != own_path
+            ):
+                continue
+            # Refuse to delete any path that is — or contains, or is
+            # contained by — ANY target's publicHeadersPath, including
+            # the current target's. Realm 20.0.3 lists `"include"` in
+            # the `Realm` target's exclude AND declares
+            # `publicHeadersPath: "include"` for the same target;
+            # deleting the dir breaks SPM's next dump-package with
+            # "public headers directory path for 'Realm' is invalid
+            # or not contained in the target." Same bidirectional
+            # containment shape as the sibling-target guard above.
+            # (Codex P2 bidirectional pattern — applied symmetrically
+            # here from the outset.)
+            if any(
+                ph == ex_rel
+                or _is_path_under(ph, ex_rel)
+                or _is_path_under(ex_rel, ph)
+                for ph in target_public_headers_paths
+            ):
+                continue
             if ex_path.is_symlink():
                 # Drop the link, not its target.
                 ex_path.unlink()
