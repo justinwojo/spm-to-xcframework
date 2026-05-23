@@ -3046,10 +3046,51 @@ def edit_strip_post_init_package_mutations(manifest_text: str) -> str:
 _TEST_TARGET_CALL_RE = re.compile(r"\.testTarget\s*\(")
 
 
+def _is_array_element_context(code_view: str, call_start: int) -> bool:
+    """Return True if the call at `call_start` is a direct element of an
+    array literal — i.e. the preceding non-whitespace character is `[`
+    (first element) or `,` (sibling element).
+
+    A `.testTarget(...)` that appears in any other context — assigned to
+    a variable (`let x: Target = .testTarget(...)`), returned from a
+    function (`return Target.testTarget(...)`), or any other expression
+    position — must NOT be stripped: removing the call body leaves a
+    dangling `=` / `return Target` / etc. that fails
+    `swift package dump-package` with a syntax error.
+
+    Canonical cases that motivated this check:
+      - SQLite.swift 0.15.5: `let testTarget: Target = .testTarget(...)`
+        used as a hoisted binding in `targets: [target, testTarget]`.
+      - swift-collections (transitive): `return Target.testTarget(...)`
+        inside a `toTarget()` helper on a custom enum.
+
+    Stripping only direct array elements preserves the intent (kill
+    test targets that SPM's describe-call scans for source layout)
+    without breaking valid but uncommon expression contexts. A test
+    target hidden inside a helper that's actually invoked from the
+    `targets:` array IS missed by this scope check — a documented
+    gap, since detecting it requires data-flow analysis. If a future
+    package surfaces this shape, the rescue is the per-target
+    auto-recovery in `prepare.py` (rebuilds the manifest from
+    inspected sources) rather than widening the regex.
+    """
+    i = call_start - 1
+    # Use .isspace() rather than a literal " \t\n" set so CRLF
+    # manifests don't drop us at `\r` and false-negative the context
+    # check. (Codex review.)
+    while i >= 0 and code_view[i].isspace():
+        i -= 1
+    return i >= 0 and code_view[i] in "[,"
+
+
 def edit_strip_test_targets(manifest_text: str) -> str:
-    """Remove every `.testTarget(...)` call from the manifest's targets
-    array, along with the trailing comma (or leading comma if it's the
-    final element).
+    """Remove every `.testTarget(...)` call that is a direct element of
+    the manifest's targets array, along with the trailing comma (or
+    leading comma if it's the final element).
+
+    Scope: only direct array elements are stripped — see
+    `_is_array_element_context` for why we deliberately skip calls in
+    let-bindings, return statements, and other expression contexts.
 
     Why strip:
       Test targets contribute nothing to archive builds — we never run
@@ -3087,6 +3128,11 @@ def edit_strip_test_targets(manifest_text: str) -> str:
             # real complaint rather than silently mutating something we
             # don't fully understand.
             break
+        if not _is_array_element_context(code_view, call_start):
+            # Not a direct array element — stripping would leave dangling
+            # syntax (e.g. `let x: Target = ` or `return Target`).
+            pos = close_idx + 1
+            continue
         # Extend the removal to absorb either the trailing comma (when
         # the testTarget has siblings after it) or the leading comma
         # (when it's the last element of the array). Without this, we
@@ -3198,6 +3244,7 @@ def edit_strip_unused_binary_targets(manifest_text: str) -> str:
     #    present, that binary target is considered "depended-on" and we
     #    leave it alone.
     depended: set[str] = set()
+    source_target_count = 0
     for m in _TARGET_CALL_KIND_RE.finditer(code_view):
         kind = m.group(1)
         if kind == "testTarget":
@@ -3206,6 +3253,17 @@ def edit_strip_unused_binary_targets(manifest_text: str) -> str:
         close_idx = _balanced_close(manifest_text, open_idx)
         if close_idx == -1:
             continue
+        # Only count calls that are direct array elements of `targets:`.
+        # Excludes helper expressions like `let helper: Target = .target(...)`
+        # or `private func mkTarget() -> Target { .target(...) }` whose
+        # presence would falsely inflate the count and defeat the
+        # pure-binary bail-out below. The depended-name walk over `body`
+        # still runs for context — false positives there just preserve a
+        # binary target, which is the safe direction.
+        m_call_start = m.start()
+        is_array_element = _is_array_element_context(code_view, m_call_start)
+        if is_array_element:
+            source_target_count += 1
         body = manifest_text[open_idx + 1:close_idx]
         # Exclude the target's own `name: "X"` literal from matching:
         # collapse to a flat view of the top-level body, find name, then
@@ -3224,6 +3282,18 @@ def edit_strip_unused_binary_targets(manifest_text: str) -> str:
             # positives (e.g. `path: "X"`) just keep the binary target.
             if f'"{bn}"' in body:
                 depended.add(bn)
+
+    # Bail out when there are zero source targets: the strip's purpose
+    # is to delete an "alternative binary distribution" that competes
+    # with a source target of the same library (analytics-connector-
+    # ios pattern). A package with ONLY `.binaryTarget(...)` and no
+    # source target is the canonical "SPM wrapper around a vendor
+    # xcframework" shape (intercom-ios-sp, mapbox-maps-ios-binary).
+    # Leaving the binary in place lets the binary-only auto-switch in
+    # cli.py see the package as binary-only and route it through
+    # --binary mode.
+    if source_target_count == 0:
+        return manifest_text
 
     # 3. Strip binary targets not in the depended set.
     targets_to_strip = [

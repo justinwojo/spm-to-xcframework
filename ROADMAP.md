@@ -112,7 +112,7 @@ Risk: low, but cost ($5–8/run) means defer until matrix has been green for a f
 
 ### Homebrew distribution
 
-User has flagged this as explicitly last priority. Distributes the existing single-file build artifact via a tap. Probably one afternoon of work once we're ready.
+User has flagged this as explicitly last priority. Distributes the existing single-file build artifact via a tap. Probably one afternoon of work once we're ready. Step-by-step plan + open decisions captured in [HOMEBREW.md](HOMEBREW.md).
 
 Risk: low. Mechanical.
 

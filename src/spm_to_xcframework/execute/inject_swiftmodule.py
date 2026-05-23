@@ -77,6 +77,19 @@ def _strip_self_module_qualifier_from_swiftinterface(
     (Swift issue #56573 / SR-14195; canonical packages: mixpanel-swift's
     `JSON.JSON`, analytics-connector-ios's `AnalyticsConnector.AnalyticsConnector`).
 
+    Gated on shadowing detection: the strip is only safe (and only
+    needed) when the module HAS a top-level type whose name equals
+    the module name. Without that shadowing type, `M.X` is just a
+    redundant qualifier — but if the interface contains a legitimate
+    super-class reference like `class Observer : ReactiveSwift.Observer<Value, Error>`
+    inside `extension Signal { ... }`, stripping `ReactiveSwift.`
+    yields `class Observer : Observer<...>`, which resolves to
+    `Signal.Observer` (the class being defined) and produces
+    `'Observer' inherits from itself` at archive time
+    (ReactiveSwift 6.x → Moya 15.x). The shadow-presence check below
+    is a substring scan for `(class|struct|enum|protocol|actor) M`
+    declarations; absence means no shadow, so skip.
+
     Scope:
     - Substitution runs over the code-only view of the swiftinterface so
       comments (`//` lines including the `swift-module-flags` header,
@@ -95,6 +108,22 @@ def _strip_self_module_qualifier_from_swiftinterface(
     """
     from ..prepare import _make_code_token_view
     code_view = _make_code_token_view(text)
+    # Shadow-presence gate. Only fire the strip when the swiftinterface
+    # declares a type whose name equals the module name — that's the
+    # ONLY situation where the SR-14195 / Module.Self compiler bug
+    # actually manifests on re-parse. Without the shadow, every `M.X`
+    # is just a qualifier that the compiler resolves correctly, AND
+    # stripping it can corrupt legitimate super-class references where
+    # `M.X` is required to disambiguate from a same-named nested
+    # type in surrounding scope (ReactiveSwift.Observer inside
+    # `extension Signal { class Observer : ReactiveSwift.Observer<...> }`).
+    shadow_pattern = re.compile(
+        r"(?:class|struct|enum|protocol|actor)\s+"
+        + re.escape(module_name)
+        + r"\b"
+    )
+    if shadow_pattern.search(code_view) is None:
+        return text
     pattern = re.compile(
         r"(?<![\w.])" + re.escape(module_name) + r"\.(?=[A-Z_])"
     )

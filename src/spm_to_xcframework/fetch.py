@@ -17,7 +17,7 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import List, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from .config import Config
 from .errors import FetchError, InspectError
@@ -52,6 +52,53 @@ def _is_path_under(child: Path, parent: Path) -> bool:
     if parent.parts == ():
         return True
     return child.parts[: len(parent.parts)] == parent.parts
+
+
+def _readlink_into_staged(staged_dir: Path, rel_path: Path) -> Optional[Path]:
+    """If `staged_dir / rel_path` is a symlink whose target stays inside
+    `staged_dir`, return the resolved location as a path relative to
+    `staged_dir`. Otherwise return `None`.
+
+    Used by the exclude-pass to detect when a sibling target's `path:`
+    points at the same physical directory as a different target via a
+    symlink at the package root. Canonical case: RevenueCat 5.x ships
+    a root-level `LocalReceiptParsing -> Sources/LocalReceiptParsing`
+    symlink; the `ReceiptParser` target uses `path: "LocalReceiptParsing"`
+    while the `RevenueCat` target uses `path: "Sources"` and excludes
+    `LocalReceiptParsing/ReceiptParser-only-files` — the two paths refer
+    to the same physical source root, but a lexical `_is_path_under`
+    check misses the overlap because the strings don't share a prefix.
+
+    Single-level readlink only — chains rare in real packages and
+    following them risks runaway resolution. The target must be a
+    relative path that, after joining with the symlink's parent and
+    normalizing, still falls inside the staged tree; absolute targets
+    or `..`-escapes return None.
+    """
+    # Defensive guard on the INPUT path: `staged_dir / absolute_path`
+    # silently ignores staged_dir, so an absolute or escape-y rel_path
+    # would let us lstat/readlink outside the staged tree on bad
+    # manifest data. Reject before touching the filesystem. (Codex P3.)
+    if rel_path.is_absolute() or ".." in rel_path.parts:
+        return None
+    abs_link = staged_dir / rel_path
+    if not abs_link.is_symlink():
+        return None
+    try:
+        link_dst = os.readlink(str(abs_link))
+    except OSError:
+        return None
+    if os.path.isabs(link_dst):
+        return None
+    # Join with the symlink's parent dir, then normpath to collapse
+    # `.` and `..`. We don't call .resolve(): chasing chains could
+    # escape the staged tree on pathological inputs.
+    joined = os.path.normpath(str(abs_link.parent / link_dst))
+    staged_str = str(staged_dir)
+    if not (joined == staged_str or joined.startswith(staged_str + os.sep)):
+        return None
+    rel_str = joined[len(staged_str) + 1:] if joined != staged_str else "."
+    return Path(rel_str)
 
 
 def _is_toxic_entry(name: str) -> bool:
@@ -437,21 +484,44 @@ def stage_source(config: Config, source_dir: Path) -> Path:
         # the staged tree as-is.
         return staged_dir
 
-    # Pre-compute every target's effective source root as a relative-to-
-    # staged-dir Path. Used below to refuse to delete an exclude path
-    # that overlaps with another target's `path:` directive (e.g. Realm
-    # 20.0.3's `Realm` target excludes `"RealmSwift"`, `"Realm/TestUtils"`,
-    # `"Realm/Tests"` — the path directives of three sibling targets in
-    # the same package). Deleting any of those breaks the sibling
-    # target's source enumeration the next time SPM walks the package.
-    sibling_target_paths: Set[Path] = set()
+    # Pre-compute every target's effective source root(s) as relative-
+    # to-staged-dir Paths, keyed by target name. Used below to refuse
+    # to delete an exclude path that overlaps with ANOTHER target's
+    # `path:` directive (e.g. Realm 20.0.3's `Realm` target excludes
+    # `"RealmSwift"`, `"Realm/TestUtils"`, `"Realm/Tests"` — the path
+    # directives of three sibling targets in the same package).
+    # Deleting any of those breaks the sibling target's source
+    # enumeration the next time SPM walks the package.
+    #
+    # Per-name (not flat) because the sibling guard must exclude the
+    # CURRENT target by IDENTITY, not by path value. RevenueCat 5.x
+    # ships `RevenueCat_CustomEntitlementComputation` with
+    # `path: "CustomEntitlementComputation"` (root-level symlink to
+    # `Sources/`) alongside `RevenueCat` with `path: "Sources"`. Both
+    # resolved/declared sets contain `Sources`. A flat set would force
+    # us to either skip `Sources` (losing the protection that
+    # `RevenueCat` is a real sibling claiming that root) or not skip
+    # it (failing the trivial-self-overlap case where the current
+    # target's own resolved root would block all its excludes). The
+    # by-name dict keeps owner identity attached to each path.
+    sibling_target_paths_by_name: Dict[str, Set[Path]] = {}
     for tgt in dump.get("targets", []):
-        tp = tgt.get("path") or _default_target_path(
-            tgt.get("name", ""), tgt.get("type", "")
-        )
+        name = tgt.get("name", "")
+        if not name:
+            continue
+        tp = tgt.get("path") or _default_target_path(name, tgt.get("type", ""))
         if not tp or tp == ".":
             continue
-        sibling_target_paths.add(Path(tp))
+        tp_path = Path(tp)
+        paths: Set[Path] = {tp_path}
+        # If this target's path is a root-level symlink into the staged
+        # tree (e.g. RevenueCat's `LocalReceiptParsing` ->
+        # `Sources/LocalReceiptParsing`), also register the resolved
+        # destination. An exclude on either form must protect both.
+        resolved = _readlink_into_staged(staged_dir, tp_path)
+        if resolved is not None:
+            paths.add(resolved)
+        sibling_target_paths_by_name[name] = paths
 
     # Pre-compute every target's effective publicHeadersPath as a
     # relative-to-staged-dir Path. Same conceptual hazard as the
@@ -479,18 +549,39 @@ def stage_source(config: Config, source_dir: Path) -> Path:
         # path directive. `Path(".") / "include"` collapses to
         # `include`, which is what we want for `path: "."` + `ph:
         # "include"` (Realm's exact shape).
-        target_public_headers_paths.add(Path(tp) / ph)
+        ph_path = Path(tp) / ph
+        target_public_headers_paths.add(ph_path)
+        # Same symlink concern as sibling_target_paths above: if the
+        # target's path resolves through a root-level symlink, also
+        # register the publicHeadersPath under the resolved location.
+        resolved_tp = _readlink_into_staged(staged_dir, Path(tp))
+        if resolved_tp is not None:
+            target_public_headers_paths.add(resolved_tp / ph)
 
     removed_count = 0
     for tgt in dump.get("targets", []):
+        own_name = tgt.get("name", "")
         target_path_str = tgt.get("path") or _default_target_path(
-            tgt.get("name", ""), tgt.get("type", "")
+            own_name, tgt.get("type", "")
         )
         if not target_path_str:
             continue
         own_path = Path(target_path_str)
+        # If this target's path is itself a root-level symlink into the
+        # staged tree (e.g. RevenueCat's CustomEntitlementComputation ->
+        # Sources), compute the resolved-to-staged-dir form. Excludes
+        # under such a target must be checked in BOTH path forms — the
+        # symlink form (used for the actual deletion path) and the
+        # resolved form (which is how sibling targets see the same
+        # physical files).
+        own_path_resolved = _readlink_into_staged(staged_dir, own_path)
         for ex in tgt.get("exclude", []) or []:
             ex_rel = Path(target_path_str) / ex
+            # All ex-path forms we need to check: the lexical form plus,
+            # if the target's root is a symlink, the resolved form.
+            ex_forms: Set[Path] = {ex_rel}
+            if own_path_resolved is not None:
+                ex_forms.add(own_path_resolved / ex)
             # Lexical containment check: refuse anything that escapes
             # the staged tree at the path level (`..` traversal, absolute
             # path) BEFORE touching the filesystem. This is symlink-safe:
@@ -528,12 +619,34 @@ def stage_source(config: Config, source_dir: Path) -> Path:
             # `"RealmSwift"`, `"Realm/Tests"`, `"Realm/TestUtils"` —
             # the path directives of three sibling targets in the
             # same package.
+            # The check runs against every ex-path form (symlink and
+            # resolved). RevenueCat 5.41.0 declares
+            # `RevenueCat_CustomEntitlementComputation` with
+            # `path: "CustomEntitlementComputation"` (a root-level
+            # symlink to `Sources/`) and excludes
+            # `"LocalReceiptParsing/ReceiptParser-only-files"`. The
+            # lexical ex_rel `CustomEntitlementComputation/...` doesn't
+            # overlap with sibling `ReceiptParser`'s path
+            # `LocalReceiptParsing` (also a symlink, into
+            # `Sources/LocalReceiptParsing`) — but its resolved form
+            # `Sources/...` does, and `shutil.rmtree` follows the
+            # symlink and physically deletes
+            # `Sources/LocalReceiptParsing/ReceiptParser-only-files`,
+            # which ReceiptParser needs.
+            #
+            # Iterate by target NAME (not by path) to skip self. A
+            # path-value filter would hide a real sibling B whose
+            # `path:` happens to equal the current target's resolved
+            # root (the canonical "B path: Sources, A path: SymA ->
+            # Sources" shape).
             if any(
-                op == ex_rel
-                or _is_path_under(op, ex_rel)
-                or _is_path_under(ex_rel, op)
-                for op in sibling_target_paths
-                if op != own_path
+                op == ef
+                or _is_path_under(op, ef)
+                or _is_path_under(ef, op)
+                for ef in ex_forms
+                for other_name, op_paths in sibling_target_paths_by_name.items()
+                if other_name != own_name
+                for op in op_paths
             ):
                 continue
             # Refuse to delete any path that is — or contains, or is
@@ -548,9 +661,10 @@ def stage_source(config: Config, source_dir: Path) -> Path:
             # (Codex P2 bidirectional pattern — applied symmetrically
             # here from the outset.)
             if any(
-                ph == ex_rel
-                or _is_path_under(ph, ex_rel)
-                or _is_path_under(ex_rel, ph)
+                ph == ef
+                or _is_path_under(ph, ef)
+                or _is_path_under(ef, ph)
+                for ef in ex_forms
                 for ph in target_public_headers_paths
             ):
                 continue

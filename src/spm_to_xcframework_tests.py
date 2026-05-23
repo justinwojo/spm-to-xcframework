@@ -10344,12 +10344,16 @@ def _selftest_strip_self_module_qualifier_in_swiftinterface() -> None:
 
     # 1. Canonical AnalyticsConnector shape — both extension on the
     #    shadowing class and member-type refs must lose the qualifier.
+    #    Fixture includes the top-level `class AnalyticsConnector` decl
+    #    that triggers the SR-14195 shadow-presence gate.
     src = (
+        "public class AnalyticsConnector {}\n"
         "extension AnalyticsConnector.AnalyticsConnector {\n"
         "  public func register(_ bridge: AnalyticsConnector.EventBridge) {}\n"
         "}\n"
     )
     expected = (
+        "public class AnalyticsConnector {}\n"
         "extension AnalyticsConnector {\n"
         "  public func register(_ bridge: EventBridge) {}\n"
         "}\n"
@@ -10359,8 +10363,14 @@ def _selftest_strip_self_module_qualifier_in_swiftinterface() -> None:
 
     # 2. Lookbehind protects nested-type chain: `M.M.X` becomes `M.X`,
     #    NOT `X`. (The bug-pattern case `M.M` still collapses to `M`.)
-    src2 = "public typealias Alias = Mod.Mod.Inner\n"
-    expected2 = "public typealias Alias = Mod.Inner\n"
+    src2 = (
+        "public class Mod {}\n"
+        "public typealias Alias = Mod.Mod.Inner\n"
+    )
+    expected2 = (
+        "public class Mod {}\n"
+        "public typealias Alias = Mod.Inner\n"
+    )
     _assert(strip(src2, "Mod") == expected2,
             f"nested-chain lookbehind broken: {strip(src2, 'Mod')!r}")
 
@@ -10385,10 +10395,12 @@ def _selftest_strip_self_module_qualifier_in_swiftinterface() -> None:
     # 5. String literal containing the qualifier survives untouched
     #    (deprecation messages, @available reasons).
     src5 = (
+        "public class Mod {}\n"
         '@available(*, deprecated, message: "Use Mod.NewType instead")\n'
         "public class Old: Mod.OldBase {}\n"
     )
     expected5 = (
+        "public class Mod {}\n"
         '@available(*, deprecated, message: "Use Mod.NewType instead")\n'
         "public class Old: OldBase {}\n"
     )
@@ -10397,11 +10409,13 @@ def _selftest_strip_self_module_qualifier_in_swiftinterface() -> None:
 
     # 6. Block and line comments containing the qualifier survive.
     src6 = (
+        "public class Mod {}\n"
         "// extension Mod.X { } — historical note\n"
         "/* extension Mod.Y { } */\n"
         "public class Real: Mod.Base {}\n"
     )
     expected6 = (
+        "public class Mod {}\n"
         "// extension Mod.X { } — historical note\n"
         "/* extension Mod.Y { } */\n"
         "public class Real: Base {}\n"
@@ -10418,7 +10432,10 @@ def _selftest_strip_self_module_qualifier_in_swiftinterface() -> None:
     # 8. Lookahead `[A-Z_]` rejects lowercase / numeric continuations,
     #    so we don't munge a method name accidentally namespaced by a
     #    same-letter prefix. (Pathological, but cheap to assert.)
-    src8 = "public let v: Mod.value = 0\n"
+    src8 = (
+        "public class Mod {}\n"
+        "public let v: Mod.value = 0\n"
+    )
     _assert(strip(src8, "Mod") == src8,
             "lookahead must reject lowercase continuation")
 
@@ -10426,6 +10443,35 @@ def _selftest_strip_self_module_qualifier_in_swiftinterface() -> None:
     src9 = "public class Foo { public var bar: Int { 0 } }\n"
     _assert(strip(src9, "AnalyticsConnector") == src9,
             "no-op when module name absent")
+
+    # 10. Shadow-presence gate (the ReactiveSwift / Moya regression case):
+    #    when the interface has NO top-level `class/struct/enum/protocol/actor`
+    #    matching the module name, every `M.X` is a real disambiguator
+    #    (super-class ref inside a same-named nested type, etc.) that must
+    #    NOT be stripped — stripping yields "'Observer' inherits from
+    #    itself" at archive time.
+    src10 = (
+        "extension Signal {\n"
+        "  public final class Observer: ReactiveSwift.Observer<Value, Error> {}\n"
+        "}\n"
+    )
+    _assert(strip(src10, "ReactiveSwift") == src10,
+            f"no-shadow strip must be no-op: {strip(src10, 'ReactiveSwift')!r}")
+
+    # 11. `typealias M = ...` and `extension M { ... }` alone (without a
+    #    top-level nominal decl of M) are also NOT shadow evidence for
+    #    SR-14195. Codex flagged this as a potential miss; Grok's
+    #    analysis (and the empirical wild-pack) supports keeping them
+    #    out of the gate. Lock the current behavior so a future change
+    #    that expands the detector trips a test.
+    src11 = (
+        "public typealias Mod = Foundation.Data\n"
+        "public extension Mod {\n"
+        "  public func wrap(_ x: Mod.Wrapper) -> Mod.Wrapper { x }\n"
+        "}\n"
+    )
+    _assert(strip(src11, "Mod") == src11,
+            f"typealias/extension alone must NOT trigger strip: {strip(src11, 'Mod')!r}")
 
 
 def _selftest_inject_resource_bundles_versioned_macos(tmp_root: Path) -> None:

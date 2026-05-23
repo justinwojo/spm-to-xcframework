@@ -1880,7 +1880,7 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import List, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 
 # Top-level (and any-depth) artifact directories that are unsafe to leave
@@ -1910,6 +1910,53 @@ def _is_path_under(child: Path, parent: Path) -> bool:
     if parent.parts == ():
         return True
     return child.parts[: len(parent.parts)] == parent.parts
+
+
+def _readlink_into_staged(staged_dir: Path, rel_path: Path) -> Optional[Path]:
+    """If `staged_dir / rel_path` is a symlink whose target stays inside
+    `staged_dir`, return the resolved location as a path relative to
+    `staged_dir`. Otherwise return `None`.
+
+    Used by the exclude-pass to detect when a sibling target's `path:`
+    points at the same physical directory as a different target via a
+    symlink at the package root. Canonical case: RevenueCat 5.x ships
+    a root-level `LocalReceiptParsing -> Sources/LocalReceiptParsing`
+    symlink; the `ReceiptParser` target uses `path: "LocalReceiptParsing"`
+    while the `RevenueCat` target uses `path: "Sources"` and excludes
+    `LocalReceiptParsing/ReceiptParser-only-files` — the two paths refer
+    to the same physical source root, but a lexical `_is_path_under`
+    check misses the overlap because the strings don't share a prefix.
+
+    Single-level readlink only — chains rare in real packages and
+    following them risks runaway resolution. The target must be a
+    relative path that, after joining with the symlink's parent and
+    normalizing, still falls inside the staged tree; absolute targets
+    or `..`-escapes return None.
+    """
+    # Defensive guard on the INPUT path: `staged_dir / absolute_path`
+    # silently ignores staged_dir, so an absolute or escape-y rel_path
+    # would let us lstat/readlink outside the staged tree on bad
+    # manifest data. Reject before touching the filesystem. (Codex P3.)
+    if rel_path.is_absolute() or ".." in rel_path.parts:
+        return None
+    abs_link = staged_dir / rel_path
+    if not abs_link.is_symlink():
+        return None
+    try:
+        link_dst = os.readlink(str(abs_link))
+    except OSError:
+        return None
+    if os.path.isabs(link_dst):
+        return None
+    # Join with the symlink's parent dir, then normpath to collapse
+    # `.` and `..`. We don't call .resolve(): chasing chains could
+    # escape the staged tree on pathological inputs.
+    joined = os.path.normpath(str(abs_link.parent / link_dst))
+    staged_str = str(staged_dir)
+    if not (joined == staged_str or joined.startswith(staged_str + os.sep)):
+        return None
+    rel_str = joined[len(staged_str) + 1:] if joined != staged_str else "."
+    return Path(rel_str)
 
 
 def _is_toxic_entry(name: str) -> bool:
@@ -2290,21 +2337,44 @@ def stage_source(config: Config, source_dir: Path) -> Path:
         # the staged tree as-is.
         return staged_dir
 
-    # Pre-compute every target's effective source root as a relative-to-
-    # staged-dir Path. Used below to refuse to delete an exclude path
-    # that overlaps with another target's `path:` directive (e.g. Realm
-    # 20.0.3's `Realm` target excludes `"RealmSwift"`, `"Realm/TestUtils"`,
-    # `"Realm/Tests"` — the path directives of three sibling targets in
-    # the same package). Deleting any of those breaks the sibling
-    # target's source enumeration the next time SPM walks the package.
-    sibling_target_paths: Set[Path] = set()
+    # Pre-compute every target's effective source root(s) as relative-
+    # to-staged-dir Paths, keyed by target name. Used below to refuse
+    # to delete an exclude path that overlaps with ANOTHER target's
+    # `path:` directive (e.g. Realm 20.0.3's `Realm` target excludes
+    # `"RealmSwift"`, `"Realm/TestUtils"`, `"Realm/Tests"` — the path
+    # directives of three sibling targets in the same package).
+    # Deleting any of those breaks the sibling target's source
+    # enumeration the next time SPM walks the package.
+    #
+    # Per-name (not flat) because the sibling guard must exclude the
+    # CURRENT target by IDENTITY, not by path value. RevenueCat 5.x
+    # ships `RevenueCat_CustomEntitlementComputation` with
+    # `path: "CustomEntitlementComputation"` (root-level symlink to
+    # `Sources/`) alongside `RevenueCat` with `path: "Sources"`. Both
+    # resolved/declared sets contain `Sources`. A flat set would force
+    # us to either skip `Sources` (losing the protection that
+    # `RevenueCat` is a real sibling claiming that root) or not skip
+    # it (failing the trivial-self-overlap case where the current
+    # target's own resolved root would block all its excludes). The
+    # by-name dict keeps owner identity attached to each path.
+    sibling_target_paths_by_name: Dict[str, Set[Path]] = {}
     for tgt in dump.get("targets", []):
-        tp = tgt.get("path") or _default_target_path(
-            tgt.get("name", ""), tgt.get("type", "")
-        )
+        name = tgt.get("name", "")
+        if not name:
+            continue
+        tp = tgt.get("path") or _default_target_path(name, tgt.get("type", ""))
         if not tp or tp == ".":
             continue
-        sibling_target_paths.add(Path(tp))
+        tp_path = Path(tp)
+        paths: Set[Path] = {tp_path}
+        # If this target's path is a root-level symlink into the staged
+        # tree (e.g. RevenueCat's `LocalReceiptParsing` ->
+        # `Sources/LocalReceiptParsing`), also register the resolved
+        # destination. An exclude on either form must protect both.
+        resolved = _readlink_into_staged(staged_dir, tp_path)
+        if resolved is not None:
+            paths.add(resolved)
+        sibling_target_paths_by_name[name] = paths
 
     # Pre-compute every target's effective publicHeadersPath as a
     # relative-to-staged-dir Path. Same conceptual hazard as the
@@ -2332,18 +2402,39 @@ def stage_source(config: Config, source_dir: Path) -> Path:
         # path directive. `Path(".") / "include"` collapses to
         # `include`, which is what we want for `path: "."` + `ph:
         # "include"` (Realm's exact shape).
-        target_public_headers_paths.add(Path(tp) / ph)
+        ph_path = Path(tp) / ph
+        target_public_headers_paths.add(ph_path)
+        # Same symlink concern as sibling_target_paths above: if the
+        # target's path resolves through a root-level symlink, also
+        # register the publicHeadersPath under the resolved location.
+        resolved_tp = _readlink_into_staged(staged_dir, Path(tp))
+        if resolved_tp is not None:
+            target_public_headers_paths.add(resolved_tp / ph)
 
     removed_count = 0
     for tgt in dump.get("targets", []):
+        own_name = tgt.get("name", "")
         target_path_str = tgt.get("path") or _default_target_path(
-            tgt.get("name", ""), tgt.get("type", "")
+            own_name, tgt.get("type", "")
         )
         if not target_path_str:
             continue
         own_path = Path(target_path_str)
+        # If this target's path is itself a root-level symlink into the
+        # staged tree (e.g. RevenueCat's CustomEntitlementComputation ->
+        # Sources), compute the resolved-to-staged-dir form. Excludes
+        # under such a target must be checked in BOTH path forms — the
+        # symlink form (used for the actual deletion path) and the
+        # resolved form (which is how sibling targets see the same
+        # physical files).
+        own_path_resolved = _readlink_into_staged(staged_dir, own_path)
         for ex in tgt.get("exclude", []) or []:
             ex_rel = Path(target_path_str) / ex
+            # All ex-path forms we need to check: the lexical form plus,
+            # if the target's root is a symlink, the resolved form.
+            ex_forms: Set[Path] = {ex_rel}
+            if own_path_resolved is not None:
+                ex_forms.add(own_path_resolved / ex)
             # Lexical containment check: refuse anything that escapes
             # the staged tree at the path level (`..` traversal, absolute
             # path) BEFORE touching the filesystem. This is symlink-safe:
@@ -2381,12 +2472,34 @@ def stage_source(config: Config, source_dir: Path) -> Path:
             # `"RealmSwift"`, `"Realm/Tests"`, `"Realm/TestUtils"` —
             # the path directives of three sibling targets in the
             # same package.
+            # The check runs against every ex-path form (symlink and
+            # resolved). RevenueCat 5.41.0 declares
+            # `RevenueCat_CustomEntitlementComputation` with
+            # `path: "CustomEntitlementComputation"` (a root-level
+            # symlink to `Sources/`) and excludes
+            # `"LocalReceiptParsing/ReceiptParser-only-files"`. The
+            # lexical ex_rel `CustomEntitlementComputation/...` doesn't
+            # overlap with sibling `ReceiptParser`'s path
+            # `LocalReceiptParsing` (also a symlink, into
+            # `Sources/LocalReceiptParsing`) — but its resolved form
+            # `Sources/...` does, and `shutil.rmtree` follows the
+            # symlink and physically deletes
+            # `Sources/LocalReceiptParsing/ReceiptParser-only-files`,
+            # which ReceiptParser needs.
+            #
+            # Iterate by target NAME (not by path) to skip self. A
+            # path-value filter would hide a real sibling B whose
+            # `path:` happens to equal the current target's resolved
+            # root (the canonical "B path: Sources, A path: SymA ->
+            # Sources" shape).
             if any(
-                op == ex_rel
-                or _is_path_under(op, ex_rel)
-                or _is_path_under(ex_rel, op)
-                for op in sibling_target_paths
-                if op != own_path
+                op == ef
+                or _is_path_under(op, ef)
+                or _is_path_under(ef, op)
+                for ef in ex_forms
+                for other_name, op_paths in sibling_target_paths_by_name.items()
+                if other_name != own_name
+                for op in op_paths
             ):
                 continue
             # Refuse to delete any path that is — or contains, or is
@@ -2401,9 +2514,10 @@ def stage_source(config: Config, source_dir: Path) -> Path:
             # (Codex P2 bidirectional pattern — applied symmetrically
             # here from the outset.)
             if any(
-                ph == ex_rel
-                or _is_path_under(ph, ex_rel)
-                or _is_path_under(ex_rel, ph)
+                ph == ef
+                or _is_path_under(ph, ef)
+                or _is_path_under(ef, ph)
+                for ef in ex_forms
                 for ph in target_public_headers_paths
             ):
                 continue
@@ -7505,10 +7619,51 @@ def edit_strip_post_init_package_mutations(manifest_text: str) -> str:
 _TEST_TARGET_CALL_RE = re.compile(r"\.testTarget\s*\(")
 
 
+def _is_array_element_context(code_view: str, call_start: int) -> bool:
+    """Return True if the call at `call_start` is a direct element of an
+    array literal — i.e. the preceding non-whitespace character is `[`
+    (first element) or `,` (sibling element).
+
+    A `.testTarget(...)` that appears in any other context — assigned to
+    a variable (`let x: Target = .testTarget(...)`), returned from a
+    function (`return Target.testTarget(...)`), or any other expression
+    position — must NOT be stripped: removing the call body leaves a
+    dangling `=` / `return Target` / etc. that fails
+    `swift package dump-package` with a syntax error.
+
+    Canonical cases that motivated this check:
+      - SQLite.swift 0.15.5: `let testTarget: Target = .testTarget(...)`
+        used as a hoisted binding in `targets: [target, testTarget]`.
+      - swift-collections (transitive): `return Target.testTarget(...)`
+        inside a `toTarget()` helper on a custom enum.
+
+    Stripping only direct array elements preserves the intent (kill
+    test targets that SPM's describe-call scans for source layout)
+    without breaking valid but uncommon expression contexts. A test
+    target hidden inside a helper that's actually invoked from the
+    `targets:` array IS missed by this scope check — a documented
+    gap, since detecting it requires data-flow analysis. If a future
+    package surfaces this shape, the rescue is the per-target
+    auto-recovery in `prepare.py` (rebuilds the manifest from
+    inspected sources) rather than widening the regex.
+    """
+    i = call_start - 1
+    # Use .isspace() rather than a literal " \t\n" set so CRLF
+    # manifests don't drop us at `\r` and false-negative the context
+    # check. (Codex review.)
+    while i >= 0 and code_view[i].isspace():
+        i -= 1
+    return i >= 0 and code_view[i] in "[,"
+
+
 def edit_strip_test_targets(manifest_text: str) -> str:
-    """Remove every `.testTarget(...)` call from the manifest's targets
-    array, along with the trailing comma (or leading comma if it's the
-    final element).
+    """Remove every `.testTarget(...)` call that is a direct element of
+    the manifest's targets array, along with the trailing comma (or
+    leading comma if it's the final element).
+
+    Scope: only direct array elements are stripped — see
+    `_is_array_element_context` for why we deliberately skip calls in
+    let-bindings, return statements, and other expression contexts.
 
     Why strip:
       Test targets contribute nothing to archive builds — we never run
@@ -7546,6 +7701,11 @@ def edit_strip_test_targets(manifest_text: str) -> str:
             # real complaint rather than silently mutating something we
             # don't fully understand.
             break
+        if not _is_array_element_context(code_view, call_start):
+            # Not a direct array element — stripping would leave dangling
+            # syntax (e.g. `let x: Target = ` or `return Target`).
+            pos = close_idx + 1
+            continue
         # Extend the removal to absorb either the trailing comma (when
         # the testTarget has siblings after it) or the leading comma
         # (when it's the last element of the array). Without this, we
@@ -7657,6 +7817,7 @@ def edit_strip_unused_binary_targets(manifest_text: str) -> str:
     #    present, that binary target is considered "depended-on" and we
     #    leave it alone.
     depended: set[str] = set()
+    source_target_count = 0
     for m in _TARGET_CALL_KIND_RE.finditer(code_view):
         kind = m.group(1)
         if kind == "testTarget":
@@ -7665,6 +7826,17 @@ def edit_strip_unused_binary_targets(manifest_text: str) -> str:
         close_idx = _balanced_close(manifest_text, open_idx)
         if close_idx == -1:
             continue
+        # Only count calls that are direct array elements of `targets:`.
+        # Excludes helper expressions like `let helper: Target = .target(...)`
+        # or `private func mkTarget() -> Target { .target(...) }` whose
+        # presence would falsely inflate the count and defeat the
+        # pure-binary bail-out below. The depended-name walk over `body`
+        # still runs for context — false positives there just preserve a
+        # binary target, which is the safe direction.
+        m_call_start = m.start()
+        is_array_element = _is_array_element_context(code_view, m_call_start)
+        if is_array_element:
+            source_target_count += 1
         body = manifest_text[open_idx + 1:close_idx]
         # Exclude the target's own `name: "X"` literal from matching:
         # collapse to a flat view of the top-level body, find name, then
@@ -7683,6 +7855,18 @@ def edit_strip_unused_binary_targets(manifest_text: str) -> str:
             # positives (e.g. `path: "X"`) just keep the binary target.
             if f'"{bn}"' in body:
                 depended.add(bn)
+
+    # Bail out when there are zero source targets: the strip's purpose
+    # is to delete an "alternative binary distribution" that competes
+    # with a source target of the same library (analytics-connector-
+    # ios pattern). A package with ONLY `.binaryTarget(...)` and no
+    # source target is the canonical "SPM wrapper around a vendor
+    # xcframework" shape (intercom-ios-sp, mapbox-maps-ios-binary).
+    # Leaving the binary in place lets the binary-only auto-switch in
+    # cli.py see the package as binary-only and route it through
+    # --binary mode.
+    if source_target_count == 0:
+        return manifest_text
 
     # 3. Strip binary targets not in the depended set.
     targets_to_strip = [
@@ -10717,6 +10901,19 @@ def _strip_self_module_qualifier_from_swiftinterface(
     (Swift issue #56573 / SR-14195; canonical packages: mixpanel-swift's
     `JSON.JSON`, analytics-connector-ios's `AnalyticsConnector.AnalyticsConnector`).
 
+    Gated on shadowing detection: the strip is only safe (and only
+    needed) when the module HAS a top-level type whose name equals
+    the module name. Without that shadowing type, `M.X` is just a
+    redundant qualifier — but if the interface contains a legitimate
+    super-class reference like `class Observer : ReactiveSwift.Observer<Value, Error>`
+    inside `extension Signal { ... }`, stripping `ReactiveSwift.`
+    yields `class Observer : Observer<...>`, which resolves to
+    `Signal.Observer` (the class being defined) and produces
+    `'Observer' inherits from itself` at archive time
+    (ReactiveSwift 6.x → Moya 15.x). The shadow-presence check below
+    is a substring scan for `(class|struct|enum|protocol|actor) M`
+    declarations; absence means no shadow, so skip.
+
     Scope:
     - Substitution runs over the code-only view of the swiftinterface so
       comments (`//` lines including the `swift-module-flags` header,
@@ -10734,6 +10931,22 @@ def _strip_self_module_qualifier_from_swiftinterface(
       attribute syntax like `@frozen` or numeric suffixes.
     """
     code_view = _make_code_token_view(text)
+    # Shadow-presence gate. Only fire the strip when the swiftinterface
+    # declares a type whose name equals the module name — that's the
+    # ONLY situation where the SR-14195 / Module.Self compiler bug
+    # actually manifests on re-parse. Without the shadow, every `M.X`
+    # is just a qualifier that the compiler resolves correctly, AND
+    # stripping it can corrupt legitimate super-class references where
+    # `M.X` is required to disambiguate from a same-named nested
+    # type in surrounding scope (ReactiveSwift.Observer inside
+    # `extension Signal { class Observer : ReactiveSwift.Observer<...> }`).
+    shadow_pattern = re.compile(
+        r"(?:class|struct|enum|protocol|actor)\s+"
+        + re.escape(module_name)
+        + r"\b"
+    )
+    if shadow_pattern.search(code_view) is None:
+        return text
     pattern = re.compile(
         r"(?<![\w.])" + re.escape(module_name) + r"\.(?=[A-Z_])"
     )
