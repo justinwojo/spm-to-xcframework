@@ -177,8 +177,14 @@ CANDIDATES: List[Candidate] = [
 
     # Auth / monetization
     Candidate("RevenueCat",
-              "https://github.com/RevenueCat/purchases-ios", "5.15.0",
-              notes="in-app subscriptions; very common for mobile monetization"),
+              "https://github.com/RevenueCat/purchases-ios", "5.21.2",
+              notes="in-app subscriptions; very common for mobile monetization. "
+                    "Pinned post-5.18.0 because RevenueCat 5.15.0's "
+                    "RevenueCatUI/CustomerCenter/Data/PurchaseInformation.swift writes "
+                    "`extension SubscriptionInfo: Transaction` which xcodebuild reports as "
+                    "ambiguous against StoreKit.SubscriptionInfo (Apple's typealias added "
+                    "to StoreKit in iOS 17). Upstream commit 33e0a78 (released in 5.18.0) "
+                    "qualified the extension as `RevenueCat.SubscriptionInfo`."),
 
     # Analytics / backend — Firebase is Grok's top MAUI binding candidate
     Candidate("firebase-ios-sdk",
@@ -258,7 +264,12 @@ CANDIDATES: List[Candidate] = [
     # apps bind this directly. (Grok recommendation.)
     Candidate("mapbox-maps-ios-binary",
               "https://github.com/mapbox/mapbox-maps-ios-binary", "v11.24.2",
-              notes="prebuilt XCFramework distribution of Metal/C++ maps SDK; binary-only SPM shim"),
+              notes="prebuilt XCFramework distribution of Metal/C++ maps SDK; binary-only SPM shim. "
+                    "Routed through --binary so we copy the prebuilt slices and avoid recompiling "
+                    "the wrapper target — that source build trips over MapboxCommon's sim "
+                    "`.private.swiftinterface` referencing internal symbols (Cancelable, "
+                    "MapboxOptions) that aren't exported at the slice's public surface.",
+              args=["--binary"]),
 
     # Monetization / ads — Google AdMob via the official SPM shim
     # repo. Top mobile ad SDK; another instance of Google's pattern
@@ -273,7 +284,15 @@ CANDIDATES: List[Candidate] = [
     # cross-platform parity with Android. (Grok recommendation.)
     Candidate("adjust-ios-sdk",
               "https://github.com/adjust/ios_sdk", "v5.6.2",
-              notes="attribution SDK with in-repo Package.swift; platform-specific deps"),
+              notes="attribution SDK with in-repo Package.swift; platform-specific deps. "
+                    "AdjustGoogleOdm is excluded — its sole transitive dep "
+                    "(google-ads-on-device-conversion-ios-sdk) is a wrapper-target+binaryTarget "
+                    "pattern that our recursive build can't merge, so the produced sibling "
+                    "xcframework exposes only the wrapper's dummy.h and AdjustGoogleOdm's "
+                    "ObjC source fails clang lookup of `ODCConversionManager`.",
+              args=["--product", "AdjustSdk",
+                    "--product", "AdjustUnsigned",
+                    "--product", "AdjustWebBridge"]),
 ]
 
 
