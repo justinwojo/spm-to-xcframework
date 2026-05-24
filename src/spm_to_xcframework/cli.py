@@ -106,126 +106,108 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> Tuple[argparse.Namespace
         nargs="?",
         help="Git URL or local filesystem path to the SPM package",
     )
-    parser.add_argument("-v", "--version", dest="version", default="",
-                        help="Git tag to check out (required for remote URLs)")
-    parser.add_argument("-o", "--output", dest="output", default="./xcframeworks",
-                        help="Output directory (default: ./xcframeworks)")
-    parser.add_argument("-p", "--product", dest="products", action="append", default=[],
-                        help="Build only this product (repeatable)")
-    parser.add_argument("-t", "--target", dest="targets", action="append", default=[],
-                        help="Build an SPM target not exposed as a .library() product (repeatable)")
-    parser.add_argument("--binary", action="store_true",
-                        help="Download pre-built xcframeworks from binary SPM targets")
-    parser.add_argument("--revision", default=None,
-                        help="Verify git tag resolves to this commit SHA before building")
-    # Platform selection. iOS is built by default (the project's
-    # downstream consumer is .NET MAUI / Xamarin); other platforms are
-    # opt-in via the bare `--<plat>` flag, with auto-derived deployment
-    # target. The `--min-<plat> VERSION` flag pins an explicit version
-    # AND implies inclusion, so existing invocations like
-    # `--min-macos 11` keep working without also passing `--macos`.
+
+    # Argument groups are a --help-presentation concern only — they do not
+    # affect parsing. The split keeps the everyday flags (package + platform
+    # selection) above the rarely-needed escape hatches and diagnostics, so
+    # `--help` reads as a short common section followed by the long tail.
+    pkg = parser.add_argument_group("package selection")
+    pkg.add_argument("-v", "--version", dest="version", default="",
+                     help="Git tag to check out (required for remote URLs). A "
+                          "leading-'v' mismatch (tag is v1.2.3, you typed 1.2.3) "
+                          "is resolved automatically.")
+    pkg.add_argument("-o", "--output", dest="output", default="./xcframeworks",
+                     help="Output directory (default: ./xcframeworks)")
+    pkg.add_argument("-p", "--product", dest="products", action="append", default=[],
+                     help="Build only this library product (repeatable; "
+                          "default: all library products)")
+    pkg.add_argument("-t", "--target", dest="targets", action="append", default=[],
+                     help="Build an SPM target that isn't exposed as a "
+                          ".library() product (repeatable). Escape hatch for "
+                          "packages like stripe-ios that ship modules as plain "
+                          ".target(...).")
+    pkg.add_argument("--binary", action="store_true",
+                     help="Download pre-built xcframeworks from binary SPM "
+                          "targets instead of building from source (remote URLs "
+                          "only).")
+    pkg.add_argument("--revision", default=None,
+                     help="Verify the resolved tag points at this full "
+                          "40-character commit SHA before fetching "
+                          "(supply-chain check).")
+    # iOS is built by default (the project's downstream consumer is .NET
+    # MAUI / iOS); other platforms are opt-in via the bare `--<plat>`
+    # flag, with auto-derived deployment target. The `--min-<plat> VERSION`
+    # flag pins an explicit version AND implies inclusion, so existing
+    # invocations like `--min-macos 11` keep working without `--macos`.
     #
     # Auto-derive order for included platforms: `--min-<plat> VERSION`
     # (explicit) > `Package.platforms[]` declaration > Apple-modern
     # fallback (ios=15.0, macos=11.0, maccatalyst=15.0, tvos=15.0,
     # watchos=8.0, visionos=1.0). `--no-ios` drops the iOS default.
-    parser.add_argument("--min-ios", default=None,
-                        help="Pin the iOS minimum deployment target (e.g. 15.0). "
-                             "iOS is built by default; this flag overrides the "
-                             "auto-derived version. Mutually exclusive with --no-ios.")
-    parser.add_argument("--no-ios", action="store_true",
-                        help="Skip iOS. Pair with --macos / --maccatalyst / --tvos / "
-                             "--watchos / --visionos to build other platforms only.")
-    parser.add_argument("--macos", action="store_true",
-                        help="Also build a macOS slice. Deployment target is auto-"
-                             "derived from Package.swift, falling back to 11.0 "
-                             "if the package doesn't declare one. Combine with "
-                             "--min-macos VERSION to pin explicitly.")
-    parser.add_argument("--min-macos", default=None,
-                        help="Pin the macOS minimum deployment target (e.g. 11.0). "
-                             "Implies --macos.")
-    parser.add_argument("--maccatalyst", action="store_true",
-                        help="Also build a Mac Catalyst slice. Deployment target "
-                             "is auto-derived from Package.swift, falling back to "
-                             "15.0. Combine with --min-maccatalyst VERSION to pin "
-                             "explicitly.")
-    parser.add_argument("--min-maccatalyst", default=None,
-                        help="Pin the Mac Catalyst minimum deployment target "
-                             "(e.g. 15.0). Implies --maccatalyst.")
-    parser.add_argument("--tvos", action="store_true",
-                        help="Also build tvOS device + simulator slices. "
-                             "Deployment target is auto-derived from Package.swift, "
-                             "falling back to 15.0. Combine with --min-tvos "
-                             "VERSION to pin explicitly.")
-    parser.add_argument("--min-tvos", default=None,
-                        help="Pin the tvOS minimum deployment target (e.g. 15.0). "
-                             "Implies --tvos.")
-    parser.add_argument("--watchos", action="store_true",
-                        help="Also build watchOS device + simulator slices. "
-                             "Deployment target is auto-derived from Package.swift, "
-                             "falling back to 8.0. Combine with --min-watchos "
-                             "VERSION to pin explicitly. Requires watchOS SDK.")
-    parser.add_argument("--min-watchos", default=None,
-                        help="Pin the watchOS minimum deployment target (e.g. 8.0). "
-                             "Implies --watchos.")
-    parser.add_argument("--visionos", action="store_true",
-                        help="Also build visionOS device + simulator slices. "
-                             "Deployment target is auto-derived from Package.swift, "
-                             "falling back to 1.0. Combine with --min-visionos "
-                             "VERSION to pin explicitly. Requires visionOS SDK.")
-    parser.add_argument("--min-visionos", default=None,
-                        help="Pin the visionOS minimum deployment target (e.g. 1.0). "
-                             "Implies --visionos.")
-    parser.add_argument("--include-deps", action="store_true",
-                        help="Also build xcframeworks for transitive dependencies (iOS-only in v1)")
-    parser.add_argument(
-        "--no-transitive-products",
-        action="store_true",
-        help=(
-            "Skip the in-process recursion that builds a sibling "
-            "xcframework for each external `.product(name:, package:)` "
-            "the root's targets depend on. The umbrella's "
-            ".swiftinterface may then `import` modules whose "
-            ".swiftmodule isn't on the consumer's search path; useful "
-            "only when you know the consumer doesn't link against those "
-            "transitive symbols."
-        ),
+    plat = parser.add_argument_group(
+        "platform selection",
+        "iOS is built by default; every other platform is opt-in. Each platform "
+        "has a bare include flag (--<plat>) and an explicit pin (--min-<plat> "
+        "VERSION); the pin also implies inclusion.",
     )
-    parser.add_argument(
-        "--best-effort-transitives",
-        action="store_true",
-        help=(
-            "Default: a transitive-package build/verify failure aborts "
-            "the whole run (the umbrella would ship with dangling "
-            ".swiftinterface imports). Pass this flag to continue with "
-            "whatever transitives succeeded; the umbrella runs anyway "
-            "and failed transitives are skipped with a warning."
-        ),
+    plat.add_argument("--min-ios", default=None,
+                      help="Pin the iOS minimum deployment target (e.g. 15.0). "
+                           "iOS is built by default; this flag overrides the "
+                           "auto-derived version. Mutually exclusive with --no-ios.")
+    plat.add_argument("--no-ios", action="store_true",
+                      help="Skip iOS. Pair with --macos / --maccatalyst / --tvos / "
+                           "--watchos / --visionos to build other platforms only.")
+    plat.add_argument("--macos", action="store_true",
+                      help="Also build a macOS slice. Deployment target is auto-"
+                           "derived from Package.swift, falling back to 11.0 "
+                           "if the package doesn't declare one. Combine with "
+                           "--min-macos VERSION to pin explicitly.")
+    plat.add_argument("--min-macos", default=None,
+                      help="Pin the macOS minimum deployment target (e.g. 11.0). "
+                           "Implies --macos.")
+    plat.add_argument("--maccatalyst", action="store_true",
+                      help="Also build a Mac Catalyst slice. Deployment target "
+                           "is auto-derived from Package.swift, falling back to "
+                           "15.0. Combine with --min-maccatalyst VERSION to pin "
+                           "explicitly.")
+    plat.add_argument("--min-maccatalyst", default=None,
+                      help="Pin the Mac Catalyst minimum deployment target "
+                           "(e.g. 15.0). Implies --maccatalyst.")
+    plat.add_argument("--tvos", action="store_true",
+                      help="Also build tvOS device + simulator slices. "
+                           "Deployment target is auto-derived from Package.swift, "
+                           "falling back to 15.0. Combine with --min-tvos "
+                           "VERSION to pin explicitly.")
+    plat.add_argument("--min-tvos", default=None,
+                      help="Pin the tvOS minimum deployment target (e.g. 15.0). "
+                           "Implies --tvos.")
+    plat.add_argument("--watchos", action="store_true",
+                      help="Also build watchOS device + simulator slices. "
+                           "Deployment target is auto-derived from Package.swift, "
+                           "falling back to 8.0. Combine with --min-watchos "
+                           "VERSION to pin explicitly. Requires watchOS SDK.")
+    plat.add_argument("--min-watchos", default=None,
+                      help="Pin the watchOS minimum deployment target (e.g. 8.0). "
+                           "Implies --watchos.")
+    plat.add_argument("--visionos", action="store_true",
+                      help="Also build visionOS device + simulator slices. "
+                           "Deployment target is auto-derived from Package.swift, "
+                           "falling back to 1.0. Combine with --min-visionos "
+                           "VERSION to pin explicitly. Requires visionOS SDK.")
+    plat.add_argument("--min-visionos", default=None,
+                      help="Pin the visionOS minimum deployment target (e.g. 1.0). "
+                           "Implies --visionos.")
+    # Escape hatches. The defaults here are right for almost every
+    # package; these exist for the rare case that needs to override them.
+    build = parser.add_argument_group(
+        "advanced build behavior",
+        "Defaults are right for almost every package — reach for these only "
+        "when a build needs to deviate.",
     )
-    parser.add_argument("--verbose", action="store_true",
-                        help="Show full build output")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Show what would be built without building. "
-                             "Runs Fetch + Inspect + Plan only; no xcodebuild "
-                             "is invoked (transitive sibling resolution is "
-                             "skipped — the printed plan reflects the umbrella "
-                             "package alone).")
-    parser.add_argument("--dry-run-json", action="store_true",
-                        help="Like --dry-run, but emit the resolved Plan as "
-                             "machine-readable JSON on stdout (informational "
-                             "log messages route to stderr). Implies --dry-run.")
-    parser.add_argument("--keep-work", action="store_true",
-                        help="Keep temporary work directory (for debugging)")
-    parser.add_argument(
-        "--no-cleanup-stale",
-        action="store_true",
-        help=(
-            "Skip cleanup of stale xcframeworks from prior runs this time, "
-            "but keep them tracked in the manifest so a subsequent normal "
-            "run will clean them."
-        ),
-    )
-    parser.add_argument(
+    build.add_argument("--include-deps", action="store_true",
+                       help="Also build xcframeworks for transitive "
+                            "dependencies (iOS-only in v1; requires iOS enabled).")
+    build.add_argument(
         "--no-dedup-overlap",
         action="store_true",
         help=(
@@ -238,11 +220,58 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> Tuple[argparse.Namespace
             "to keep legacy single-shot behavior."
         ),
     )
+    build.add_argument(
+        "--no-transitive-products",
+        action="store_true",
+        help=(
+            "Skip the in-process recursion that builds a sibling "
+            "xcframework for each external `.product(name:, package:)` "
+            "the root's targets depend on. The umbrella's "
+            ".swiftinterface may then `import` modules whose "
+            ".swiftmodule isn't on the consumer's search path; useful "
+            "only when you know the consumer doesn't link against those "
+            "transitive symbols."
+        ),
+    )
+    build.add_argument(
+        "--best-effort-transitives",
+        action="store_true",
+        help=(
+            "Default: a transitive-package build/verify failure aborts "
+            "the whole run (the umbrella would ship with dangling "
+            ".swiftinterface imports). Pass this flag to continue with "
+            "whatever transitives succeeded; the umbrella runs anyway "
+            "and failed transitives are skipped with a warning."
+        ),
+    )
+    build.add_argument(
+        "--no-cleanup-stale",
+        action="store_true",
+        help=(
+            "Skip cleanup of stale xcframeworks from prior runs this time, "
+            "but keep them tracked in the manifest so a subsequent normal "
+            "run will clean them."
+        ),
+    )
 
-    # Session-1-only flag for exploration. Not removed in later sessions —
-    # it remains a useful diagnostic.
-    parser.add_argument("--inspect-only", action="store_true",
-                        help="Run Fetch + Inspect and print the parsed Package model, then exit.")
+    diag = parser.add_argument_group("diagnostics")
+    diag.add_argument("--verbose", action="store_true",
+                      help="Show full xcodebuild output.")
+    diag.add_argument("--dry-run", action="store_true",
+                      help="Show what would be built without building. "
+                           "Runs Fetch + Inspect + Plan only; no xcodebuild "
+                           "is invoked (transitive sibling resolution is "
+                           "skipped — the printed plan reflects the umbrella "
+                           "package alone).")
+    diag.add_argument("--dry-run-json", action="store_true",
+                      help="Like --dry-run, but emit the resolved Plan as "
+                           "machine-readable JSON on stdout (informational "
+                           "log messages route to stderr). Implies --dry-run.")
+    diag.add_argument("--inspect-only", action="store_true",
+                      help="Run Fetch + Inspect and print the parsed Package "
+                           "model, then exit.")
+    diag.add_argument("--keep-work", action="store_true",
+                      help="Keep the temporary work directory (for debugging).")
 
     ns = parser.parse_args(argv)
     return ns, parser
