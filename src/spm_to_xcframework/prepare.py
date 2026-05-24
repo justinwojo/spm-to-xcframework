@@ -1634,7 +1634,7 @@ def edit_augment_target_dependencies(
 
     Wrapper-style manifests (swift-collections' `CustomTarget.target(
     name:, dependencies:, ...)`) are supported because the regex
-    `\.(target|executableTarget|testTarget)\s*\(` matches both
+    `\\.(target|executableTarget|testTarget)\\s*\\(` matches both
     `CustomTarget.target(` and bare `.target(` calls. The wrapper's
     `dependencies` field is `[Target.Dependency]`-typed, which accepts
     `ExpressibleByStringLiteral` entries the same as a real
