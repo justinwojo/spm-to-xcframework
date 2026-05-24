@@ -13,20 +13,28 @@ Defaults to **iOS device + simulator**; other platforms are opt-in. Framework ty
 
 ## Get started
 
-```bash
-git clone https://github.com/justinwojo/spm-to-xcframework.git
-cd spm-to-xcframework
+Install with [Homebrew](https://brew.sh):
 
+```bash
+brew install justinwojo/spm-to-xcframework/spm-to-xcframework
+```
+
+The three-part name pulls in the tap automatically — no separate `brew tap` step — and puts `spm-to-xcframework` on your `PATH`. Then:
+
+```bash
 # Build all library products from a remote package at a tag
-./spm-to-xcframework https://github.com/Alamofire/Alamofire.git -v 5.10.2
+spm-to-xcframework https://github.com/Alamofire/Alamofire.git -v 5.10.2
 
 ls xcframeworks   # → Alamofire.xcframework  AlamofireDynamic.xcframework  .spm-to-xcframework-manifest.json
 ```
 
-`spm-to-xcframework` is a single self-contained script — **Python 3.9+, standard library only, no `pip install`**. To call it from anywhere, put the repo directory on your `PATH`:
+Prefer to run from source, or track the latest `main`? It's a single self-contained script — **Python 3.9+, standard library only, no `pip install`** — so a clone is all you need:
 
 ```bash
+git clone https://github.com/justinwojo/spm-to-xcframework.git
+cd spm-to-xcframework
 export PATH="$PWD:$PATH"   # this shell; add to your shell profile to persist
+./spm-to-xcframework https://github.com/Alamofire/Alamofire.git -v 5.10.2
 ```
 
 The rest of this README uses the bare `spm-to-xcframework` form, assuming it's on your `PATH`.
