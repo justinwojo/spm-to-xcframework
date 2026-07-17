@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional, Set, Tuple
 
 from .config import Config
 from .diagnostics import format_swift_package_failure
@@ -236,6 +236,50 @@ _MODULE_TYPE_LANGUAGE = {
     "MixedLanguageTarget": Language.MIXED,
 }
 
+# Compiled-source extensions that make a ClangTarget NON-pure-C: ObjC (.m),
+# ObjC++ (.mm), C++ (.cpp/.cc/.cxx/.c++/.cp), and assembly (.s/.asm). These
+# are matched against a LOWERCASED filename, so uppercase spellings that are
+# legal on case-sensitive filesystems (.CPP, .CC, .MM, .S, …) are caught too.
+# The lone `.c`-vs-`.C` distinction is handled separately in the classifier
+# because lowercasing would collide `.C` (the C++ convention) with `.c` (C).
+# A ClangTarget whose compiled sources are all `.c` (headers ignored) is a
+# pure-C shim — safe to build standalone as its own `.library(type:
+# .dynamic)`, which `_auto_synth_sibling_units` relies on to promote helpers
+# like swift-numerics' `_NumericsShims`.
+_NON_PURE_C_SOURCE_EXTS = (
+    ".m", ".mm",
+    ".cpp", ".cc", ".cxx", ".c++", ".cp",
+    ".s", ".asm",
+)
+
+
+def _clang_sources_are_pure_c(sources: object) -> bool:
+    """True iff `sources` (describe's per-target source list) has at least
+    one `.c` file and no ObjC/C++/assembly source. Header files (`.h`,
+    `.hpp`, …) are neutral — they don't determine the compile language.
+    Used to sub-classify a ClangTarget (which the language map otherwise
+    collapses to Language.OBJC) as a standalone-safe pure-C shim."""
+    if not isinstance(sources, list):
+        return False
+    saw_c = False
+    for src in sources:
+        if not isinstance(src, str):
+            continue
+        # `.c` (lowercase) is C; `.C` (uppercase) is the C++ convention on
+        # case-sensitive filesystems. This single distinction is case-
+        # SENSITIVE; every other non-C source is rejected case-insensitively
+        # below, so mixed targets like `["shim.c", "backend.CPP"]` don't slip
+        # through as pure C.
+        if src.endswith(".c"):
+            saw_c = True
+            continue
+        if src.endswith(".C"):
+            return False
+        low = src.lower()
+        if any(low.endswith(ext) for ext in _NON_PURE_C_SOURCE_EXTS):
+            return False
+    return saw_c
+
 
 def _swift_describe_package(staged_dir: Path) -> dict:
     """Run `swift package describe --type json` against the staged dir
@@ -296,6 +340,10 @@ def scan_target_languages(staged_dir: Path, targets: Iterable[Target]) -> None:
         tgt.language = _MODULE_TYPE_LANGUAGE.get(module_type, Language.NA)
         sources = entry.get("sources")
         tgt.source_file_count = len(sources) if isinstance(sources, list) else 0
+        tgt.clang_is_pure_c = (
+            module_type == "ClangTarget"
+            and _clang_sources_are_pure_c(sources)
+        )
 
 
 def discover_schemes(staged_dir: Path, verbose: bool = False) -> List[str]:
@@ -536,6 +584,156 @@ def _is_transitive_binary_only(
     return binary_products > 0
 
 
+def _collect_byname_dependency_names(
+    raw_dump: dict, targets: List[Target]
+) -> "dict[str, List[str]]":
+    """Enumerate bare-name / `byName` dependencies that REGULAR targets in
+    the root declare, EXCLUDING names that resolve to an internal target of
+    the root package.
+
+    SwiftPM lets a target depend on another package's product by bare name
+    (`dependencies: ["SWXMLHash"]`) when the name is unambiguous — but such
+    a dep carries NO package identity in `dump-package`. It appears as
+    `{"byName": ["SWXMLHash", null]}`, byte-identical in shape to an
+    internal sibling dep, so `_collect_referenced_package_products` (which
+    only reads the `{"product": [...]}` shape) never sees it. Macaw →
+    SWXMLHash and CocoaMQTT → MqttCocoaAsyncSocket are the canonical cases
+    where this silent miss ships an umbrella xcframework whose dependency
+    module was never built.
+
+    Returns an ordered dict mapping bare name → ordered list of the root
+    REGULAR target names that reference it. Names matching an internal
+    target are dropped here (those are internal deps resolved by the
+    auto-synth / internal-closure paths, not external products). The
+    caller resolves each surviving name against the DIRECT dependency
+    packages' product inventories; names that don't resolve to exactly one
+    external product are dropped there.
+    """
+    internal_target_names = {t.name for t in targets}
+    target_kind_by_name = {t.name: t.kind for t in targets}
+    out: "dict[str, List[str]]" = {}
+    for t in raw_dump.get("targets", []) or []:
+        if not isinstance(t, dict):
+            continue
+        name = t.get("name")
+        if not isinstance(name, str):
+            continue
+        if target_kind_by_name.get(name) != TargetKind.REGULAR:
+            continue
+        for dep in t.get("dependencies", []) or []:
+            if not isinstance(dep, dict):
+                continue
+            by = dep.get("byName")
+            if not isinstance(by, list) or not by:
+                continue
+            dep_name = by[0]
+            if not isinstance(dep_name, str):
+                continue
+            # Internal sibling dep — resolved by the auto-synth / internal
+            # closure paths, not an external product reference. SPM itself
+            # resolves a bare name to an internal target before a dependency
+            # product, so this exclusion also matches SPM's own precedence.
+            if dep_name in internal_target_names:
+                continue
+            per_name = out.setdefault(dep_name, [])
+            if name not in per_name:
+                per_name.append(name)
+    return out
+
+
+def _resolve_byname_external_products(
+    tree: dict,
+    byname_candidates: "dict[str, List[str]]",
+    referenced_by_identity: "dict[str, dict]",
+    verbose: bool,
+) -> None:
+    """Resolve each bare-name dep in `byname_candidates` against the DIRECT
+    dependency packages' product inventories and, on a UNIQUE match, fold
+    it into `referenced_by_identity` (mutated in place) exactly as though
+    the root had written `.product(name: <name>, package: <identity>)`.
+
+    SwiftPM only lets a target byName-reference a product of a DIRECT
+    dependency, so the search is bounded to the root's immediate deps
+    (`tree["dependencies"]`) — a handful of `dump-package` calls, and only
+    when an unresolved byName actually exists. A name that matches zero, or
+    more than one, direct dep's products is left unresolved (verbose-
+    logged): building/attributing the wrong sibling is worse than the
+    pre-existing miss, and an ambiguous bare name is something SPM itself
+    would reject.
+    """
+    direct_children: List[Tuple[str, str]] = []
+    seen_identities: Set[str] = set()
+    for child in tree.get("dependencies", []) or []:
+        if not isinstance(child, dict):
+            continue
+        identity = child.get("identity")
+        path = child.get("path")
+        if not (isinstance(identity, str) and isinstance(path, str)):
+            continue
+        if identity in seen_identities:
+            continue
+        seen_identities.add(identity)
+        direct_children.append((identity, path))
+    if not direct_children:
+        return
+
+    # product name -> ordered list of direct-dep identities declaring a
+    # product with that name. Built by dumping each direct dep checkout once.
+    product_owners: "dict[str, List[str]]" = {}
+    for identity, path in direct_children:
+        checkout = Path(path)
+        if not (checkout / "Package.swift").is_file() and not any(
+            checkout.glob("Package@swift-*.swift")
+        ):
+            continue
+        try:
+            _r, d_products, _t, _pl, _n, _tv = dump_package(checkout)
+        except Exception as exc:  # noqa: BLE001 — Inspect must not crash
+            verbose_log(
+                verbose,
+                f"  byName resolve: dump-package failed for {identity!r}: {exc}",
+            )
+            continue
+        for prod in d_products:
+            owners = product_owners.setdefault(prod.name, [])
+            if identity not in owners:
+                owners.append(identity)
+
+    for name, root_targets in byname_candidates.items():
+        owners = product_owners.get(name)
+        if not owners:
+            verbose_log(
+                verbose,
+                f"  byName {name!r} matched no direct dependency product "
+                f"(leaving unresolved)",
+            )
+            continue
+        if len(owners) > 1:
+            verbose_log(
+                verbose,
+                f"  byName {name!r} is ambiguous across {owners!r} "
+                f"(leaving unresolved)",
+            )
+            continue
+        identity = owners[0]
+        entry = referenced_by_identity.setdefault(
+            identity,
+            {"products": [], "root_targets": [], "product_to_root_targets": {}},
+        )
+        if name not in entry["products"]:
+            entry["products"].append(name)
+        per_product = entry["product_to_root_targets"].setdefault(name, [])
+        for rt in root_targets:
+            if rt not in entry["root_targets"]:
+                entry["root_targets"].append(rt)
+            if rt not in per_product:
+                per_product.append(rt)
+        verbose_log(
+            verbose,
+            f"  byName {name!r} resolved to product of {identity!r}",
+        )
+
+
 def _discover_transitive_packages(
     staged_dir: Path,
     raw_dump: dict,
@@ -556,7 +754,45 @@ def _discover_transitive_packages(
         package author shipped a broken manifest)
     """
     referenced_by_identity = _collect_referenced_package_products(raw_dump, targets)
-    if not referenced_by_identity:
+
+    # Bare-name (`byName`) external product deps carry no identity in
+    # dump-package, so they're collected separately and resolved against the
+    # direct deps' product inventories below. Any already covered by an
+    # explicit `.product(...)` ref (same product referenced both ways) don't
+    # need re-resolving — the explicit ref already carries the identity — but
+    # their byName-referencing targets are still merged into that identity's
+    # attribution (see the `if byname_candidates:` block below).
+    byname_candidates = _collect_byname_dependency_names(raw_dump, targets)
+    if byname_candidates:
+        # A bare name may reference the SAME product another root target already
+        # reaches via `.product(name:, package:)`. Those are already resolved to
+        # an identity — nothing left to look up — but the byName-referencing
+        # targets must still be merged into that entry's attribution, or
+        # `--product` / `--target` closure-filtering (which keys transitives off
+        # `root_targets` / `product_to_root_targets`) could drop a transitive
+        # that a selected byName-only target actually needs. Only genuinely
+        # unresolved names survive into `byname_candidates` for the lookup below.
+        product_owner_identity = {
+            p: identity
+            for identity, entry in referenced_by_identity.items()
+            for p in entry["products"]
+        }
+        remaining: "dict[str, List[str]]" = {}
+        for name, rts in byname_candidates.items():
+            identity = product_owner_identity.get(name)
+            if identity is None:
+                remaining[name] = rts
+                continue
+            entry = referenced_by_identity[identity]
+            per_product = entry["product_to_root_targets"].setdefault(name, [])
+            for rt in rts:
+                if rt not in entry["root_targets"]:
+                    entry["root_targets"].append(rt)
+                if rt not in per_product:
+                    per_product.append(rt)
+        byname_candidates = remaining
+
+    if not referenced_by_identity and not byname_candidates:
         return []
 
     tree = _show_dependencies(staged_dir, verbose=verbose)
@@ -564,6 +800,18 @@ def _discover_transitive_packages(
         return []
     flat = _flatten_dependency_tree(tree)
     if not flat:
+        return []
+
+    # Resolve bare-name deps (Macaw → SWXMLHash, CocoaMQTT →
+    # MqttCocoaAsyncSocket) to their owning direct dependency and fold them
+    # into `referenced_by_identity` so they're built + consumed like any
+    # `.product(name:, package:)` reference. A no-op when there are none.
+    if byname_candidates:
+        _resolve_byname_external_products(
+            tree, byname_candidates, referenced_by_identity, verbose
+        )
+    if not referenced_by_identity:
+        # Every byName candidate was unresolvable/ambiguous — nothing to build.
         return []
 
     # Case-insensitive identity lookup so root manifests that write

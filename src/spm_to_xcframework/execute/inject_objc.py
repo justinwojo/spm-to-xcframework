@@ -21,6 +21,28 @@ from ..model import Package, _default_target_path
 from .inject_swiftmodule import _ensure_root_symlink, _framework_content_root
 
 
+def _clang_module_name(fw_name: str) -> str:
+    """Convert a framework/product name to the Clang module identifier a
+    consumer's `import`/`@import` will actually spell.
+
+    A framework bundle may be named with characters that are illegal in a
+    Clang module name — the canonical case is a hyphenated SPM product
+    like `cmark-gfm`, whose Swift/Clang module is `cmark_gfm` (SPM applies
+    the same C99 mangling: any character that is not a letter, digit, or
+    underscore becomes `_`, and a leading digit is prefixed with `_`).
+    Emitting `framework module cmark-gfm { ... }` produces a modulemap no
+    consumer can `import`, because `import cmark-gfm` isn't valid Swift.
+
+    Only the `module <NAME>` token in the generated modulemap needs this
+    form; on-disk header filenames (`<fw_name>.h`, `<fw_name>-Swift.h`)
+    keep the literal framework name and are passed through unchanged.
+    """
+    sanitized = "".join(c if (c.isalnum() or c == "_") else "_" for c in fw_name)
+    if sanitized and sanitized[0].isdigit():
+        sanitized = "_" + sanitized
+    return sanitized or fw_name
+
+
 def _has_h_files_recursive(path: Path) -> bool:
     """True iff `path` contains at least one `.h` file at any depth.
 
@@ -36,14 +58,16 @@ def _has_h_files_recursive(path: Path) -> bool:
     return False
 
 
-def _find_objc_headers_dir(
+def _collect_objc_header_dirs(
     package: Package,
     product_name: str,
     fw_name: str,
-) -> Optional[Path]:
-    """Find a directory of public ObjC headers for the named product.
+) -> List[Path]:
+    """Ordered, de-duplicated public-ObjC-header source dirs for a product.
 
-    Priority (matches legacy bash 1352-1397):
+    `dirs[0]` is the single best match — the same directory the legacy
+    single-dir resolver returned (see `_find_objc_headers_dir`), chosen by
+    this priority (legacy bash 1352-1397):
       1. A direct product target whose name == fw_name with a
          publicHeadersPath that exists and contains *.h files.
       2. A direct product target whose name == product_name.
@@ -51,7 +75,17 @@ def _find_objc_headers_dir(
       4. First-level dependencies of direct product targets, with the
          same fw_name > product_name > anything-with-headers priority.
 
-    Returns the absolute path of the public-headers directory, or None.
+    Any remaining entries are the header dirs of *internal-only*
+    first-level dependencies (deps no product separately packages). A
+    mixed framework whose Swift target ships an umbrella header that
+    `#import`s a C dependency's header — Yams's `Yams.h` doing
+    `#import <Yams/yaml.h>` from the internal `CYaml` target — needs BOTH
+    copied: the umbrella from the Swift target dir *and* `yaml.h` from
+    CYaml's `include/`. The single-dir resolver stopped at the first
+    match, dropping the C header and leaving the umbrella's `#import`
+    dangling at consume time (X-006).
+
+    Returns an empty list when no public-header dir is found.
     """
     raw_targets_by_name: Dict[str, dict] = {}
     for raw_t in package.raw_dump.get("targets", []) or []:
@@ -68,7 +102,7 @@ def _find_objc_headers_dir(
     if not product_targets and product_name in raw_targets_by_name:
         product_targets = [product_name]
     if not product_targets:
-        return None
+        return []
 
     # Targets that any product in this package exposes as part of its
     # own xcframework. Used to gate implicit-layout fallback in the dep
@@ -150,6 +184,7 @@ def _find_objc_headers_dir(
                 return target_dir
         return None
 
+    primary: Optional[Path] = None
     product_match: Optional[Path] = None
     any_match: Optional[Path] = None
     for tname in product_targets:
@@ -157,17 +192,16 @@ def _find_objc_headers_dir(
         if d is None:
             continue
         if tname == fw_name:
-            return d
+            primary = d
+            break
         if tname == product_name:
             if product_match is None:
                 product_match = d
         else:
             if any_match is None:
                 any_match = d
-    if product_match is not None:
-        return product_match
-    if any_match is not None:
-        return any_match
+    if primary is None:
+        primary = product_match if product_match is not None else any_match
 
     # First-level dependencies of direct product targets. Accepts both
     # `byName` and `target` dep shapes — the GRDB-style `.target()`
@@ -180,10 +214,14 @@ def _find_objc_headers_dir(
     # StripePayments). An internal-only dep — one no product
     # references — gets the same `include/` and umbrella fallbacks as
     # a direct product target, since the parent is the only place it
-    # ships.
+    # ships. Unlike the legacy single-dir resolver, these dep dirs are
+    # *added to* the primary match instead of used only as a fallback,
+    # so a mixed framework (Yams) still gets its internal C dep's
+    # headers (CYaml's yaml.h) even though the Swift target already
+    # supplied an umbrella (X-006).
     dep_fw_match: Optional[Path] = None
     dep_product_match: Optional[Path] = None
-    dep_any_match: Optional[Path] = None
+    dep_rest: List[Path] = []
     seen_deps: Set[str] = set()
     for tname in product_targets:
         raw = raw_targets_by_name.get(tname)
@@ -201,13 +239,30 @@ def _find_objc_headers_dir(
                 dep_fw_match = d
             elif dep_name == product_name and dep_product_match is None:
                 dep_product_match = d
-            elif dep_any_match is None:
-                dep_any_match = d
-    if dep_fw_match is not None:
-        return dep_fw_match
-    if dep_product_match is not None:
-        return dep_product_match
-    return dep_any_match
+            else:
+                dep_rest.append(d)
+
+    ordered: List[Path] = []
+    for d in (primary, dep_fw_match, dep_product_match, *dep_rest):
+        if d is not None and d not in ordered:
+            ordered.append(d)
+    return ordered
+
+
+def _find_objc_headers_dir(
+    package: Package,
+    product_name: str,
+    fw_name: str,
+) -> Optional[Path]:
+    """Single best public-ObjC-header dir for a product, or None.
+
+    Thin wrapper over `_collect_objc_header_dirs` preserving the legacy
+    single-dir contract (the first / highest-priority match). Callers
+    that must also fold in a mixed framework's internal C-dependency
+    headers should use `_collect_objc_header_dirs` directly.
+    """
+    dirs = _collect_objc_header_dirs(package, product_name, fw_name)
+    return dirs[0] if dirs else None
 
 
 def _generate_modulemap(fw_path: Path, fw_name: str) -> None:
@@ -220,13 +275,16 @@ def _generate_modulemap(fw_path: Path, fw_name: str) -> None:
     modules_dir = content_root / "Modules"
     modules_dir.mkdir(parents=True, exist_ok=True)
     headers_dir = content_root / "Headers"
+    module_name = _clang_module_name(fw_name)
     umbrella = headers_dir / f"{fw_name}.h"
     if umbrella.is_file():
         # The `module * { export * }` line tells Clang to walk the
         # Headers/ tree on its own, so nested layouts work without
-        # having to enumerate every file here.
+        # having to enumerate every file here. The module token uses the
+        # Clang-legal identifier (`cmark-gfm` → `cmark_gfm`) while the
+        # umbrella header keeps its real on-disk filename.
         text = (
-            f"framework module {fw_name} {{\n"
+            f"framework module {module_name} {{\n"
             f"  umbrella header \"{fw_name}.h\"\n"
             f"  export *\n"
             f"  module * {{ export * }}\n"
@@ -243,7 +301,7 @@ def _generate_modulemap(fw_path: Path, fw_name: str) -> None:
             for p in headers_dir.rglob("*.h")
             if p.is_file()
         )
-        lines = [f"framework module {fw_name} {{"]
+        lines = [f"framework module {module_name} {{"]
         for rel in header_rel_paths:
             lines.append(f"  header \"{rel}\"")
         lines.append("  export *")
@@ -273,8 +331,8 @@ def inject_objc_headers(
                 verbose_log(verbose, "  Public headers already present in framework")
                 return False
 
-    headers_dir = _find_objc_headers_dir(package, product_name, fw_name)
-    if headers_dir is None:
+    header_dirs = _collect_objc_header_dirs(package, product_name, fw_name)
+    if not header_dirs:
         verbose_log(verbose, f"  No ObjC public headers found in source tree for {fw_name}")
         return False
 
@@ -289,21 +347,29 @@ def inject_objc_headers(
     # because (a) `#import <Module/Sub/Header.h>` needs the physical
     # path to exist inside Headers/, and (b) a flat copy would silently
     # overwrite same-named headers that live in different subfolders
-    # (Codex [P2]).
-    module_subdir = headers_dir / fw_name
-    scan_base = module_subdir if module_subdir.is_dir() else headers_dir
+    # (Codex [P2]). A mixed framework contributes more than one source
+    # dir (the Swift target's umbrella dir + an internal C dep's
+    # `include/`, e.g. Yams + CYaml); copy them in priority order and
+    # let the first (highest-priority) dir win any filename collision so
+    # the primary product target's public surface can't be shadowed by a
+    # dependency's header.
     copied = 0
-    for h in sorted(scan_base.rglob("*.h")):
-        if not h.is_file():
-            continue
-        rel = h.relative_to(scan_base)
-        dest = headers_target / rel
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(h, dest)
-        copied += 1
+    for src_dir in header_dirs:
+        module_subdir = src_dir / fw_name
+        scan_base = module_subdir if module_subdir.is_dir() else src_dir
+        for h in sorted(scan_base.rglob("*.h")):
+            if not h.is_file():
+                continue
+            rel = h.relative_to(scan_base)
+            dest = headers_target / rel
+            if dest.exists():
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(h, dest)
+            copied += 1
 
     if copied == 0:
-        verbose_log(verbose, f"  No headers copied from {headers_dir}")
+        verbose_log(verbose, f"  No headers copied from {header_dirs[0]}")
         return False
 
     _generate_modulemap(fw_path, fw_name)
@@ -359,7 +425,13 @@ def inject_pure_swift_clang_modulemap(
     if not any(d.is_dir() for d in swiftmodule_dirs):
         return False
 
-    bridge_header_name = f"{fw_name}-Swift.h"
+    # Swift names the generated bridge header after the *module* name
+    # (the C99-mangled target name), so a hyphenated product like
+    # `cmark-gfm` emits `cmark_gfm-Swift.h`, not `cmark-gfm-Swift.h`.
+    # Use the Clang module identifier for both the DerivedData lookup and
+    # the `module <NAME>` token so they agree with what swiftc produced.
+    module_name = _clang_module_name(fw_name)
+    bridge_header_name = f"{module_name}-Swift.h"
     bridge_header_src: Optional[Path] = None
     if dd_path.is_dir():
         for candidate in dd_path.rglob(bridge_header_name):
@@ -382,7 +454,7 @@ def inject_pure_swift_clang_modulemap(
 
     modules_dir.mkdir(parents=True, exist_ok=True)
     text = (
-        f"framework module {fw_name} {{\n"
+        f"framework module {module_name} {{\n"
         f"  header \"{bridge_header_name}\"\n"
         f"  requires objc\n"
         f"}}\n"

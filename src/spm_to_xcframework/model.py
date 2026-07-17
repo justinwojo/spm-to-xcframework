@@ -72,6 +72,15 @@ class Target:
     exclude: List[str]
     language: str = Language.NA  # filled in by scan_target_languages()
     source_file_count: int = 0   # diagnostics; len(describe.targets[i].sources)
+    # True iff this is a ClangTarget whose compiled sources are all pure C
+    # (`.c` only — no ObjC/.m, ObjC++/.mm, C++/.cpp, or assembly). The
+    # Language enum collapses every ClangTarget to Language.OBJC, so this
+    # flag is the only signal that distinguishes a standalone-safe pure-C
+    # shim (canonical: swift-numerics' `_NumericsShims`) from an ObjC
+    # helper that needs umbrella-level link context (WCDB's `objc-core`).
+    # Filled in by scan_target_languages(); stays False for every non-Clang
+    # target and every target describe doesn't classify.
+    clang_is_pure_c: bool = False
 
 
 @dataclass

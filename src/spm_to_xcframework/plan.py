@@ -788,19 +788,27 @@ def _auto_synth_sibling_units(
             need here is swift-collections'
             `InternalCollectionsUtilities` (the hidden helper whose
             symbols other siblings' `.swiftinterface` reference).
+          * A pure-C shim (`tgt.clang_is_pure_c` — a ClangTarget
+            whose sources are all `.c`, no ObjC/C++/asm). The model
+            collapses every ClangTarget to Language.OBJC, so this
+            sub-classification is what lets swift-numerics'
+            `_NumericsShims` (a math-intrinsics helper a sibling's
+            `.private.swiftinterface` does `import _NumericsShims`
+            against) promote while WCDB's ObjC helpers stay out.
           * No `tool: "linker"` settings declared on the target —
-            even on Swift, a target that explicitly declares
+            even on Swift/pure-C, a target that explicitly declares
             `.linkedFramework` / `.linkedLibrary` probably depends
             on umbrella-level link context.
-        Anything else (ObjC/Mixed/N/A language, or any explicit
-        linker settings) → SKIP, leaving the umbrella to statically
-        embed the target. Canonical SKIP case: WCDB's `bridge`,
-        `common`, and `objc-core` ObjC helpers — they call
-        CoreFoundation but the `.linkedFramework("CoreFoundation")`
-        lives on the WCDBSwift umbrella's `linkerSettings`. Promoting
-        them standalone would fail at link with `Undefined symbol:
-        _CFAllocatorGetDefault` and friends. The `--target T` escape
-        hatch is still the explicit opt-in.
+        Anything else (ObjC/Mixed/N/A language that is not a pure-C
+        shim, or any explicit linker settings) → SKIP, leaving the
+        umbrella to statically embed the target. Canonical SKIP case:
+        WCDB's `bridge`, `common`, and `objc-core` ObjC helpers —
+        they call CoreFoundation but the
+        `.linkedFramework("CoreFoundation")` lives on the WCDBSwift
+        umbrella's `linkerSettings`. Promoting them standalone would
+        fail at link with `Undefined symbol: _CFAllocatorGetDefault`
+        and friends. The `--target T` escape hatch is still the
+        explicit opt-in.
 
     Skipped (won't produce a unit):
       - Non-regular targets (system / binary / executable / test /
@@ -876,11 +884,27 @@ def _auto_synth_sibling_units(
             tgt = package.target_by_name(sibling)
             if tgt is None:
                 continue
-            if tgt.language != Language.SWIFT:
+            # Promote pure-Swift helpers (autolink covers Foundation/CF)
+            # and pure-C shims. A ClangTarget collapses to Language.OBJC
+            # in the model, so the C carve-out is gated on the pure-C
+            # sub-classification (`clang_is_pure_c`): the canonical case is
+            # swift-numerics' `_NumericsShims` — a math-intrinsics helper
+            # with no ObjC and no system-framework linkage, whose module a
+            # sibling's `.private.swiftinterface` does
+            # `import _NumericsShims`. Genuine ObjC helpers (WCDB's
+            # `bridge` / `common` / `objc-core`) stay OUT: they call
+            # CoreFoundation through the umbrella's `.linkedFramework(...)`
+            # settings, which don't propagate to a standalone
+            # `.library(type: .dynamic)` build.
+            is_pure_swift = tgt.language == Language.SWIFT
+            is_pure_c_shim = (
+                tgt.language == Language.OBJC and tgt.clang_is_pure_c
+            )
+            if not (is_pure_swift or is_pure_c_shim):
                 continue
             if _target_declares_linker_settings(package, sibling):
                 continue
-            language = Language.SWIFT
+            language = tgt.language
             taken_product_names.add(sibling)
             plan.package_swift_edits.append(
                 PackageSwiftEdit(

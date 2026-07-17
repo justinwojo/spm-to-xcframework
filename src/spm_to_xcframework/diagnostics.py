@@ -98,6 +98,77 @@ _PATTERNS: List[Tuple[str, str, str]] = [
         "or wait for Xcode 26.4 / swift-collections 1.6.",
     ),
     (
+        # Library-evolution wall #1: `@_alwaysEmitIntoClient` initializers.
+        # A resilient (BUILD_LIBRARY_FOR_DISTRIBUTION=YES) class init that
+        # is `@_alwaysEmitIntoClient` must delegate to another initializer,
+        # but the upstream package declares a designated one that can't.
+        # Fires for the whole package's own source (not a rewrite artifact)
+        # — the same `xcodebuild archive` against an unmodified checkout
+        # reproduces. Canonical: Defaults's `Defaults.Key<Value>` /
+        # `Defaults._AnyKey` inits. Verified against Xcode 26.3 2026-07.
+        "is '@_alwaysEmitIntoClient' and must delegate to another initializer",
+        "Package cannot be built as a library-evolution dynamic framework "
+        "(@_alwaysEmitIntoClient initializer)",
+        "This is an upstream/toolchain limitation, not a spm-to-xcframework "
+        "bug: the package uses `@_alwaysEmitIntoClient` on a class initializer "
+        "that can't delegate, which Xcode 26.3 rejects when compiling for "
+        "library evolution (the resilient dynamic-framework mode every "
+        "xcframework needs). A plain `xcodebuild archive` of the unmodified "
+        "package reproduces it. There is no spm-to-xcframework workaround — "
+        "consume the package as source/SPM, or wait for an upstream release "
+        "that drops the attribute (or a newer toolchain that allows it).",
+    ),
+    (
+        # Library-evolution wall #2: `@_spi` protocol requirements without a
+        # default. A resilient module can't vend a protocol requirement that
+        # is `@_spi` unless a protocol extension supplies a default, because
+        # the requirement wouldn't be part of the stable public witness
+        # table. Fires on the upstream source, not a rewrite. Canonical:
+        # Apollo's `ApolloAPI` (`init(_fieldData:)`, `_fieldData`, `__data`,
+        # `init(_dataDict:)`, `_jsonEncodableValue`). Verified Xcode 26.3.
+        "cannot be declared '@_spi' without a default implementation in a protocol extension",
+        "Package cannot be built as a library-evolution dynamic framework "
+        "(@_spi protocol requirement)",
+        "This is an upstream/toolchain limitation, not a spm-to-xcframework "
+        "bug: the package declares `@_spi` protocol requirements with no "
+        "default implementation, which Xcode 26.3 rejects when compiling for "
+        "library evolution (the resilient dynamic-framework mode every "
+        "xcframework needs). A plain `xcodebuild archive` of the unmodified "
+        "package reproduces it. There is no spm-to-xcframework workaround — "
+        "consume the package as source/SPM, or wait for an upstream release "
+        "that adds the missing defaults (or moves the SPI off the protocol).",
+    ),
+    (
+        # Library-evolution wall #3: initializer-delegation resilience. An
+        # `@inlinable`/`@_alwaysEmitIntoClient` initializer compiled for
+        # library evolution must delegate on every path; when the upstream
+        # init assigns stored properties directly instead, the resilient
+        # build fails with `'self' used before 'self.init'`. This is *also*
+        # the swift-crypto → swift-asn1 (X-002) "static-only product can't
+        # be synthesized as a dynamic framework" signature: the product
+        # compiles when linked statically but not as a resilient dynamic
+        # framework. Canonical: swift-log's `Logging` (Logger/Entry inits)
+        # and swift-asn1's `ASN1.swift`. Verified against Xcode 26.3 2026-07.
+        # The string can in principle appear for a genuine init bug, but such
+        # a package wouldn't compile in ANY mode, so in practice reaching
+        # archive with this error means the resilient/LE build is the trigger
+        # — the raw compiler error is still printed below for confirmation.
+        "used before 'self.init' call or assignment to 'self'",
+        "Package cannot be built as a library-evolution dynamic framework "
+        "(initializer resilience)",
+        "This commonly indicates an upstream/toolchain limitation rather than "
+        "a spm-to-xcframework bug: an `@inlinable`/`@_alwaysEmitIntoClient` "
+        "initializer that assigns stored properties directly is rejected when "
+        "compiling for library evolution (the resilient dynamic-framework mode "
+        "every xcframework needs), even though the same code links fine "
+        "statically. For a transitive dependency this is the "
+        "\"static-only product can't be synthesized as a dynamic framework\" "
+        "case (e.g. swift-crypto → swift-asn1). A plain `xcodebuild archive` "
+        "of the unmodified package reproduces it. There is no "
+        "spm-to-xcframework workaround — consume the package as source/SPM, "
+        "or wait for an upstream release / newer toolchain.",
+    ),
+    (
         # Generic linker diagnostic — can be a missing sibling target
         # (the common SPM case), an SDK/toolchain mismatch, vendored
         # auto-link metadata, or a stale `-l` flag. Wording stays soft

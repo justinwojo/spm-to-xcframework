@@ -608,7 +608,21 @@ def _swift_string_literal(s: str) -> str:
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-_TARGET_CALL_KIND_RE = re.compile(r"\.(target|executableTarget|testTarget)\s*\(")
+# `.macro(...)` targets carry a `dependencies:` array exactly like the
+# other source-target kinds, so every dependency-graph rewrite in this
+# module (external-product → string-dep, orphan-`.product()` strip,
+# search-path closure) must reach them too. A macro target left with a
+# `.product(name:, package: ID)` reference to a package we consumed as an
+# overlay (or otherwise stripped) dangles as "unknown package 'ID' in
+# dependencies of target '<macro>'" at dump-package time — the exact
+# swift-navigation 2.10.3 failure (SwiftNavigationMacros → swift-case-paths).
+# `.macro` targets are never build units (the `--target` escape hatch
+# refuses them, and dedup only substitutes single-target *built* siblings),
+# so `_find_target_call_for_name` can never hand a macro target to
+# `edit_replace_with_binary_target`.
+_TARGET_CALL_KIND_RE = re.compile(
+    r"\.(target|executableTarget|testTarget|macro)\s*\("
+)
 _BINARY_TARGET_CALL_RE = re.compile(r"\.binaryTarget\s*\(")
 _LIBRARY_CALL_RE = re.compile(r"\.library\s*\(")
 _TOP_LEVEL_NAME_LABEL_RE = re.compile(
@@ -2946,6 +2960,151 @@ _POST_INIT_PLUS_EQ_RE = re.compile(
     r"(?<![.\w])\w+\.(?:dependencies|targets)\s*\+=\s*\["
 )
 
+# `_PRODUCT_CALL_RE` (`.product(`) is already defined above; reuse it.
+# This dep-declaration regex is deliberately NOT named `_PACKAGE_CALL_RE`
+# — that name is taken by the `\bPackage\s*\(` *constructor* finder near
+# the top of this module, and colliding on it silently breaks every
+# overlay/synth pass that locates the top-level `Package(...)` call.
+_PACKAGE_DEP_CALL_RE = re.compile(r"\.package\s*\(")
+
+
+def _pkg_identity_from_url(url: str) -> str:
+    """SPM package identity from a `url:`/`path:` string: last path
+    component, `.git` suffix removed, lowercased — the same convention
+    `prune_child._identity_from_url` and
+    `edit_strip_package_deps_for_identities` apply inline. A local path
+    like `"../swift-atomics"` normalises to `swift-atomics`. Named
+    distinctly from `prune_child._identity_from_url` so the flattened
+    single-file artifact carries no duplicate `def` (prune_child sits
+    below prepare in MODULE_ORDER, so we can't reuse its binding)."""
+    ident = url.strip().rstrip("/")
+    if not ident:
+        return ""
+    last = ident.rsplit("/", 1)[-1]
+    if last.endswith(".git"):
+        last = last[:-4]
+    return last.lower()
+
+
+def _testtarget_spans(
+    manifest_text: str, code_view: str
+) -> List[Tuple[int, int]]:
+    """`(open_paren_idx, close_paren_idx)` for every `.testTarget(...)`
+    call, discovered against the code-only `code_view` so a commented or
+    string-embedded occurrence can't match. Used to exclude test-only
+    `.product()` references from load-bearing detection."""
+    spans: List[Tuple[int, int]] = []
+    pos = 0
+    while True:
+        m = _TEST_TARGET_CALL_RE.search(code_view, pos)
+        if not m:
+            break
+        open_idx = m.end() - 1
+        close_idx = _balanced_close(manifest_text, open_idx)
+        if close_idx == -1:
+            break
+        spans.append((open_idx, close_idx))
+        pos = close_idx + 1
+    return spans
+
+
+def _load_bearing_package_identities(manifest_text: str) -> Set[str]:
+    """Lowercased identities of every package referenced by a
+    `.product(name:, package: ID)` call that is NOT lexically inside a
+    `.testTarget(...)` call.
+
+    A post-init `package.dependencies` mutation that adds one of these
+    identities is *load-bearing*: a consumer build compiles the target
+    (or the file-scope binding) that references it, so its `.package(...)`
+    declaration must survive `edit_strip_post_init_package_mutations`.
+    The scan is position-based rather than target-scoped so it covers
+    both manifest shapes uniformly:
+      - inline refs inside a target's `dependencies:` array
+        (`.product(name: "CasePathsMacrosSupport", package: "swift-case-paths")`
+        in swift-navigation's `.macro` target);
+      - hoisted file-scope bindings
+        (`let swiftAtomics = .product(name: "Atomics", package: "swift-atomics")`
+        in swift-nio), which sit outside every target call but drive real
+        target deps through a `let` variable.
+    Test-only references are excluded so genuinely optional tooling still
+    gets stripped: swift-case-paths' `OMIT_MACRO_TESTS` block wires
+    `MacroTesting` (from swift-macro-testing) into an appended
+    `.testTarget`, and stripping that dep is what keeps its transitive
+    xctest-dynamic-overlay from colliding with our overlay binaryTargets.
+    """
+    code_view = _make_code_token_view(manifest_text)
+    test_spans = _testtarget_spans(manifest_text, code_view)
+    identities: Set[str] = set()
+    pos = 0
+    while True:
+        m = _PRODUCT_CALL_RE.search(code_view, pos)
+        if not m:
+            break
+        head = m.start()
+        open_idx = m.end() - 1
+        close_idx = _balanced_close(manifest_text, open_idx)
+        if close_idx == -1:
+            break
+        pos = close_idx + 1
+        if any(
+            ts_open <= head and close_idx <= ts_close
+            for ts_open, ts_close in test_spans
+        ):
+            continue
+        pkg = _top_level_keyword_string_value(
+            manifest_text[open_idx + 1 : close_idx], "package"
+        )
+        if pkg:
+            identities.add(pkg.lower())
+    return identities
+
+
+def _package_entry_identity(entry_inner: str) -> Optional[str]:
+    """Best-effort SPM identity for one `.package(...)` declaration, given
+    the text *inside* its parens. Tries `url:` (remote), then `path:`
+    (local), then `id:` (registry). Returns None when none is a plain
+    string literal — the caller keeps unidentifiable entries rather than
+    strip a dep it can't name."""
+    url = _top_level_keyword_string_value(entry_inner, "url")
+    if url:
+        return _pkg_identity_from_url(url)
+    path = _top_level_keyword_string_value(entry_inner, "path")
+    if path:
+        return _pkg_identity_from_url(path)
+    reg = _top_level_keyword_string_value(entry_inner, "id")
+    if reg:
+        return reg.strip().lower()
+    return None
+
+
+def _post_init_dep_mutation_is_load_bearing(
+    manifest_text: str,
+    code_view: str,
+    open_idx: int,
+    close_idx: int,
+    load_bearing: Set[str],
+) -> bool:
+    """True iff the `package.dependencies` mutation whose argument list
+    spans `(open_idx, close_idx)` declares at least one `.package(...)`
+    entry whose identity is load-bearing. Scans for `.package(` heads in
+    the code-only view (depth-agnostic — handles both `+= [ ... ]` arrays
+    and `.append(contentsOf: [ ... ])`), balanced-closing each against the
+    original text so nested version calls (`.upToNextMajor(from:)`) are
+    stepped over cleanly."""
+    pos = open_idx + 1
+    while True:
+        m = _PACKAGE_DEP_CALL_RE.search(code_view, pos, close_idx)
+        if not m:
+            return False
+        p_open = m.end() - 1
+        p_close = _balanced_close(manifest_text, p_open)
+        if p_close == -1 or p_close > close_idx:
+            return False
+        ident = _package_entry_identity(manifest_text[p_open + 1 : p_close])
+        if ident is not None and ident in load_bearing:
+            return True
+        pos = p_close + 1
+
 
 def edit_strip_post_init_package_mutations(manifest_text: str) -> str:
     """Strip every file-scope `<var>.dependencies.append(...)`,
@@ -2962,47 +3121,60 @@ def edit_strip_post_init_package_mutations(manifest_text: str) -> str:
     optional build-time tool (swift-docc-plugin, swift-macro-testing,
     swift-snapshot-testing, swift-benchmark, example subprojects, …).
 
-    Why strip:
+    Why strip `.targets` mutations, and *optional* `.dependencies` ones:
       A downstream consumer building runtime products (which is the
-      entire mission of `spm-to-xcframework`) never needs any of these
-      build-time helpers. And when an umbrella consumes a transitive
-      sibling whose targets we've replaced with binaryTarget overlays,
-      a conditional append that transitively reaches the same package
-      identity reintroduces it into the graph with conflicting target
-      names — `xcodebuild archive` then aborts with "multiple packages
-      declare targets with a conflicting name". The canonical case is
+      entire mission of `spm-to-xcframework`) never needs any build-time
+      helper. And when an umbrella consumes a transitive sibling whose
+      targets we've replaced with binaryTarget overlays, a conditional
+      append that transitively reaches the same package identity
+      reintroduces it into the graph with conflicting target names —
+      `xcodebuild archive` then aborts with "multiple packages declare
+      targets with a conflicting name". The canonical case is
       swift-case-paths' OMIT_MACRO_TESTS-gated swift-macro-testing
       append, whose closure pulls in xctest-dynamic-overlay's
       IssueReporting/XCTestDynamicOverlay targets that we just injected
-      as binaryTargets.
+      as binaryTargets. The author's choice to put a dep behind
+      `package.dependencies.append(...)` is a signal it *may* be
+      optional; documentation/testing/benchmarking tooling is present
+      for the author and safely absent for consumers.
 
-    Why this is safe at consumer time:
-      The author's choice to put a dep behind `package.dependencies.
-      append(...)` is itself the signal that the dep is optional. Apple
-      and the broader ecosystem have settled on this idiom precisely so
-      that documentation/testing/benchmarking tooling can be present for
-      the package author and absent for downstream consumers. Stripping
-      preserves runtime correctness for every consumer-side build path;
-      it only removes work the package author cares about (their own
-      tests, their own docc generation, etc.). The remaining failure
-      mode — an author who put a *runtime* dep behind a compile-time
-      gate — is a design error on their part and was already broken for
-      most consumers anyway.
+    Why NOT strip *load-bearing* `.dependencies` mutations:
+      Some packages declare genuinely load-bearing runtime dependencies
+      after the initializer — not optional tooling. swift-nio hoists
+      `let swiftAtomics = .product(name: "Atomics", package:
+      "swift-atomics")` at file scope (referenced by NIOCore, NIOPosix,
+      …) and only *adds* the backing `.package(url:)` in a post-init
+      `package.dependencies += [...]` block (its
+      `SWIFTCI_USE_LOCAL_DEPS` else-branch). grpc-swift does the same for
+      swift-nio/swift-protobuf. Blanket-stripping those left every
+      referencing target dangling with "unknown package 'swift-atomics'"
+      at dump-package time — the X-003 regression. So a `.dependencies`
+      mutation is preserved whenever ANY `.package(...)` entry it
+      declares has an identity that is *referenced* by a
+      `.product(package: ID)` call outside a `.testTarget` (see
+      `_load_bearing_package_identities`). `.targets` mutations are still
+      always stripped: an appended target is never a build unit for us,
+      and the umbrella-conflict hazard above is real.
 
     Implementation: walks `_make_code_token_view(manifest_text)` (so
     `"` strings and `// /* */` comments don't trigger false matches),
     finds each append/`+=` head, runs `_balanced_close` against the
-    original text to find the matching `)` or `]`, then removes the
-    whole statement — including any trailing semicolon, any
-    leading-whitespace-only prefix on the same line, and the trailing
-    newline if it leaves the line empty. Removal proceeds back-to-front
-    so earlier offsets remain valid as later spans collapse.
+    original text to find the matching `)` or `]`. For `.dependencies`
+    mutations it then checks the enclosed `.package()` entries against
+    the load-bearing identity set and skips (preserves) the statement if
+    any is load-bearing; `.targets` mutations are unconditionally
+    collected. Collected statements are removed whole — including any
+    trailing semicolon, any leading-whitespace-only prefix on the same
+    line, and the trailing newline if it leaves the line empty. Removal
+    proceeds back-to-front so earlier offsets remain valid as later
+    spans collapse.
 
     Idempotent: when the manifest contains no qualifying calls, the
     function returns `manifest_text` unchanged. Re-running on already-
     stripped text is also a no-op.
     """
     code_view = _make_code_token_view(manifest_text)
+    load_bearing = _load_bearing_package_identities(manifest_text)
     spans: List[Tuple[int, int]] = []
 
     for regex in (_POST_INIT_APPEND_RE, _POST_INIT_PLUS_EQ_RE):
@@ -3010,6 +3182,13 @@ def edit_strip_post_init_package_mutations(manifest_text: str) -> str:
             open_idx = m.end() - 1  # points at `(` or `[`
             close_idx = _balanced_close(manifest_text, open_idx)
             if close_idx == -1:
+                continue
+            # `.targets` mutations always go (never a build unit for us);
+            # a `.dependencies` mutation survives when it declares any
+            # load-bearing package the graph still references.
+            if ".dependencies" in m.group(0) and _post_init_dep_mutation_is_load_bearing(
+                manifest_text, code_view, open_idx, close_idx, load_bearing
+            ):
                 continue
             spans.append((m.start(), close_idx + 1))
 

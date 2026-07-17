@@ -2558,6 +2558,208 @@ def _selftest_edit_append_synth_to_post_init_products_ignores_dotted_owner() -> 
             f"expected None when no file-scope products assignment exists; got:\n{out!r}")
 
 
+def _selftest_strip_post_init_preserves_load_bearing_hoisted_binding() -> None:
+    """X-003 (swift-nio / grpc-swift shape): a post-init
+    `package.dependencies += [...]` that backs a file-scope hoisted
+    `.product(package: ID)` binding is LOAD-BEARING and must survive the
+    strip, or every target that references the binding dangles with
+    "unknown package 'ID'" at dump-package time.
+
+    swift-nio declares `let swiftAtomics = .product(name: "Atomics",
+    package: "swift-atomics")` at file scope (referenced by NIOCore &c.)
+    and only adds the backing `.package(url:)` in a
+    `SWIFTCI_USE_LOCAL_DEPS`-guarded `+=` block. Both the remote if-branch
+    and the local-path else-branch reference the same load-bearing
+    identity, so BOTH statements must be preserved verbatim.
+    """
+    text = (
+        'let package = Package(\n'
+        '    name: "swift-nio",\n'
+        '    targets: [\n'
+        '        .target(name: "NIOCore", dependencies: [swiftAtomics]),\n'
+        '    ]\n'
+        ')\n'
+        'let swiftAtomics: PackageDescription.Target.Dependency = '
+        '.product(name: "Atomics", package: "swift-atomics")\n'
+        'if Context.environment["SWIFTCI_USE_LOCAL_DEPS"] == nil {\n'
+        '    package.dependencies += [\n'
+        '        .package(url: "https://github.com/apple/swift-atomics.git", from: "1.1.0"),\n'
+        '    ]\n'
+        '} else {\n'
+        '    package.dependencies += [\n'
+        '        .package(path: "../swift-atomics"),\n'
+        '    ]\n'
+        '}\n'
+    )
+    out = edit_strip_post_init_package_mutations(text)
+    _assert(
+        'url: "https://github.com/apple/swift-atomics.git"' in out,
+        f"load-bearing remote +=[] was stripped:\n{out}",
+    )
+    _assert(
+        '.package(path: "../swift-atomics")' in out,
+        f"load-bearing local-path else-branch +=[] was stripped:\n{out}",
+    )
+
+
+def _selftest_strip_post_init_strips_optional_appends() -> None:
+    """X-003 (swift-case-paths shape): post-init `.append(...)` of a
+    genuinely OPTIONAL dependency (docc plugin; test-only macro tooling)
+    is still stripped, and the appended `.testTarget` goes with it — none
+    are runtime-load-bearing for a consumer.
+
+    swift-macro-testing here is referenced only by the appended
+    `CasePathsMacrosTests` testTarget, so it is NOT load-bearing and must
+    be stripped: leaving it would drag its transitive
+    xctest-dynamic-overlay into the graph and collide with our overlay
+    binaryTargets. The `.macro` target itself (a real build input for the
+    library product) must be preserved untouched.
+    """
+    text = (
+        'let package = Package(\n'
+        '    name: "swift-case-paths",\n'
+        '    dependencies: [\n'
+        '        .package(url: "https://github.com/swiftlang/swift-syntax", from: "509.0.0"),\n'
+        '    ],\n'
+        '    targets: [\n'
+        '        .target(name: "CasePaths", dependencies: ["CasePathsMacros"]),\n'
+        '        .macro(name: "CasePathsMacros", dependencies: [\n'
+        '            .product(name: "SwiftSyntaxMacros", package: "swift-syntax"),\n'
+        '        ]),\n'
+        '    ]\n'
+        ')\n'
+        '#if !os(Windows)\n'
+        '  package.dependencies.append(\n'
+        '    .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.0.0")\n'
+        '  )\n'
+        '#endif\n'
+        'if ProcessInfo.processInfo.environment["OMIT_MACRO_TESTS"] == nil {\n'
+        '  package.dependencies.append(\n'
+        '    .package(url: "https://github.com/pointfreeco/swift-macro-testing", from: "0.2.0")\n'
+        '  )\n'
+        '  package.targets.append(\n'
+        '    .testTarget(name: "CasePathsMacrosTests", dependencies: [\n'
+        '      "CasePathsMacros",\n'
+        '      .product(name: "MacroTesting", package: "swift-macro-testing"),\n'
+        '    ])\n'
+        '  )\n'
+        '}\n'
+    )
+    out = edit_strip_post_init_package_mutations(text)
+    _assert("swift-docc-plugin" not in out,
+            f"optional docc-plugin append survived:\n{out}")
+    _assert("swift-macro-testing" not in out,
+            f"test-only swift-macro-testing append survived:\n{out}")
+    _assert("CasePathsMacrosTests" not in out,
+            f"appended testTarget survived:\n{out}")
+    _assert(
+        '.macro(name: "CasePathsMacros"' in out,
+        f"in-initializer .macro target was disturbed:\n{out}",
+    )
+
+
+def _selftest_strip_post_init_targets_mutation_always_stripped() -> None:
+    """X-003: a `package.targets` mutation is ALWAYS stripped, even when
+    it references a package that is load-bearing elsewhere. An appended
+    target is never a build unit for us, and keeping it invites the
+    umbrella target-name conflict the strip exists to prevent. Only the
+    load-bearing `.dependencies` statement is spared."""
+    text = (
+        'let package = Package(name: "P", targets: [.target(name: "P", '
+        'dependencies: [thing])])\n'
+        'let thing = .product(name: "Thing", package: "thing-pkg")\n'
+        'package.dependencies += [.package(url: "https://x/thing-pkg", from: "1.0.0")]\n'
+        'package.targets.append(.target(name: "ExtraP", '
+        'dependencies: [.product(name: "Thing", package: "thing-pkg")]))\n'
+    )
+    out = edit_strip_post_init_package_mutations(text)
+    _assert("thing-pkg" in out and 'url: "https://x/thing-pkg"' in out,
+            f"load-bearing dependencies += was stripped:\n{out}")
+    _assert("ExtraP" not in out,
+            f"appended target survived (targets mutation must always strip):\n{out}")
+
+
+def _selftest_strip_post_init_load_bearing_ignores_testtarget_only_refs() -> None:
+    """X-003: a `.product(package: ID)` reference that appears ONLY inside
+    a `.testTarget(...)` does NOT make ID load-bearing — the post-init
+    `.append` that adds it is still stripped. Mirrors swift-case-paths'
+    swift-macro-testing, whose sole consumer is a test target."""
+    text = (
+        'let package = Package(\n'
+        '    name: "P",\n'
+        '    targets: [\n'
+        '        .target(name: "P"),\n'
+        '        .testTarget(name: "PTests", dependencies: [\n'
+        '            .product(name: "Only", package: "only-pkg"),\n'
+        '        ]),\n'
+        '    ]\n'
+        ')\n'
+        'package.dependencies.append(.package(url: "https://x/only-pkg", from: "1.0.0"))\n'
+    )
+    out = edit_strip_post_init_package_mutations(text)
+    # The post-init append must be stripped (its package is referenced only
+    # from a test target, so it is NOT load-bearing).
+    _assert('url: "https://x/only-pkg"' not in out,
+            f"test-only-referenced post-init dep append was NOT stripped:\n{out}")
+    _assert("package.dependencies.append" not in out,
+            f"post-init append statement survived:\n{out}")
+    # The testTarget's own `.product(package:)` reference lives inside the
+    # initializer (not a post-init mutation), so it is untouched here —
+    # test targets themselves are stripped earlier, at staging.
+    _assert('.product(name: "Only", package: "only-pkg")' in out,
+            f"in-initializer testTarget ref was wrongly disturbed:\n{out}")
+
+
+def _selftest_macro_target_reached_by_orphan_ref_strip() -> None:
+    """X-003 Part 3 (swift-navigation shape): `.macro(...)` targets carry
+    a `dependencies:` array like any source target, so the dependency-
+    graph rewrite passes MUST reach them. Here a consumed-overlay
+    package's orphan `.product(package: ID)` inside a `.macro` target is
+    stripped by `edit_strip_orphan_product_refs_for_identities_in_all_targets`;
+    before the `_TARGET_CALL_KIND_RE` macro fix it survived and dangled
+    as "unknown package 'ID'" at dump-package time.
+    """
+    text = (
+        'let package = Package(\n'
+        '    name: "swift-navigation",\n'
+        '    targets: [\n'
+        '        .macro(name: "SwiftNavigationMacros", dependencies: [\n'
+        '            .product(name: "CasePathsMacrosSupport", package: "swift-case-paths"),\n'
+        '            .product(name: "SwiftSyntaxMacros", package: "swift-syntax"),\n'
+        '        ]),\n'
+        '    ]\n'
+        ')\n'
+    )
+    out = edit_strip_orphan_product_refs_for_identities_in_all_targets(
+        text, {"swift-case-paths"}
+    )
+    _assert("CasePathsMacrosSupport" not in out,
+            f"orphan .product() in .macro target was not stripped:\n{out}")
+    _assert("SwiftSyntaxMacros" in out,
+            f"unrelated .product() in .macro target was wrongly stripped:\n{out}")
+
+
+def _selftest_macro_target_reached_by_product_rewrite() -> None:
+    """X-003 Part 3: the external-product→string-dep rewrite also reaches
+    `.macro(...)` targets, so a consumed sibling product referenced from a
+    macro target resolves against the injected `.binaryTarget` overlay."""
+    text = (
+        'let package = Package(\n'
+        '    name: "swift-navigation",\n'
+        '    targets: [\n'
+        '        .macro(name: "SwiftNavigationMacros", dependencies: [\n'
+        '            .product(name: "CasePathsMacrosSupport", package: "swift-case-paths"),\n'
+        '        ]),\n'
+        '    ]\n'
+        ')\n'
+    )
+    out = edit_rewrite_external_product_to_string_dep_in_all_targets(
+        text, "CasePathsMacrosSupport", "swift-case-paths"
+    )
+    _assert('"CasePathsMacrosSupport"' in out and ".product(" not in out,
+            f".product() in .macro target was not rewritten to string dep:\n{out}")
+
+
 SWIFT_COLLECTIONS_WRAPPER_FIXTURE = '''// swift-tools-version:5.7
 import PackageDescription
 
@@ -3874,6 +4076,7 @@ def _auto_synth_pkg(
     sibling_target: str,
     sibling_language: str,
     sibling_settings: Optional[List[dict]] = None,
+    sibling_clang_is_pure_c: bool = False,
 ) -> "tool.Package":
     """Construct a minimal tool.Package that exercises
     `_auto_synth_sibling_units`'s internal-helper branch: one umbrella
@@ -3902,11 +4105,12 @@ def _auto_synth_pkg(
     }
     raw_, products, targets, platforms, name, tv = _parse_dump(raw)
     # `_parse_dump` doesn't fill the language field (that's a separate
-    # disk scan pass). Stamp the sibling's language to whatever the
-    # test wants so the auto-synth gate sees the right value.
+    # disk scan pass). Stamp the sibling's language / pure-C flag to
+    # whatever the test wants so the auto-synth gate sees the right value.
     for t in targets:
         if t.name == sibling_target:
             t.language = sibling_language
+            t.clang_is_pure_c = sibling_clang_is_pure_c
     return tool.Package(
         name=name, tools_version=tv, platforms=platforms,
         products=products, targets=targets, schemes=[],
@@ -4020,6 +4224,329 @@ def _selftest_auto_synth_skips_swift_with_explicit_linker_settings() -> None:
     _assert("SwiftWithLink" not in names,
             "Swift helper with explicit linker settings must NOT be "
             f"auto-promoted; build_units={names!r}")
+
+
+def _selftest_auto_synth_promotes_pure_c_shim() -> None:
+    """[X-001 regression] A pure-C internal shim (a ClangTarget whose
+    sources are all `.c`) MUST be auto-promoted to its own xcframework.
+    Canonical case: swift-numerics' `_NumericsShims`. The model collapses
+    every ClangTarget to Language.OBJC, so the promotion is gated on the
+    `clang_is_pure_c` sub-classification rather than the language enum.
+    Without promotion, `RealModule.xcframework` ships without the shim and
+    a consumer compiling against `RealModule.private.swiftinterface` (which
+    does `import _NumericsShims`) can't resolve the module.
+
+    The synthesized build unit must carry the shim's real language
+    (Language.OBJC — there is no Language.C), NOT a hard-coded Swift, so
+    Execute/Verify treat it as the clang-module framework it is.
+    """
+    pkg = _auto_synth_pkg(
+        umbrella_target="RealModule",
+        sibling_target="_NumericsShims",
+        sibling_language=tool.Language.OBJC,
+        sibling_clang_is_pure_c=True,
+    )
+    plan = _auto_synth_seed_plan("RealModule")
+    tool._auto_synth_sibling_units(plan, pkg, taken_product_names=set())
+    names = [bu.name for bu in plan.build_units]
+    _assert("_NumericsShims" in names,
+            f"pure-C shim should be auto-promoted; build_units={names!r}")
+    kinds = [(e.kind, e.product_name) for e in plan.package_swift_edits]
+    _assert(("synth_library", "_NumericsShims") in kinds,
+            f"missing synth_library edit for the shim; edits={kinds!r}")
+    shim_unit = next(bu for bu in plan.build_units
+                     if bu.name == "_NumericsShims")
+    _assert(shim_unit.language == tool.Language.OBJC,
+            f"pure-C shim unit must carry its real (ObjC) language, "
+            f"got {shim_unit.language!r}")
+
+
+def _selftest_auto_synth_skips_impure_clang_helper() -> None:
+    """[X-001 regression — the guard that keeps WCDB out] A ClangTarget
+    that is NOT pure C (its sources include ObjC `.m` / ObjC++ `.mm` /
+    C++), i.e. `clang_is_pure_c == False`, must NOT be auto-promoted.
+    This is the exact WCDB `objc-core` shape: an ObjC-language helper that
+    relies on `.linkedFramework(...)` context declared on the umbrella.
+    The pure-C carve-out (X-001) must not widen the door for it.
+    """
+    pkg = _auto_synth_pkg(
+        umbrella_target="WCDBSwift",
+        sibling_target="objc-core",
+        sibling_language=tool.Language.OBJC,
+        sibling_clang_is_pure_c=False,
+    )
+    plan = _auto_synth_seed_plan("WCDBSwift")
+    tool._auto_synth_sibling_units(plan, pkg, taken_product_names=set())
+    names = [bu.name for bu in plan.build_units]
+    _assert("objc-core" not in names,
+            f"impure (ObjC) ClangTarget must NOT be auto-promoted; "
+            f"build_units={names!r}")
+    kinds = [(e.kind, e.product_name) for e in plan.package_swift_edits]
+    _assert(("synth_library", "objc-core") not in kinds,
+            f"impure ClangTarget edit leaked into plan; edits={kinds!r}")
+
+
+def _selftest_auto_synth_skips_pure_c_with_explicit_linker_settings() -> None:
+    """[X-001 regression — secondary guard survives the carve-out] Even a
+    pure-C shim that declares its OWN `.linkedFramework(...)` /
+    `.linkedLibrary(...)` must be skipped: the declaration signals it needs
+    link-time context a standalone `.library(type: .dynamic)` build may not
+    have. The `--target T` escape hatch remains the explicit opt-in. This
+    pins that the pure-C path still honours guard (b)."""
+    pkg = _auto_synth_pkg(
+        umbrella_target="Top",
+        sibling_target="CShimWithLink",
+        sibling_language=tool.Language.OBJC,
+        sibling_clang_is_pure_c=True,
+        sibling_settings=[
+            {"tool": "linker",
+             "kind": {"linkedLibrary": ["z"]}},
+        ],
+    )
+    plan = _auto_synth_seed_plan("Top")
+    tool._auto_synth_sibling_units(plan, pkg, taken_product_names=set())
+    names = [bu.name for bu in plan.build_units]
+    _assert("CShimWithLink" not in names,
+            "pure-C shim with explicit linker settings must NOT be "
+            f"auto-promoted; build_units={names!r}")
+
+
+def _selftest_clang_sources_are_pure_c_classification() -> None:
+    """[X-001 unit] `_clang_sources_are_pure_c` distinguishes a pure-C
+    source list from ObjC/C++/assembly/header-only ones. This is the
+    Inspect-side signal that feeds `Target.clang_is_pure_c`."""
+    from spm_to_xcframework.inspect import _clang_sources_are_pure_c
+    # Pure C — at least one .c, nothing disqualifying (.h is neutral).
+    _assert(_clang_sources_are_pure_c(["_NumericsShims.c"]) is True,
+            "single .c source is pure C")
+    _assert(_clang_sources_are_pure_c(["a.c", "include/a.h"]) is True,
+            ".h headers are neutral")
+    # Not pure C — any ObjC / ObjC++ / C++ / assembly source disqualifies.
+    _assert(_clang_sources_are_pure_c(["a.m", "b.c"]) is False,
+            ".m (ObjC) disqualifies")
+    _assert(_clang_sources_are_pure_c(["a.mm"]) is False,
+            ".mm (ObjC++) disqualifies")
+    _assert(_clang_sources_are_pure_c(["a.cpp"]) is False,
+            ".cpp (C++) disqualifies")
+    _assert(_clang_sources_are_pure_c(["a.C"]) is False,
+            "capital .C (C++) disqualifies (case-sensitive)")
+    _assert(_clang_sources_are_pure_c(["a.s", "b.c"]) is False,
+            ".s (assembly) disqualifies")
+    # Uppercase C++/ObjC++/asm spellings mixed with a genuine .c must NOT
+    # slip through as pure C (Codex/Grok r1: the denylist was case-sensitive,
+    # so `["shim.c", "backend.CPP"]` was misclassified True). The non-C
+    # denylist is now matched case-insensitively.
+    _assert(_clang_sources_are_pure_c(["shim.c", "backend.CPP"]) is False,
+            "uppercase .CPP mixed with .c is not pure C")
+    _assert(_clang_sources_are_pure_c(["shim.c", "b.CC"]) is False,
+            "uppercase .CC mixed with .c is not pure C")
+    _assert(_clang_sources_are_pure_c(["shim.c", "b.MM"]) is False,
+            "uppercase .MM (ObjC++) mixed with .c is not pure C")
+    _assert(_clang_sources_are_pure_c(["shim.c", "b.S"]) is False,
+            "uppercase .S (assembly) mixed with .c is not pure C")
+    _assert(_clang_sources_are_pure_c(["a.cp"]) is False,
+            ".cp (C++) disqualifies")
+    # No .c at all → not pure C (header-only / empty / wrong type).
+    _assert(_clang_sources_are_pure_c(["only.h"]) is False,
+            "header-only is not pure C")
+    _assert(_clang_sources_are_pure_c([]) is False, "empty is not pure C")
+    _assert(_clang_sources_are_pure_c(None) is False, "None is not pure C")
+
+
+def _selftest_collect_byname_dependency_names() -> None:
+    """[X-005 unit] `_collect_byname_dependency_names` harvests bare-name
+    (`byName`) deps of REGULAR targets, excluding internal-target names and
+    non-REGULAR targets, and ignores the `.product(...)` shape (which the
+    identity-carrying collector already handles). This is the Macaw shape:
+    `dependencies: ["SWXMLHash"]` on the Macaw target."""
+    from spm_to_xcframework.inspect import _collect_byname_dependency_names
+    raw_dump = {
+        "targets": [
+            {"name": "Macaw", "dependencies": [
+                {"byName": ["SWXMLHash", None]},        # external bare name
+                {"byName": ["MacawCore", None]},        # internal sibling
+                {"product": ["Ignore", "pkg", None, None]},  # product shape
+            ]},
+            {"name": "MacawCore", "dependencies": []},
+            {"name": "MacawTests", "dependencies": [
+                {"byName": ["SWXMLHash", None]},        # test target — excluded
+            ]},
+        ],
+    }
+    targets = [
+        tool.Target(name="Macaw", kind=tool.TargetKind.REGULAR, path=None,
+                    public_headers_path=None, dependencies=[], exclude=[]),
+        tool.Target(name="MacawCore", kind=tool.TargetKind.REGULAR, path=None,
+                    public_headers_path=None, dependencies=[], exclude=[]),
+        tool.Target(name="MacawTests", kind=tool.TargetKind.TEST, path=None,
+                    public_headers_path=None, dependencies=[], exclude=[]),
+    ]
+    out = _collect_byname_dependency_names(raw_dump, targets)
+    _assert(out == {"SWXMLHash": ["Macaw"]},
+            f"expected only the external bare name attributed to Macaw, "
+            f"got {out!r}")
+
+
+def _selftest_resolve_byname_external_products() -> None:
+    """[X-005 unit] `_resolve_byname_external_products` maps a bare name to
+    the DIRECT dependency package that declares a product with that name and
+    folds it into `referenced_by_identity` as if the root had written
+    `.product(name:, package:)`. Ambiguous (2+ owners) and unmatched names
+    are left unresolved. dump-package is stubbed so the test needs no swift
+    toolchain; the direct-dep checkouts are real temp dirs so the
+    manifest-presence guard passes."""
+    import sys
+    _insp = sys.modules["spm_to_xcframework.inspect"]
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        # Real checkout dirs (each with a Package.swift) for three direct
+        # deps: one owns SWXMLHash, two both own a colliding "Dup" product.
+        for ident in ("swxmlhash", "dupa", "dupb"):
+            (root / ident).mkdir()
+            (root / ident / "Package.swift").write_text("// stub\n")
+        products_by_ident = {
+            "swxmlhash": [tool.Product(name="SWXMLHash",
+                                       linkage=tool.Linkage.AUTOMATIC,
+                                       targets=["SWXMLHash"])],
+            "dupa": [tool.Product(name="Dup", linkage=tool.Linkage.AUTOMATIC,
+                                  targets=["Dup"])],
+            "dupb": [tool.Product(name="Dup", linkage=tool.Linkage.AUTOMATIC,
+                                  targets=["Dup"])],
+        }
+
+        def _fake_dump_package(checkout):
+            ident = Path(checkout).name
+            prods = products_by_ident.get(ident, [])
+            return ({}, prods, [], [], ident, "5.7")
+
+        tree = {"dependencies": [
+            {"identity": "swxmlhash", "path": str(root / "swxmlhash")},
+            {"identity": "dupa", "path": str(root / "dupa")},
+            {"identity": "dupb", "path": str(root / "dupb")},
+        ]}
+        byname_candidates = {
+            "SWXMLHash": ["Macaw"],   # unique → resolves
+            "Dup": ["Macaw"],         # ambiguous → skipped
+            "Ghost": ["Macaw"],       # no owner → skipped
+        }
+        referenced: "dict" = {}
+        saved = _insp.dump_package
+        try:
+            _insp.dump_package = _fake_dump_package
+            _insp._resolve_byname_external_products(
+                tree, byname_candidates, referenced, verbose=False
+            )
+        finally:
+            _insp.dump_package = saved
+
+    _assert(set(referenced.keys()) == {"swxmlhash"},
+            f"only the uniquely-resolved bare name should fold in; "
+            f"got identities {sorted(referenced.keys())!r}")
+    entry = referenced["swxmlhash"]
+    _assert(entry["products"] == ["SWXMLHash"], f"products={entry['products']!r}")
+    _assert(entry["root_targets"] == ["Macaw"],
+            f"root_targets={entry['root_targets']!r}")
+    _assert(entry["product_to_root_targets"] == {"SWXMLHash": ["Macaw"]},
+            f"product_to_root_targets={entry['product_to_root_targets']!r}")
+
+
+def _selftest_discover_transitive_packages_byname_wiring() -> None:
+    """[X-005 wiring + M1 attribution merge] Drive the whole
+    `_discover_transitive_packages` path (not just the resolver) with
+    `_show_dependencies` + `dump_package` stubbed, covering two shapes:
+
+      - pkgb: referenced ONLY by a bare name (`dependencies: ["Beta"]`) —
+        the Macaw/CocoaMQTT case. Before X-005 this returned nothing; it
+        must now surface as a TransitivePackageInfo attributed to its
+        byName-referencing target (the wiring gap Codex/Grok r1 flagged:
+        the isolated resolver test did not exercise this).
+      - pkga: referenced BOTH via `.product(name:"Alpha", package:"pkga")`
+        from target A AND by bare name from target B. The bare ref must
+        MERGE B into pkga's attribution rather than being dropped as
+        "already covered" (Grok r1 M1) — otherwise `--product`/`--target`
+        closure-filtering that selects B-but-not-A would wrongly drop the
+        transitive.
+    """
+    import sys
+    _insp = sys.modules["spm_to_xcframework.inspect"]
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        for ident in ("pkga", "pkgb"):
+            (root / ident).mkdir()
+            (root / ident / "Package.swift").write_text("// stub\n")
+
+        raw_dump = {
+            "targets": [
+                {"name": "A", "dependencies": [
+                    {"product": ["Alpha", "pkga", None, None]},
+                ]},
+                {"name": "B", "dependencies": [
+                    {"byName": ["Alpha", None]},   # same product, bare — MERGE
+                ]},
+                {"name": "C", "dependencies": [
+                    {"byName": ["Beta", None]},     # byName-only — WIRING
+                ]},
+            ],
+        }
+        targets = [
+            tool.Target(name=n, kind=tool.TargetKind.REGULAR, path=None,
+                        public_headers_path=None, dependencies=[], exclude=[])
+            for n in ("A", "B", "C")
+        ]
+        products_by_ident = {
+            "pkga": [tool.Product(name="Alpha", linkage=tool.Linkage.AUTOMATIC,
+                                  targets=["Alpha"])],
+            "pkgb": [tool.Product(name="Beta", linkage=tool.Linkage.AUTOMATIC,
+                                  targets=["Beta"])],
+        }
+
+        def _fake_dump_package(checkout):
+            ident = Path(checkout).name
+            return ({}, products_by_ident.get(ident, []), [], [], ident, "5.7")
+
+        def _fake_show_deps(staged_dir, verbose):
+            return {"dependencies": [
+                {"identity": "pkga", "path": str(root / "pkga"),
+                 "url": "https://example.com/pkga", "version": "1.0.0",
+                 "dependencies": []},
+                {"identity": "pkgb", "path": str(root / "pkgb"),
+                 "url": "https://example.com/pkgb", "version": "2.0.0",
+                 "dependencies": []},
+            ]}
+
+        saved_dump = _insp.dump_package
+        saved_show = _insp._show_dependencies
+        try:
+            _insp.dump_package = _fake_dump_package
+            _insp._show_dependencies = _fake_show_deps
+            out = _insp._discover_transitive_packages(
+                root, raw_dump, targets, verbose=False
+            )
+        finally:
+            _insp.dump_package = saved_dump
+            _insp._show_dependencies = saved_show
+
+    by_ident = {tp.identity: tp for tp in out}
+    _assert(set(by_ident) == {"pkga", "pkgb"},
+            f"both direct deps should surface as transitives; got "
+            f"{sorted(by_ident)!r}")
+
+    # M1: the bare ref from B is merged into pkga's attribution, not dropped.
+    pkga = by_ident["pkga"]
+    _assert(pkga.referencing_root_targets == ["A", "B"],
+            f"pkga must be attributed to BOTH the .product ref (A) and the "
+            f"merged byName ref (B); got {pkga.referencing_root_targets!r}")
+    _assert(pkga.product_to_root_targets == {"Alpha": ["A", "B"]},
+            f"pkga product_to_root_targets={pkga.product_to_root_targets!r}")
+    _assert(pkga.referenced_products == ["Alpha"],
+            f"pkga referenced_products={pkga.referenced_products!r}")
+
+    # Wiring: pkgb, reachable only by bare name, is discovered + attributed.
+    pkgb = by_ident["pkgb"]
+    _assert(pkgb.referencing_root_targets == ["C"],
+            f"pkgb referencing_root_targets={pkgb.referencing_root_targets!r}")
+    _assert(pkgb.referenced_products == ["Beta"],
+            f"pkgb referenced_products={pkgb.referenced_products!r}")
 
 
 def _selftest_find_target_call_for_name_ignores_commented_calls() -> None:
@@ -5555,6 +6082,48 @@ def _selftest_diagnostics_scan_known_patterns() -> None:
             "lower-case 'module' must still hit the binary-mismatch pattern, "
             "not the new module-not-found regex")
 
+    # --- Library-evolution walls (X-002 + LE-diagnostic item) -----------
+    # Three upstream/toolchain LE limitations every xcframework build can
+    # hit. Each must map to an "upstream/toolchain limitation, not a
+    # spm-to-xcframework bug" diagnosis so users stop chasing a tool bug.
+    # Compiler strings verified against Xcode 26.3 corpus result.json files
+    # (Defaults, Apollo, swift-log / swift-asn1) 2026-07.
+
+    # Wall #1 — `@_alwaysEmitIntoClient` initializer (Defaults).
+    diag = scan(
+        "error: initializer 'init(_:)' is '@_alwaysEmitIntoClient' and "
+        "must delegate to another initializer"
+    )
+    _assert(diag is not None, "@_alwaysEmitIntoClient pattern must match")
+    _assert("library-evolution" in diag.headline.lower(), diag.headline)
+    _assert("alwaysemitintoclient" in diag.headline.lower(), diag.headline)
+    _assert("upstream" in diag.suggestion.lower() and
+            "not a spm-to-xcframework" in diag.suggestion.lower(),
+            diag.suggestion)
+
+    # Wall #2 — `@_spi` protocol requirement without a default (Apollo).
+    diag = scan(
+        "error: instance method '_fieldData' cannot be declared '@_spi' "
+        "without a default implementation in a protocol extension"
+    )
+    _assert(diag is not None, "@_spi protocol requirement pattern must match")
+    _assert("library-evolution" in diag.headline.lower(), diag.headline)
+    _assert("@_spi" in diag.headline, diag.headline)
+    _assert("upstream" in diag.suggestion.lower(), diag.suggestion)
+
+    # Wall #3 — initializer-delegation resilience; ALSO the swift-crypto →
+    # swift-asn1 (X-002) static-only-can't-go-dynamic signature.
+    diag = scan(
+        "error: 'self' used before 'self.init' call or assignment to 'self'"
+    )
+    _assert(diag is not None, "self-before-init pattern must match")
+    _assert("library-evolution" in diag.headline.lower(), diag.headline)
+    _assert("initializer resilience" in diag.headline.lower(), diag.headline)
+    _assert("static-only" in diag.suggestion.lower() and
+            "swift-asn1" in diag.suggestion.lower(),
+            "suggestion should name the X-002 static-only case: "
+            f"{diag.suggestion}")
+
 
 def _selftest_edit_strip_test_targets() -> None:
     """`edit_strip_test_targets` excises `.testTarget(...)` calls from
@@ -5860,6 +6429,78 @@ def _selftest_inject_pure_swift_clang_modulemap() -> None:
         _assert(result is False, "missing -Swift.h should short-circuit")
         _assert(not (fw / "Modules" / "module.modulemap").exists(),
                 "no modulemap should be written when bridge header absent")
+
+    # 5. [X-004 regression] Hyphenated framework name — swiftc names the
+    #    generated bridge header after the C99-mangled MODULE name, so a
+    #    `cmark-gfm` product emits `cmark_gfm-Swift.h` (not
+    #    `cmark-gfm-Swift.h`). The lookup, the copied filename, and the
+    #    `module <NAME>` token must all use the sanitized identifier so
+    #    they agree with what swiftc produced — otherwise the modulemap
+    #    is unresolvable (`framework module cmark-gfm { ... }` is illegal
+    #    and no consumer can `@import cmark_gfm`).
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        fw = _make_swift_framework(td_path / "out", "cmark-gfm")
+        # DerivedData carries the swiftc-emitted, sanitized bridge header.
+        dd = td_path / "build" / "DerivedData"
+        dsrc = (dd / "Build" / "Intermediates.noindex" / "cmark_gfm.build"
+                / "Release-iphoneos" / "cmark_gfm.build" / "DerivedSources")
+        dsrc.mkdir(parents=True)
+        (dsrc / "cmark_gfm-Swift.h").write_text("// bridge\n")
+        result = inject_pure_swift_clang_modulemap(
+            fw_path=fw, fw_name="cmark-gfm", dd_path=dd,
+            variant="ios-arm64", verbose=False,
+        )
+        _assert(result is True, "hyphenated happy path should return True")
+        mm_text = (fw / "Modules" / "module.modulemap").read_text()
+        _assert("framework module cmark_gfm" in mm_text,
+                f"module token must be sanitized to cmark_gfm:\n{mm_text}")
+        _assert("cmark-gfm" not in mm_text.split("{")[0],
+                f"the `module` line must not carry the hyphen:\n{mm_text}")
+        # Bridge header referenced + copied under its swiftc name.
+        _assert('header "cmark_gfm-Swift.h"' in mm_text, mm_text)
+        _assert((fw / "Headers" / "cmark_gfm-Swift.h").is_file(),
+                "sanitized-name bridge header must be copied into Headers/")
+
+
+def _selftest_generate_modulemap_hyphenated_name() -> None:
+    """[X-004 regression] `_generate_modulemap` + `_clang_module_name`:
+    the ObjC-header modulemap path (used by `inject_objc_headers`) must
+    emit a Clang-legal `module` token for hyphenated product names while
+    keeping the real header filenames literal. Covers both the umbrella
+    (`<fw>.h` present) and explicit-header forms."""
+    from spm_to_xcframework.execute.inject_objc import (
+        _clang_module_name, _generate_modulemap,
+    )
+    # Unit: the name mangler mirrors SPM's C99 identifier mangling.
+    _assert(_clang_module_name("cmark-gfm") == "cmark_gfm",
+            _clang_module_name("cmark-gfm"))
+    _assert(_clang_module_name("Foo_Bar") == "Foo_Bar", "legal name unchanged")
+    _assert(_clang_module_name("swift.foo") == "swift_foo", "dot → underscore")
+    _assert(_clang_module_name("1abc") == "_1abc", "leading digit prefixed")
+
+    # Umbrella form: `cmark-gfm.h` present.
+    with tempfile.TemporaryDirectory() as td:
+        fw = Path(td) / "cmark-gfm.framework"
+        (fw / "Headers").mkdir(parents=True)
+        (fw / "Headers" / "cmark-gfm.h").write_text("// umbrella\n")
+        _generate_modulemap(fw, "cmark-gfm")
+        mm = (fw / "Modules" / "module.modulemap").read_text()
+        _assert(mm.startswith("framework module cmark_gfm {"),
+                f"umbrella form must open with sanitized module token:\n{mm}")
+        _assert('umbrella header "cmark-gfm.h"' in mm,
+                f"umbrella header keeps its literal filename:\n{mm}")
+
+    # Explicit form: no `<fw>.h` umbrella, list headers individually.
+    with tempfile.TemporaryDirectory() as td:
+        fw = Path(td) / "cmark-gfm.framework"
+        (fw / "Headers").mkdir(parents=True)
+        (fw / "Headers" / "cmark.h").write_text("// header\n")
+        _generate_modulemap(fw, "cmark-gfm")
+        mm = (fw / "Modules" / "module.modulemap").read_text()
+        _assert(mm.startswith("framework module cmark_gfm {"),
+                f"explicit form must open with sanitized module token:\n{mm}")
+        _assert('header "cmark.h"' in mm, f"explicit header listed:\n{mm}")
 
 
 def _selftest_diagnostics_scan_plan_error() -> None:
@@ -7244,6 +7885,89 @@ def _selftest_inject_objc_headers_with_umbrella(tmp_root: Path) -> None:
         verbose=False,
     )
     _assert(not second, "inject_objc_headers should be idempotent")
+
+
+def _selftest_inject_objc_headers_mixed_c_dep_yaml(tmp_root: Path) -> None:
+    """[X-006 regression] A mixed framework whose Swift target ships an
+    umbrella header that `#import`s an INTERNAL C dependency's header must
+    get BOTH header dirs copied. Canonical case: Yams's `Yams.h` umbrella
+    does `#import <Yams/yaml.h>`, but `yaml.h` lives in the internal-only
+    `CYaml` target's `include/`. The legacy single-dir resolver stopped at
+    the Yams umbrella (first match) and dropped `yaml.h`, leaving the
+    `#import` dangling at consume time.
+
+    Asserts: (1) `_collect_objc_header_dirs` returns BOTH dirs, primary
+    first; (2) `_find_objc_headers_dir` (legacy wrapper) still returns only
+    the primary (backward compat); (3) `inject_objc_headers` copies both
+    `Yams.h` AND `yaml.h` into the framework Headers/.
+    """
+    base = tmp_root / "objc_inject_mixed_c_dep"
+    staged = base / "staged"
+    staged.mkdir(parents=True)
+
+    # Swift target `Yams` — umbrella header at the target root, no include/.
+    yams_dir = staged / "Sources" / "Yams"
+    yams_dir.mkdir(parents=True)
+    (yams_dir / "Yams.swift").write_text("// swift")
+    (yams_dir / "Yams.h").write_text("#import <Yams/yaml.h>\n")
+
+    # Internal-only C target `CYaml` — default SPM `include/` layout, no
+    # product exposes it, so its headers fold into the parent framework.
+    cyaml_inc = staged / "Sources" / "CYaml" / "include"
+    cyaml_inc.mkdir(parents=True)
+    (cyaml_inc / "yaml.h").write_text("// libyaml public header")
+    (staged / "Sources" / "CYaml" / "yaml.c").write_text("// impl")
+
+    raw_dump = {
+        "name": "Yams",
+        "products": [
+            {"name": "Yams", "type": {"library": ["automatic"]},
+             "targets": ["Yams"]},
+        ],
+        "targets": [
+            {"name": "Yams", "type": "regular", "path": "Sources/Yams",
+             "publicHeadersPath": None,
+             "dependencies": [{"target": ["CYaml", None]}]},
+            {"name": "CYaml", "type": "regular", "path": "Sources/CYaml",
+             "publicHeadersPath": None, "dependencies": []},
+        ],
+    }
+    package = Package(
+        name="Yams", tools_version="5.7.0", platforms=[],
+        products=[Product(name="Yams", linkage=Linkage.AUTOMATIC,
+                          targets=["Yams"])],
+        targets=[
+            Target(name="Yams", kind=TargetKind.REGULAR, path="Sources/Yams",
+                   public_headers_path=None, dependencies=["CYaml"],
+                   exclude=[], language=Language.MIXED),
+            Target(name="CYaml", kind=TargetKind.REGULAR, path="Sources/CYaml",
+                   public_headers_path=None, dependencies=[], exclude=[],
+                   language=Language.OBJC),
+        ],
+        schemes=[], raw_dump=raw_dump, staged_dir=staged,
+    )
+
+    from spm_to_xcframework.execute.inject_objc import _collect_objc_header_dirs
+    dirs = _collect_objc_header_dirs(package, product_name="Yams",
+                                     fw_name="Yams")
+    _assert(dirs == [yams_dir, cyaml_inc],
+            f"expected [Yams dir, CYaml/include], got {dirs!r}")
+    # Legacy single-dir wrapper must still yield only the primary.
+    _assert(_find_objc_headers_dir(package, product_name="Yams",
+                                   fw_name="Yams") == yams_dir,
+            "legacy _find_objc_headers_dir must return only the primary dir")
+
+    fw = base / "Yams.framework"
+    fw.mkdir()
+    injected = inject_objc_headers(
+        package=package, product_name="Yams", fw_name="Yams",
+        fw_path=fw, verbose=False,
+    )
+    _assert(injected, "inject_objc_headers should have returned True")
+    _assert((fw / "Headers" / "Yams.h").is_file(),
+            "umbrella Yams.h must be copied")
+    _assert((fw / "Headers" / "yaml.h").is_file(),
+            "internal C dep's yaml.h must ALSO be copied (X-006)")
 
 
 def _selftest_inject_objc_headers_explicit_modulemap(tmp_root: Path) -> None:
@@ -11796,6 +12520,18 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          _selftest_edit_append_synth_to_post_init_products_no_match, False),
         ("synth-product: post-init helper rejects dotted-owner false matches",
          _selftest_edit_append_synth_to_post_init_products_ignores_dotted_owner, False),
+        ("X-003 [swift-nio]: post-init strip preserves load-bearing hoisted-binding dep",
+         _selftest_strip_post_init_preserves_load_bearing_hoisted_binding, False),
+        ("X-003 [swift-case-paths]: post-init strip drops optional/test-only appends, keeps .macro",
+         _selftest_strip_post_init_strips_optional_appends, False),
+        ("X-003: post-init .targets mutation always stripped even if pkg load-bearing",
+         _selftest_strip_post_init_targets_mutation_always_stripped, False),
+        ("X-003: load-bearing detection ignores testTarget-only .product() refs",
+         _selftest_strip_post_init_load_bearing_ignores_testtarget_only_refs, False),
+        ("X-003 [swift-navigation]: orphan-ref strip reaches .macro target deps",
+         _selftest_macro_target_reached_by_orphan_ref_strip, False),
+        ("X-003 [swift-navigation]: external-product→string-dep rewrite reaches .macro target deps",
+         _selftest_macro_target_reached_by_product_rewrite, False),
         ("dedup-overlap overlay [swift-collections]: first call injects block + wraps targets: arg",
          _selftest_overlay_first_call_injects_block_and_wraps_targets_arg, False),
         ("dedup-overlap overlay [swift-collections]: second call extends block, no re-wrap",
@@ -11882,6 +12618,22 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          _selftest_auto_synth_skips_mixed_internal_helper, False),
         ("auto-synth-sibling-units: skips Swift helper with explicit linker settings",
          _selftest_auto_synth_skips_swift_with_explicit_linker_settings, False),
+        ("auto-synth-sibling-units [X-001]: promotes pure-C shim (swift-numerics _NumericsShims)",
+         _selftest_auto_synth_promotes_pure_c_shim, False),
+        ("auto-synth-sibling-units [X-001]: skips impure (ObjC) ClangTarget (WCDB objc-core)",
+         _selftest_auto_synth_skips_impure_clang_helper, False),
+        ("auto-synth-sibling-units [X-001]: skips pure-C shim with explicit linker settings",
+         _selftest_auto_synth_skips_pure_c_with_explicit_linker_settings, False),
+        ("inspect [X-001]: _clang_sources_are_pure_c classification",
+         _selftest_clang_sources_are_pure_c_classification, False),
+        ("inspect [X-005]: _collect_byname_dependency_names harvests external bare-name deps",
+         _selftest_collect_byname_dependency_names, False),
+        ("inspect [X-005]: _resolve_byname_external_products resolves unique / skips ambiguous",
+         _selftest_resolve_byname_external_products, False),
+        ("inspect [X-005 wiring/M1]: _discover_transitive_packages byName discovery + attribution merge",
+         _selftest_discover_transitive_packages_byname_wiring, False),
+        ("inject-objc [X-004]: _generate_modulemap + _clang_module_name sanitize hyphenated names",
+         _selftest_generate_modulemap_hyphenated_name, False),
         ("dedup-overlap [Codex P2 r2]: _find_target_call_for_name skips commented-out target decls",
          _selftest_find_target_call_for_name_ignores_commented_calls, False),
         ("dedup-overlap [Codex P2 r2]: _has_binary_target_with_name skips commented-out binary target decls",
@@ -12041,6 +12793,8 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          lambda: _selftest_detect_framework_type_swift_objc_mixed(tmp_root), False),
         ("execute: inject_objc_headers umbrella + idempotency",
          lambda: _selftest_inject_objc_headers_with_umbrella(tmp_root), False),
+        ("execute [X-006]: inject_objc_headers copies internal C dep headers (Yams+CYaml yaml.h)",
+         lambda: _selftest_inject_objc_headers_mixed_c_dep_yaml(tmp_root), False),
         ("execute: inject_objc_headers explicit modulemap",
          lambda: _selftest_inject_objc_headers_explicit_modulemap(tmp_root), False),
         ("execute: inject_objc_headers preserves nested subpaths (P2)",

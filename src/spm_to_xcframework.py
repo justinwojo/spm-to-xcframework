@@ -308,6 +308,77 @@ _PATTERNS: List[Tuple[str, str, str]] = [
         "or wait for Xcode 26.4 / swift-collections 1.6.",
     ),
     (
+        # Library-evolution wall #1: `@_alwaysEmitIntoClient` initializers.
+        # A resilient (BUILD_LIBRARY_FOR_DISTRIBUTION=YES) class init that
+        # is `@_alwaysEmitIntoClient` must delegate to another initializer,
+        # but the upstream package declares a designated one that can't.
+        # Fires for the whole package's own source (not a rewrite artifact)
+        # — the same `xcodebuild archive` against an unmodified checkout
+        # reproduces. Canonical: Defaults's `Defaults.Key<Value>` /
+        # `Defaults._AnyKey` inits. Verified against Xcode 26.3 2026-07.
+        "is '@_alwaysEmitIntoClient' and must delegate to another initializer",
+        "Package cannot be built as a library-evolution dynamic framework "
+        "(@_alwaysEmitIntoClient initializer)",
+        "This is an upstream/toolchain limitation, not a spm-to-xcframework "
+        "bug: the package uses `@_alwaysEmitIntoClient` on a class initializer "
+        "that can't delegate, which Xcode 26.3 rejects when compiling for "
+        "library evolution (the resilient dynamic-framework mode every "
+        "xcframework needs). A plain `xcodebuild archive` of the unmodified "
+        "package reproduces it. There is no spm-to-xcframework workaround — "
+        "consume the package as source/SPM, or wait for an upstream release "
+        "that drops the attribute (or a newer toolchain that allows it).",
+    ),
+    (
+        # Library-evolution wall #2: `@_spi` protocol requirements without a
+        # default. A resilient module can't vend a protocol requirement that
+        # is `@_spi` unless a protocol extension supplies a default, because
+        # the requirement wouldn't be part of the stable public witness
+        # table. Fires on the upstream source, not a rewrite. Canonical:
+        # Apollo's `ApolloAPI` (`init(_fieldData:)`, `_fieldData`, `__data`,
+        # `init(_dataDict:)`, `_jsonEncodableValue`). Verified Xcode 26.3.
+        "cannot be declared '@_spi' without a default implementation in a protocol extension",
+        "Package cannot be built as a library-evolution dynamic framework "
+        "(@_spi protocol requirement)",
+        "This is an upstream/toolchain limitation, not a spm-to-xcframework "
+        "bug: the package declares `@_spi` protocol requirements with no "
+        "default implementation, which Xcode 26.3 rejects when compiling for "
+        "library evolution (the resilient dynamic-framework mode every "
+        "xcframework needs). A plain `xcodebuild archive` of the unmodified "
+        "package reproduces it. There is no spm-to-xcframework workaround — "
+        "consume the package as source/SPM, or wait for an upstream release "
+        "that adds the missing defaults (or moves the SPI off the protocol).",
+    ),
+    (
+        # Library-evolution wall #3: initializer-delegation resilience. An
+        # `@inlinable`/`@_alwaysEmitIntoClient` initializer compiled for
+        # library evolution must delegate on every path; when the upstream
+        # init assigns stored properties directly instead, the resilient
+        # build fails with `'self' used before 'self.init'`. This is *also*
+        # the swift-crypto → swift-asn1 (X-002) "static-only product can't
+        # be synthesized as a dynamic framework" signature: the product
+        # compiles when linked statically but not as a resilient dynamic
+        # framework. Canonical: swift-log's `Logging` (Logger/Entry inits)
+        # and swift-asn1's `ASN1.swift`. Verified against Xcode 26.3 2026-07.
+        # The string can in principle appear for a genuine init bug, but such
+        # a package wouldn't compile in ANY mode, so in practice reaching
+        # archive with this error means the resilient/LE build is the trigger
+        # — the raw compiler error is still printed below for confirmation.
+        "used before 'self.init' call or assignment to 'self'",
+        "Package cannot be built as a library-evolution dynamic framework "
+        "(initializer resilience)",
+        "This commonly indicates an upstream/toolchain limitation rather than "
+        "a spm-to-xcframework bug: an `@inlinable`/`@_alwaysEmitIntoClient` "
+        "initializer that assigns stored properties directly is rejected when "
+        "compiling for library evolution (the resilient dynamic-framework mode "
+        "every xcframework needs), even though the same code links fine "
+        "statically. For a transitive dependency this is the "
+        "\"static-only product can't be synthesized as a dynamic framework\" "
+        "case (e.g. swift-crypto → swift-asn1). A plain `xcodebuild archive` "
+        "of the unmodified package reproduces it. There is no "
+        "spm-to-xcframework workaround — consume the package as source/SPM, "
+        "or wait for an upstream release / newer toolchain.",
+    ),
+    (
         # Generic linker diagnostic — can be a missing sibling target
         # (the common SPM case), an SDK/toolchain mismatch, vendored
         # auto-link metadata, or a stale `-l` flag. Wording stays soft
@@ -980,6 +1051,15 @@ class Target:
     exclude: List[str]
     language: str = Language.NA  # filled in by scan_target_languages()
     source_file_count: int = 0   # diagnostics; len(describe.targets[i].sources)
+    # True iff this is a ClangTarget whose compiled sources are all pure C
+    # (`.c` only — no ObjC/.m, ObjC++/.mm, C++/.cpp, or assembly). The
+    # Language enum collapses every ClangTarget to Language.OBJC, so this
+    # flag is the only signal that distinguishes a standalone-safe pure-C
+    # shim (canonical: swift-numerics' `_NumericsShims`) from an ObjC
+    # helper that needs umbrella-level link context (WCDB's `objc-core`).
+    # Filled in by scan_target_languages(); stays False for every non-Clang
+    # target and every target describe doesn't classify.
+    clang_is_pure_c: bool = False
 
 
 @dataclass
@@ -2679,7 +2759,7 @@ def discover_binary_artifacts(config: Config) -> List[BinaryArtifact]:
 import json
 import subprocess
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional, Set, Tuple
 
 
 
@@ -2889,6 +2969,50 @@ _MODULE_TYPE_LANGUAGE = {
     "MixedLanguageTarget": Language.MIXED,
 }
 
+# Compiled-source extensions that make a ClangTarget NON-pure-C: ObjC (.m),
+# ObjC++ (.mm), C++ (.cpp/.cc/.cxx/.c++/.cp), and assembly (.s/.asm). These
+# are matched against a LOWERCASED filename, so uppercase spellings that are
+# legal on case-sensitive filesystems (.CPP, .CC, .MM, .S, …) are caught too.
+# The lone `.c`-vs-`.C` distinction is handled separately in the classifier
+# because lowercasing would collide `.C` (the C++ convention) with `.c` (C).
+# A ClangTarget whose compiled sources are all `.c` (headers ignored) is a
+# pure-C shim — safe to build standalone as its own `.library(type:
+# .dynamic)`, which `_auto_synth_sibling_units` relies on to promote helpers
+# like swift-numerics' `_NumericsShims`.
+_NON_PURE_C_SOURCE_EXTS = (
+    ".m", ".mm",
+    ".cpp", ".cc", ".cxx", ".c++", ".cp",
+    ".s", ".asm",
+)
+
+
+def _clang_sources_are_pure_c(sources: object) -> bool:
+    """True iff `sources` (describe's per-target source list) has at least
+    one `.c` file and no ObjC/C++/assembly source. Header files (`.h`,
+    `.hpp`, …) are neutral — they don't determine the compile language.
+    Used to sub-classify a ClangTarget (which the language map otherwise
+    collapses to Language.OBJC) as a standalone-safe pure-C shim."""
+    if not isinstance(sources, list):
+        return False
+    saw_c = False
+    for src in sources:
+        if not isinstance(src, str):
+            continue
+        # `.c` (lowercase) is C; `.C` (uppercase) is the C++ convention on
+        # case-sensitive filesystems. This single distinction is case-
+        # SENSITIVE; every other non-C source is rejected case-insensitively
+        # below, so mixed targets like `["shim.c", "backend.CPP"]` don't slip
+        # through as pure C.
+        if src.endswith(".c"):
+            saw_c = True
+            continue
+        if src.endswith(".C"):
+            return False
+        low = src.lower()
+        if any(low.endswith(ext) for ext in _NON_PURE_C_SOURCE_EXTS):
+            return False
+    return saw_c
+
 
 def _swift_describe_package(staged_dir: Path) -> dict:
     """Run `swift package describe --type json` against the staged dir
@@ -2949,6 +3073,10 @@ def scan_target_languages(staged_dir: Path, targets: Iterable[Target]) -> None:
         tgt.language = _MODULE_TYPE_LANGUAGE.get(module_type, Language.NA)
         sources = entry.get("sources")
         tgt.source_file_count = len(sources) if isinstance(sources, list) else 0
+        tgt.clang_is_pure_c = (
+            module_type == "ClangTarget"
+            and _clang_sources_are_pure_c(sources)
+        )
 
 
 def discover_schemes(staged_dir: Path, verbose: bool = False) -> List[str]:
@@ -3189,6 +3317,156 @@ def _is_transitive_binary_only(
     return binary_products > 0
 
 
+def _collect_byname_dependency_names(
+    raw_dump: dict, targets: List[Target]
+) -> "dict[str, List[str]]":
+    """Enumerate bare-name / `byName` dependencies that REGULAR targets in
+    the root declare, EXCLUDING names that resolve to an internal target of
+    the root package.
+
+    SwiftPM lets a target depend on another package's product by bare name
+    (`dependencies: ["SWXMLHash"]`) when the name is unambiguous — but such
+    a dep carries NO package identity in `dump-package`. It appears as
+    `{"byName": ["SWXMLHash", null]}`, byte-identical in shape to an
+    internal sibling dep, so `_collect_referenced_package_products` (which
+    only reads the `{"product": [...]}` shape) never sees it. Macaw →
+    SWXMLHash and CocoaMQTT → MqttCocoaAsyncSocket are the canonical cases
+    where this silent miss ships an umbrella xcframework whose dependency
+    module was never built.
+
+    Returns an ordered dict mapping bare name → ordered list of the root
+    REGULAR target names that reference it. Names matching an internal
+    target are dropped here (those are internal deps resolved by the
+    auto-synth / internal-closure paths, not external products). The
+    caller resolves each surviving name against the DIRECT dependency
+    packages' product inventories; names that don't resolve to exactly one
+    external product are dropped there.
+    """
+    internal_target_names = {t.name for t in targets}
+    target_kind_by_name = {t.name: t.kind for t in targets}
+    out: "dict[str, List[str]]" = {}
+    for t in raw_dump.get("targets", []) or []:
+        if not isinstance(t, dict):
+            continue
+        name = t.get("name")
+        if not isinstance(name, str):
+            continue
+        if target_kind_by_name.get(name) != TargetKind.REGULAR:
+            continue
+        for dep in t.get("dependencies", []) or []:
+            if not isinstance(dep, dict):
+                continue
+            by = dep.get("byName")
+            if not isinstance(by, list) or not by:
+                continue
+            dep_name = by[0]
+            if not isinstance(dep_name, str):
+                continue
+            # Internal sibling dep — resolved by the auto-synth / internal
+            # closure paths, not an external product reference. SPM itself
+            # resolves a bare name to an internal target before a dependency
+            # product, so this exclusion also matches SPM's own precedence.
+            if dep_name in internal_target_names:
+                continue
+            per_name = out.setdefault(dep_name, [])
+            if name not in per_name:
+                per_name.append(name)
+    return out
+
+
+def _resolve_byname_external_products(
+    tree: dict,
+    byname_candidates: "dict[str, List[str]]",
+    referenced_by_identity: "dict[str, dict]",
+    verbose: bool,
+) -> None:
+    """Resolve each bare-name dep in `byname_candidates` against the DIRECT
+    dependency packages' product inventories and, on a UNIQUE match, fold
+    it into `referenced_by_identity` (mutated in place) exactly as though
+    the root had written `.product(name: <name>, package: <identity>)`.
+
+    SwiftPM only lets a target byName-reference a product of a DIRECT
+    dependency, so the search is bounded to the root's immediate deps
+    (`tree["dependencies"]`) — a handful of `dump-package` calls, and only
+    when an unresolved byName actually exists. A name that matches zero, or
+    more than one, direct dep's products is left unresolved (verbose-
+    logged): building/attributing the wrong sibling is worse than the
+    pre-existing miss, and an ambiguous bare name is something SPM itself
+    would reject.
+    """
+    direct_children: List[Tuple[str, str]] = []
+    seen_identities: Set[str] = set()
+    for child in tree.get("dependencies", []) or []:
+        if not isinstance(child, dict):
+            continue
+        identity = child.get("identity")
+        path = child.get("path")
+        if not (isinstance(identity, str) and isinstance(path, str)):
+            continue
+        if identity in seen_identities:
+            continue
+        seen_identities.add(identity)
+        direct_children.append((identity, path))
+    if not direct_children:
+        return
+
+    # product name -> ordered list of direct-dep identities declaring a
+    # product with that name. Built by dumping each direct dep checkout once.
+    product_owners: "dict[str, List[str]]" = {}
+    for identity, path in direct_children:
+        checkout = Path(path)
+        if not (checkout / "Package.swift").is_file() and not any(
+            checkout.glob("Package@swift-*.swift")
+        ):
+            continue
+        try:
+            _r, d_products, _t, _pl, _n, _tv = dump_package(checkout)
+        except Exception as exc:  # noqa: BLE001 — Inspect must not crash
+            verbose_log(
+                verbose,
+                f"  byName resolve: dump-package failed for {identity!r}: {exc}",
+            )
+            continue
+        for prod in d_products:
+            owners = product_owners.setdefault(prod.name, [])
+            if identity not in owners:
+                owners.append(identity)
+
+    for name, root_targets in byname_candidates.items():
+        owners = product_owners.get(name)
+        if not owners:
+            verbose_log(
+                verbose,
+                f"  byName {name!r} matched no direct dependency product "
+                f"(leaving unresolved)",
+            )
+            continue
+        if len(owners) > 1:
+            verbose_log(
+                verbose,
+                f"  byName {name!r} is ambiguous across {owners!r} "
+                f"(leaving unresolved)",
+            )
+            continue
+        identity = owners[0]
+        entry = referenced_by_identity.setdefault(
+            identity,
+            {"products": [], "root_targets": [], "product_to_root_targets": {}},
+        )
+        if name not in entry["products"]:
+            entry["products"].append(name)
+        per_product = entry["product_to_root_targets"].setdefault(name, [])
+        for rt in root_targets:
+            if rt not in entry["root_targets"]:
+                entry["root_targets"].append(rt)
+            if rt not in per_product:
+                per_product.append(rt)
+        verbose_log(
+            verbose,
+            f"  byName {name!r} resolved to product of {identity!r}",
+        )
+
+
 def _discover_transitive_packages(
     staged_dir: Path,
     raw_dump: dict,
@@ -3209,7 +3487,45 @@ def _discover_transitive_packages(
         package author shipped a broken manifest)
     """
     referenced_by_identity = _collect_referenced_package_products(raw_dump, targets)
-    if not referenced_by_identity:
+
+    # Bare-name (`byName`) external product deps carry no identity in
+    # dump-package, so they're collected separately and resolved against the
+    # direct deps' product inventories below. Any already covered by an
+    # explicit `.product(...)` ref (same product referenced both ways) don't
+    # need re-resolving — the explicit ref already carries the identity — but
+    # their byName-referencing targets are still merged into that identity's
+    # attribution (see the `if byname_candidates:` block below).
+    byname_candidates = _collect_byname_dependency_names(raw_dump, targets)
+    if byname_candidates:
+        # A bare name may reference the SAME product another root target already
+        # reaches via `.product(name:, package:)`. Those are already resolved to
+        # an identity — nothing left to look up — but the byName-referencing
+        # targets must still be merged into that entry's attribution, or
+        # `--product` / `--target` closure-filtering (which keys transitives off
+        # `root_targets` / `product_to_root_targets`) could drop a transitive
+        # that a selected byName-only target actually needs. Only genuinely
+        # unresolved names survive into `byname_candidates` for the lookup below.
+        product_owner_identity = {
+            p: identity
+            for identity, entry in referenced_by_identity.items()
+            for p in entry["products"]
+        }
+        remaining: "dict[str, List[str]]" = {}
+        for name, rts in byname_candidates.items():
+            identity = product_owner_identity.get(name)
+            if identity is None:
+                remaining[name] = rts
+                continue
+            entry = referenced_by_identity[identity]
+            per_product = entry["product_to_root_targets"].setdefault(name, [])
+            for rt in rts:
+                if rt not in entry["root_targets"]:
+                    entry["root_targets"].append(rt)
+                if rt not in per_product:
+                    per_product.append(rt)
+        byname_candidates = remaining
+
+    if not referenced_by_identity and not byname_candidates:
         return []
 
     tree = _show_dependencies(staged_dir, verbose=verbose)
@@ -3217,6 +3533,18 @@ def _discover_transitive_packages(
         return []
     flat = _flatten_dependency_tree(tree)
     if not flat:
+        return []
+
+    # Resolve bare-name deps (Macaw → SWXMLHash, CocoaMQTT →
+    # MqttCocoaAsyncSocket) to their owning direct dependency and fold them
+    # into `referenced_by_identity` so they're built + consumed like any
+    # `.product(name:, package:)` reference. A no-op when there are none.
+    if byname_candidates:
+        _resolve_byname_external_products(
+            tree, byname_candidates, referenced_by_identity, verbose
+        )
+    if not referenced_by_identity:
+        # Every byName candidate was unresolvable/ambiguous — nothing to build.
         return []
 
     # Case-insensitive identity lookup so root manifests that write
@@ -4122,19 +4450,27 @@ def _auto_synth_sibling_units(
             need here is swift-collections'
             `InternalCollectionsUtilities` (the hidden helper whose
             symbols other siblings' `.swiftinterface` reference).
+          * A pure-C shim (`tgt.clang_is_pure_c` — a ClangTarget
+            whose sources are all `.c`, no ObjC/C++/asm). The model
+            collapses every ClangTarget to Language.OBJC, so this
+            sub-classification is what lets swift-numerics'
+            `_NumericsShims` (a math-intrinsics helper a sibling's
+            `.private.swiftinterface` does `import _NumericsShims`
+            against) promote while WCDB's ObjC helpers stay out.
           * No `tool: "linker"` settings declared on the target —
-            even on Swift, a target that explicitly declares
+            even on Swift/pure-C, a target that explicitly declares
             `.linkedFramework` / `.linkedLibrary` probably depends
             on umbrella-level link context.
-        Anything else (ObjC/Mixed/N/A language, or any explicit
-        linker settings) → SKIP, leaving the umbrella to statically
-        embed the target. Canonical SKIP case: WCDB's `bridge`,
-        `common`, and `objc-core` ObjC helpers — they call
-        CoreFoundation but the `.linkedFramework("CoreFoundation")`
-        lives on the WCDBSwift umbrella's `linkerSettings`. Promoting
-        them standalone would fail at link with `Undefined symbol:
-        _CFAllocatorGetDefault` and friends. The `--target T` escape
-        hatch is still the explicit opt-in.
+        Anything else (ObjC/Mixed/N/A language that is not a pure-C
+        shim, or any explicit linker settings) → SKIP, leaving the
+        umbrella to statically embed the target. Canonical SKIP case:
+        WCDB's `bridge`, `common`, and `objc-core` ObjC helpers —
+        they call CoreFoundation but the
+        `.linkedFramework("CoreFoundation")` lives on the WCDBSwift
+        umbrella's `linkerSettings`. Promoting them standalone would
+        fail at link with `Undefined symbol: _CFAllocatorGetDefault`
+        and friends. The `--target T` escape hatch is still the
+        explicit opt-in.
 
     Skipped (won't produce a unit):
       - Non-regular targets (system / binary / executable / test /
@@ -4210,11 +4546,27 @@ def _auto_synth_sibling_units(
             tgt = package.target_by_name(sibling)
             if tgt is None:
                 continue
-            if tgt.language != Language.SWIFT:
+            # Promote pure-Swift helpers (autolink covers Foundation/CF)
+            # and pure-C shims. A ClangTarget collapses to Language.OBJC
+            # in the model, so the C carve-out is gated on the pure-C
+            # sub-classification (`clang_is_pure_c`): the canonical case is
+            # swift-numerics' `_NumericsShims` — a math-intrinsics helper
+            # with no ObjC and no system-framework linkage, whose module a
+            # sibling's `.private.swiftinterface` does
+            # `import _NumericsShims`. Genuine ObjC helpers (WCDB's
+            # `bridge` / `common` / `objc-core`) stay OUT: they call
+            # CoreFoundation through the umbrella's `.linkedFramework(...)`
+            # settings, which don't propagate to a standalone
+            # `.library(type: .dynamic)` build.
+            is_pure_swift = tgt.language == Language.SWIFT
+            is_pure_c_shim = (
+                tgt.language == Language.OBJC and tgt.clang_is_pure_c
+            )
+            if not (is_pure_swift or is_pure_c_shim):
                 continue
             if _target_declares_linker_settings(package, sibling):
                 continue
-            language = Language.SWIFT
+            language = tgt.language
             taken_product_names.add(sibling)
             plan.package_swift_edits.append(
                 PackageSwiftEdit(
@@ -5181,7 +5533,21 @@ def _swift_string_literal(s: str) -> str:
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-_TARGET_CALL_KIND_RE = re.compile(r"\.(target|executableTarget|testTarget)\s*\(")
+# `.macro(...)` targets carry a `dependencies:` array exactly like the
+# other source-target kinds, so every dependency-graph rewrite in this
+# module (external-product → string-dep, orphan-`.product()` strip,
+# search-path closure) must reach them too. A macro target left with a
+# `.product(name:, package: ID)` reference to a package we consumed as an
+# overlay (or otherwise stripped) dangles as "unknown package 'ID' in
+# dependencies of target '<macro>'" at dump-package time — the exact
+# swift-navigation 2.10.3 failure (SwiftNavigationMacros → swift-case-paths).
+# `.macro` targets are never build units (the `--target` escape hatch
+# refuses them, and dedup only substitutes single-target *built* siblings),
+# so `_find_target_call_for_name` can never hand a macro target to
+# `edit_replace_with_binary_target`.
+_TARGET_CALL_KIND_RE = re.compile(
+    r"\.(target|executableTarget|testTarget|macro)\s*\("
+)
 _BINARY_TARGET_CALL_RE = re.compile(r"\.binaryTarget\s*\(")
 _LIBRARY_CALL_RE = re.compile(r"\.library\s*\(")
 _TOP_LEVEL_NAME_LABEL_RE = re.compile(
@@ -7519,6 +7885,151 @@ _POST_INIT_PLUS_EQ_RE = re.compile(
     r"(?<![.\w])\w+\.(?:dependencies|targets)\s*\+=\s*\["
 )
 
+# `_PRODUCT_CALL_RE` (`.product(`) is already defined above; reuse it.
+# This dep-declaration regex is deliberately NOT named `_PACKAGE_CALL_RE`
+# — that name is taken by the `\bPackage\s*\(` *constructor* finder near
+# the top of this module, and colliding on it silently breaks every
+# overlay/synth pass that locates the top-level `Package(...)` call.
+_PACKAGE_DEP_CALL_RE = re.compile(r"\.package\s*\(")
+
+
+def _pkg_identity_from_url(url: str) -> str:
+    """SPM package identity from a `url:`/`path:` string: last path
+    component, `.git` suffix removed, lowercased — the same convention
+    `prune_child._identity_from_url` and
+    `edit_strip_package_deps_for_identities` apply inline. A local path
+    like `"../swift-atomics"` normalises to `swift-atomics`. Named
+    distinctly from `prune_child._identity_from_url` so the flattened
+    single-file artifact carries no duplicate `def` (prune_child sits
+    below prepare in MODULE_ORDER, so we can't reuse its binding)."""
+    ident = url.strip().rstrip("/")
+    if not ident:
+        return ""
+    last = ident.rsplit("/", 1)[-1]
+    if last.endswith(".git"):
+        last = last[:-4]
+    return last.lower()
+
+
+def _testtarget_spans(
+    manifest_text: str, code_view: str
+) -> List[Tuple[int, int]]:
+    """`(open_paren_idx, close_paren_idx)` for every `.testTarget(...)`
+    call, discovered against the code-only `code_view` so a commented or
+    string-embedded occurrence can't match. Used to exclude test-only
+    `.product()` references from load-bearing detection."""
+    spans: List[Tuple[int, int]] = []
+    pos = 0
+    while True:
+        m = _TEST_TARGET_CALL_RE.search(code_view, pos)
+        if not m:
+            break
+        open_idx = m.end() - 1
+        close_idx = _balanced_close(manifest_text, open_idx)
+        if close_idx == -1:
+            break
+        spans.append((open_idx, close_idx))
+        pos = close_idx + 1
+    return spans
+
+
+def _load_bearing_package_identities(manifest_text: str) -> Set[str]:
+    """Lowercased identities of every package referenced by a
+    `.product(name:, package: ID)` call that is NOT lexically inside a
+    `.testTarget(...)` call.
+
+    A post-init `package.dependencies` mutation that adds one of these
+    identities is *load-bearing*: a consumer build compiles the target
+    (or the file-scope binding) that references it, so its `.package(...)`
+    declaration must survive `edit_strip_post_init_package_mutations`.
+    The scan is position-based rather than target-scoped so it covers
+    both manifest shapes uniformly:
+      - inline refs inside a target's `dependencies:` array
+        (`.product(name: "CasePathsMacrosSupport", package: "swift-case-paths")`
+        in swift-navigation's `.macro` target);
+      - hoisted file-scope bindings
+        (`let swiftAtomics = .product(name: "Atomics", package: "swift-atomics")`
+        in swift-nio), which sit outside every target call but drive real
+        target deps through a `let` variable.
+    Test-only references are excluded so genuinely optional tooling still
+    gets stripped: swift-case-paths' `OMIT_MACRO_TESTS` block wires
+    `MacroTesting` (from swift-macro-testing) into an appended
+    `.testTarget`, and stripping that dep is what keeps its transitive
+    xctest-dynamic-overlay from colliding with our overlay binaryTargets.
+    """
+    code_view = _make_code_token_view(manifest_text)
+    test_spans = _testtarget_spans(manifest_text, code_view)
+    identities: Set[str] = set()
+    pos = 0
+    while True:
+        m = _PRODUCT_CALL_RE.search(code_view, pos)
+        if not m:
+            break
+        head = m.start()
+        open_idx = m.end() - 1
+        close_idx = _balanced_close(manifest_text, open_idx)
+        if close_idx == -1:
+            break
+        pos = close_idx + 1
+        if any(
+            ts_open <= head and close_idx <= ts_close
+            for ts_open, ts_close in test_spans
+        ):
+            continue
+        pkg = _top_level_keyword_string_value(
+            manifest_text[open_idx + 1 : close_idx], "package"
+        )
+        if pkg:
+            identities.add(pkg.lower())
+    return identities
+
+
+def _package_entry_identity(entry_inner: str) -> Optional[str]:
+    """Best-effort SPM identity for one `.package(...)` declaration, given
+    the text *inside* its parens. Tries `url:` (remote), then `path:`
+    (local), then `id:` (registry). Returns None when none is a plain
+    string literal — the caller keeps unidentifiable entries rather than
+    strip a dep it can't name."""
+    url = _top_level_keyword_string_value(entry_inner, "url")
+    if url:
+        return _pkg_identity_from_url(url)
+    path = _top_level_keyword_string_value(entry_inner, "path")
+    if path:
+        return _pkg_identity_from_url(path)
+    reg = _top_level_keyword_string_value(entry_inner, "id")
+    if reg:
+        return reg.strip().lower()
+    return None
+
+
+def _post_init_dep_mutation_is_load_bearing(
+    manifest_text: str,
+    code_view: str,
+    open_idx: int,
+    close_idx: int,
+    load_bearing: Set[str],
+) -> bool:
+    """True iff the `package.dependencies` mutation whose argument list
+    spans `(open_idx, close_idx)` declares at least one `.package(...)`
+    entry whose identity is load-bearing. Scans for `.package(` heads in
+    the code-only view (depth-agnostic — handles both `+= [ ... ]` arrays
+    and `.append(contentsOf: [ ... ])`), balanced-closing each against the
+    original text so nested version calls (`.upToNextMajor(from:)`) are
+    stepped over cleanly."""
+    pos = open_idx + 1
+    while True:
+        m = _PACKAGE_DEP_CALL_RE.search(code_view, pos, close_idx)
+        if not m:
+            return False
+        p_open = m.end() - 1
+        p_close = _balanced_close(manifest_text, p_open)
+        if p_close == -1 or p_close > close_idx:
+            return False
+        ident = _package_entry_identity(manifest_text[p_open + 1 : p_close])
+        if ident is not None and ident in load_bearing:
+            return True
+        pos = p_close + 1
+
 
 def edit_strip_post_init_package_mutations(manifest_text: str) -> str:
     """Strip every file-scope `<var>.dependencies.append(...)`,
@@ -7535,47 +8046,60 @@ def edit_strip_post_init_package_mutations(manifest_text: str) -> str:
     optional build-time tool (swift-docc-plugin, swift-macro-testing,
     swift-snapshot-testing, swift-benchmark, example subprojects, …).
 
-    Why strip:
+    Why strip `.targets` mutations, and *optional* `.dependencies` ones:
       A downstream consumer building runtime products (which is the
-      entire mission of `spm-to-xcframework`) never needs any of these
-      build-time helpers. And when an umbrella consumes a transitive
-      sibling whose targets we've replaced with binaryTarget overlays,
-      a conditional append that transitively reaches the same package
-      identity reintroduces it into the graph with conflicting target
-      names — `xcodebuild archive` then aborts with "multiple packages
-      declare targets with a conflicting name". The canonical case is
+      entire mission of `spm-to-xcframework`) never needs any build-time
+      helper. And when an umbrella consumes a transitive sibling whose
+      targets we've replaced with binaryTarget overlays, a conditional
+      append that transitively reaches the same package identity
+      reintroduces it into the graph with conflicting target names —
+      `xcodebuild archive` then aborts with "multiple packages declare
+      targets with a conflicting name". The canonical case is
       swift-case-paths' OMIT_MACRO_TESTS-gated swift-macro-testing
       append, whose closure pulls in xctest-dynamic-overlay's
       IssueReporting/XCTestDynamicOverlay targets that we just injected
-      as binaryTargets.
+      as binaryTargets. The author's choice to put a dep behind
+      `package.dependencies.append(...)` is a signal it *may* be
+      optional; documentation/testing/benchmarking tooling is present
+      for the author and safely absent for consumers.
 
-    Why this is safe at consumer time:
-      The author's choice to put a dep behind `package.dependencies.
-      append(...)` is itself the signal that the dep is optional. Apple
-      and the broader ecosystem have settled on this idiom precisely so
-      that documentation/testing/benchmarking tooling can be present for
-      the package author and absent for downstream consumers. Stripping
-      preserves runtime correctness for every consumer-side build path;
-      it only removes work the package author cares about (their own
-      tests, their own docc generation, etc.). The remaining failure
-      mode — an author who put a *runtime* dep behind a compile-time
-      gate — is a design error on their part and was already broken for
-      most consumers anyway.
+    Why NOT strip *load-bearing* `.dependencies` mutations:
+      Some packages declare genuinely load-bearing runtime dependencies
+      after the initializer — not optional tooling. swift-nio hoists
+      `let swiftAtomics = .product(name: "Atomics", package:
+      "swift-atomics")` at file scope (referenced by NIOCore, NIOPosix,
+      …) and only *adds* the backing `.package(url:)` in a post-init
+      `package.dependencies += [...]` block (its
+      `SWIFTCI_USE_LOCAL_DEPS` else-branch). grpc-swift does the same for
+      swift-nio/swift-protobuf. Blanket-stripping those left every
+      referencing target dangling with "unknown package 'swift-atomics'"
+      at dump-package time — the X-003 regression. So a `.dependencies`
+      mutation is preserved whenever ANY `.package(...)` entry it
+      declares has an identity that is *referenced* by a
+      `.product(package: ID)` call outside a `.testTarget` (see
+      `_load_bearing_package_identities`). `.targets` mutations are still
+      always stripped: an appended target is never a build unit for us,
+      and the umbrella-conflict hazard above is real.
 
     Implementation: walks `_make_code_token_view(manifest_text)` (so
     `"` strings and `// /* */` comments don't trigger false matches),
     finds each append/`+=` head, runs `_balanced_close` against the
-    original text to find the matching `)` or `]`, then removes the
-    whole statement — including any trailing semicolon, any
-    leading-whitespace-only prefix on the same line, and the trailing
-    newline if it leaves the line empty. Removal proceeds back-to-front
-    so earlier offsets remain valid as later spans collapse.
+    original text to find the matching `)` or `]`. For `.dependencies`
+    mutations it then checks the enclosed `.package()` entries against
+    the load-bearing identity set and skips (preserves) the statement if
+    any is load-bearing; `.targets` mutations are unconditionally
+    collected. Collected statements are removed whole — including any
+    trailing semicolon, any leading-whitespace-only prefix on the same
+    line, and the trailing newline if it leaves the line empty. Removal
+    proceeds back-to-front so earlier offsets remain valid as later
+    spans collapse.
 
     Idempotent: when the manifest contains no qualifying calls, the
     function returns `manifest_text` unchanged. Re-running on already-
     stripped text is also a no-op.
     """
     code_view = _make_code_token_view(manifest_text)
+    load_bearing = _load_bearing_package_identities(manifest_text)
     spans: List[Tuple[int, int]] = []
 
     for regex in (_POST_INIT_APPEND_RE, _POST_INIT_PLUS_EQ_RE):
@@ -7583,6 +8107,13 @@ def edit_strip_post_init_package_mutations(manifest_text: str) -> str:
             open_idx = m.end() - 1  # points at `(` or `[`
             close_idx = _balanced_close(manifest_text, open_idx)
             if close_idx == -1:
+                continue
+            # `.targets` mutations always go (never a build unit for us);
+            # a `.dependencies` mutation survives when it declares any
+            # load-bearing package the graph still references.
+            if ".dependencies" in m.group(0) and _post_init_dep_mutation_is_load_bearing(
+                manifest_text, code_view, open_idx, close_idx, load_bearing
+            ):
                 continue
             spans.append((m.start(), close_idx + 1))
 
@@ -11159,6 +11690,28 @@ from typing import Dict, List, Optional, Set
 
 
 
+def _clang_module_name(fw_name: str) -> str:
+    """Convert a framework/product name to the Clang module identifier a
+    consumer's `import`/`@import` will actually spell.
+
+    A framework bundle may be named with characters that are illegal in a
+    Clang module name — the canonical case is a hyphenated SPM product
+    like `cmark-gfm`, whose Swift/Clang module is `cmark_gfm` (SPM applies
+    the same C99 mangling: any character that is not a letter, digit, or
+    underscore becomes `_`, and a leading digit is prefixed with `_`).
+    Emitting `framework module cmark-gfm { ... }` produces a modulemap no
+    consumer can `import`, because `import cmark-gfm` isn't valid Swift.
+
+    Only the `module <NAME>` token in the generated modulemap needs this
+    form; on-disk header filenames (`<fw_name>.h`, `<fw_name>-Swift.h`)
+    keep the literal framework name and are passed through unchanged.
+    """
+    sanitized = "".join(c if (c.isalnum() or c == "_") else "_" for c in fw_name)
+    if sanitized and sanitized[0].isdigit():
+        sanitized = "_" + sanitized
+    return sanitized or fw_name
+
+
 def _has_h_files_recursive(path: Path) -> bool:
     """True iff `path` contains at least one `.h` file at any depth.
 
@@ -11174,14 +11727,16 @@ def _has_h_files_recursive(path: Path) -> bool:
     return False
 
 
-def _find_objc_headers_dir(
+def _collect_objc_header_dirs(
     package: Package,
     product_name: str,
     fw_name: str,
-) -> Optional[Path]:
-    """Find a directory of public ObjC headers for the named product.
+) -> List[Path]:
+    """Ordered, de-duplicated public-ObjC-header source dirs for a product.
 
-    Priority (matches legacy bash 1352-1397):
+    `dirs[0]` is the single best match — the same directory the legacy
+    single-dir resolver returned (see `_find_objc_headers_dir`), chosen by
+    this priority (legacy bash 1352-1397):
       1. A direct product target whose name == fw_name with a
          publicHeadersPath that exists and contains *.h files.
       2. A direct product target whose name == product_name.
@@ -11189,7 +11744,17 @@ def _find_objc_headers_dir(
       4. First-level dependencies of direct product targets, with the
          same fw_name > product_name > anything-with-headers priority.
 
-    Returns the absolute path of the public-headers directory, or None.
+    Any remaining entries are the header dirs of *internal-only*
+    first-level dependencies (deps no product separately packages). A
+    mixed framework whose Swift target ships an umbrella header that
+    `#import`s a C dependency's header — Yams's `Yams.h` doing
+    `#import <Yams/yaml.h>` from the internal `CYaml` target — needs BOTH
+    copied: the umbrella from the Swift target dir *and* `yaml.h` from
+    CYaml's `include/`. The single-dir resolver stopped at the first
+    match, dropping the C header and leaving the umbrella's `#import`
+    dangling at consume time (X-006).
+
+    Returns an empty list when no public-header dir is found.
     """
     raw_targets_by_name: Dict[str, dict] = {}
     for raw_t in package.raw_dump.get("targets", []) or []:
@@ -11206,7 +11771,7 @@ def _find_objc_headers_dir(
     if not product_targets and product_name in raw_targets_by_name:
         product_targets = [product_name]
     if not product_targets:
-        return None
+        return []
 
     # Targets that any product in this package exposes as part of its
     # own xcframework. Used to gate implicit-layout fallback in the dep
@@ -11288,6 +11853,7 @@ def _find_objc_headers_dir(
                 return target_dir
         return None
 
+    primary: Optional[Path] = None
     product_match: Optional[Path] = None
     any_match: Optional[Path] = None
     for tname in product_targets:
@@ -11295,17 +11861,16 @@ def _find_objc_headers_dir(
         if d is None:
             continue
         if tname == fw_name:
-            return d
+            primary = d
+            break
         if tname == product_name:
             if product_match is None:
                 product_match = d
         else:
             if any_match is None:
                 any_match = d
-    if product_match is not None:
-        return product_match
-    if any_match is not None:
-        return any_match
+    if primary is None:
+        primary = product_match if product_match is not None else any_match
 
     # First-level dependencies of direct product targets. Accepts both
     # `byName` and `target` dep shapes — the GRDB-style `.target()`
@@ -11318,10 +11883,14 @@ def _find_objc_headers_dir(
     # StripePayments). An internal-only dep — one no product
     # references — gets the same `include/` and umbrella fallbacks as
     # a direct product target, since the parent is the only place it
-    # ships.
+    # ships. Unlike the legacy single-dir resolver, these dep dirs are
+    # *added to* the primary match instead of used only as a fallback,
+    # so a mixed framework (Yams) still gets its internal C dep's
+    # headers (CYaml's yaml.h) even though the Swift target already
+    # supplied an umbrella (X-006).
     dep_fw_match: Optional[Path] = None
     dep_product_match: Optional[Path] = None
-    dep_any_match: Optional[Path] = None
+    dep_rest: List[Path] = []
     seen_deps: Set[str] = set()
     for tname in product_targets:
         raw = raw_targets_by_name.get(tname)
@@ -11339,13 +11908,30 @@ def _find_objc_headers_dir(
                 dep_fw_match = d
             elif dep_name == product_name and dep_product_match is None:
                 dep_product_match = d
-            elif dep_any_match is None:
-                dep_any_match = d
-    if dep_fw_match is not None:
-        return dep_fw_match
-    if dep_product_match is not None:
-        return dep_product_match
-    return dep_any_match
+            else:
+                dep_rest.append(d)
+
+    ordered: List[Path] = []
+    for d in (primary, dep_fw_match, dep_product_match, *dep_rest):
+        if d is not None and d not in ordered:
+            ordered.append(d)
+    return ordered
+
+
+def _find_objc_headers_dir(
+    package: Package,
+    product_name: str,
+    fw_name: str,
+) -> Optional[Path]:
+    """Single best public-ObjC-header dir for a product, or None.
+
+    Thin wrapper over `_collect_objc_header_dirs` preserving the legacy
+    single-dir contract (the first / highest-priority match). Callers
+    that must also fold in a mixed framework's internal C-dependency
+    headers should use `_collect_objc_header_dirs` directly.
+    """
+    dirs = _collect_objc_header_dirs(package, product_name, fw_name)
+    return dirs[0] if dirs else None
 
 
 def _generate_modulemap(fw_path: Path, fw_name: str) -> None:
@@ -11358,13 +11944,16 @@ def _generate_modulemap(fw_path: Path, fw_name: str) -> None:
     modules_dir = content_root / "Modules"
     modules_dir.mkdir(parents=True, exist_ok=True)
     headers_dir = content_root / "Headers"
+    module_name = _clang_module_name(fw_name)
     umbrella = headers_dir / f"{fw_name}.h"
     if umbrella.is_file():
         # The `module * { export * }` line tells Clang to walk the
         # Headers/ tree on its own, so nested layouts work without
-        # having to enumerate every file here.
+        # having to enumerate every file here. The module token uses the
+        # Clang-legal identifier (`cmark-gfm` → `cmark_gfm`) while the
+        # umbrella header keeps its real on-disk filename.
         text = (
-            f"framework module {fw_name} {{\n"
+            f"framework module {module_name} {{\n"
             f"  umbrella header \"{fw_name}.h\"\n"
             f"  export *\n"
             f"  module * {{ export * }}\n"
@@ -11381,7 +11970,7 @@ def _generate_modulemap(fw_path: Path, fw_name: str) -> None:
             for p in headers_dir.rglob("*.h")
             if p.is_file()
         )
-        lines = [f"framework module {fw_name} {{"]
+        lines = [f"framework module {module_name} {{"]
         for rel in header_rel_paths:
             lines.append(f"  header \"{rel}\"")
         lines.append("  export *")
@@ -11411,8 +12000,8 @@ def inject_objc_headers(
                 verbose_log(verbose, "  Public headers already present in framework")
                 return False
 
-    headers_dir = _find_objc_headers_dir(package, product_name, fw_name)
-    if headers_dir is None:
+    header_dirs = _collect_objc_header_dirs(package, product_name, fw_name)
+    if not header_dirs:
         verbose_log(verbose, f"  No ObjC public headers found in source tree for {fw_name}")
         return False
 
@@ -11427,21 +12016,29 @@ def inject_objc_headers(
     # because (a) `#import <Module/Sub/Header.h>` needs the physical
     # path to exist inside Headers/, and (b) a flat copy would silently
     # overwrite same-named headers that live in different subfolders
-    # (Codex [P2]).
-    module_subdir = headers_dir / fw_name
-    scan_base = module_subdir if module_subdir.is_dir() else headers_dir
+    # (Codex [P2]). A mixed framework contributes more than one source
+    # dir (the Swift target's umbrella dir + an internal C dep's
+    # `include/`, e.g. Yams + CYaml); copy them in priority order and
+    # let the first (highest-priority) dir win any filename collision so
+    # the primary product target's public surface can't be shadowed by a
+    # dependency's header.
     copied = 0
-    for h in sorted(scan_base.rglob("*.h")):
-        if not h.is_file():
-            continue
-        rel = h.relative_to(scan_base)
-        dest = headers_target / rel
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(h, dest)
-        copied += 1
+    for src_dir in header_dirs:
+        module_subdir = src_dir / fw_name
+        scan_base = module_subdir if module_subdir.is_dir() else src_dir
+        for h in sorted(scan_base.rglob("*.h")):
+            if not h.is_file():
+                continue
+            rel = h.relative_to(scan_base)
+            dest = headers_target / rel
+            if dest.exists():
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(h, dest)
+            copied += 1
 
     if copied == 0:
-        verbose_log(verbose, f"  No headers copied from {headers_dir}")
+        verbose_log(verbose, f"  No headers copied from {header_dirs[0]}")
         return False
 
     _generate_modulemap(fw_path, fw_name)
@@ -11497,7 +12094,13 @@ def inject_pure_swift_clang_modulemap(
     if not any(d.is_dir() for d in swiftmodule_dirs):
         return False
 
-    bridge_header_name = f"{fw_name}-Swift.h"
+    # Swift names the generated bridge header after the *module* name
+    # (the C99-mangled target name), so a hyphenated product like
+    # `cmark-gfm` emits `cmark_gfm-Swift.h`, not `cmark-gfm-Swift.h`.
+    # Use the Clang module identifier for both the DerivedData lookup and
+    # the `module <NAME>` token so they agree with what swiftc produced.
+    module_name = _clang_module_name(fw_name)
+    bridge_header_name = f"{module_name}-Swift.h"
     bridge_header_src: Optional[Path] = None
     if dd_path.is_dir():
         for candidate in dd_path.rglob(bridge_header_name):
@@ -11520,7 +12123,7 @@ def inject_pure_swift_clang_modulemap(
 
     modules_dir.mkdir(parents=True, exist_ok=True)
     text = (
-        f"framework module {fw_name} {{\n"
+        f"framework module {module_name} {{\n"
         f"  header \"{bridge_header_name}\"\n"
         f"  requires objc\n"
         f"}}\n"
