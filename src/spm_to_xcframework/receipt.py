@@ -108,7 +108,7 @@ class ReceiptFailure:
     deleted unless `--keep-work`, so this is frequently null rather than a
     dangling path — we never invent one."""
 
-    phase: str                             # fetch|inspect|plan|prepare|execute|verify|promote
+    phase: str                             # fetch|inspect|plan|prepare|execute|verify|promote|closure
     unit: Optional[str]
     root_diagnostic: str
     result_bundle_path: Optional[str] = None
@@ -157,6 +157,19 @@ class Receipt:
     missing_required_modules: List[str] = field(default_factory=list)
     failures: List[ReceiptFailure] = field(default_factory=list)
     produced_at: str = ""  # stamped at write time
+    # In-memory accumulator for the import-closure gate (graph_closure.py):
+    # modules a produced interface publicly imports that the produced set does
+    # not provide, yet the dependency graph owns. NOT a separate serialized
+    # field — the finalizer unions it INTO `missing_required_modules` so the
+    # serialized schema (v1) stays exactly as documented above. Kept distinct
+    # in memory only so the union is idempotent and order-stable regardless of
+    # how many times the gate records into it.
+    closure_missing_modules: List[str] = field(default_factory=list)
+
+    def record_closure_missing(self, module: str) -> None:
+        """De-duplicating append used by the import-closure gate."""
+        if module not in self.closure_missing_modules:
+            self.closure_missing_modules.append(module)
 
     def record_failure(
         self,

@@ -68,6 +68,7 @@ MODULE_ORDER: List[str] = [
     "output_manifest.py",
     "receipt.py",
     "verify.py",
+    "graph_closure.py",
     "cli.py",
 ]
 

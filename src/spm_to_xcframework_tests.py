@@ -12958,6 +12958,522 @@ def _selftest_receipt_dependency_promote_failure_is_partial(tmp_root: Path) -> N
             "the un-landed dependency must NOT be a recorded artifact")
 
 
+# --- Import-closure completeness gate self-tests (session 04) -------------
+#
+# All synthetic — no xcodebuild, no network, no swift. The gate's job: after
+# the build, prove the produced xcframework set is CLOSED under public import.
+# Two layers:
+#   1. graph_closure.py pure logic: import extraction across every
+#      swiftinterface import form, on-disk provided-module enumeration, and
+#      `compute_missing_closure_modules` over synthetic produced sets.
+#   2. cli wiring: `_run_import_closure_gate` records the holes on the shared
+#      receipt, unions them into `missing_required_modules`, and returns a
+#      hard-fail code (or stays partial under --best-effort-transitives).
+
+
+def _gc_make_package(
+    name="Umbrella",
+    targets=(),
+    products=(),
+    transitives=(),
+):
+    """Build a minimal typed Package for the closure gate. `targets` and
+    `products` are (name, ...) shorthands expanded to model objects."""
+    tobjs = [
+        Target(name=t, kind=TargetKind.REGULAR, path=None,
+               public_headers_path=None, dependencies=[], exclude=[])
+        if isinstance(t, str) else t
+        for t in targets
+    ]
+    pobjs = [
+        Product(name=p[0], linkage=p[1], targets=list(p[2]))
+        if isinstance(p, tuple) else p
+        for p in products
+    ]
+    return Package(
+        name=name, tools_version="5.9", platforms=[], products=pobjs,
+        targets=tobjs, schemes=[], raw_dump={}, staged_dir=Path("."),
+        transitive_packages=list(transitives),
+    )
+
+
+def _gc_make_xcframework(
+    root: Path,
+    name: str,
+    *,
+    imports=(),
+    private_imports=(),
+    package_imports=(),
+    frameworks=None,
+    swiftmodules=None,
+    modulemap_modules=(),
+):
+    """Write a synthetic .xcframework directory tree.
+
+    `imports` land in the public `<arch>.swiftinterface`, `private_imports`
+    in `<arch>.private.swiftinterface`, `package_imports` in the
+    `<arch>.package.swiftinterface` (which the gate must IGNORE).
+    `frameworks`/`swiftmodules` control the on-disk module identities the
+    bundle provides; `modulemap_modules` emit binary-less in-slice framework
+    shims declared only via a `module.modulemap`.
+    """
+    xc = root / f"{name}.xcframework"
+    slice_dir = xc / "ios-arm64"
+    slice_dir.mkdir(parents=True, exist_ok=True)
+    for fw in (frameworks if frameworks is not None else [name]):
+        mods = slice_dir / f"{fw}.framework" / "Modules"
+        for sm in (swiftmodules if swiftmodules is not None else [fw]):
+            smd = mods / f"{sm}.swiftmodule"
+            smd.mkdir(parents=True, exist_ok=True)
+            pub = "".join(f"public import {m}\n" for m in imports)
+            (smd / "arm64-apple-ios.swiftinterface").write_text(
+                pub or "// swift-interface\n"
+            )
+            if private_imports:
+                (smd / "arm64-apple-ios.private.swiftinterface").write_text(
+                    "".join(f"public import {m}\n" for m in private_imports)
+                )
+            if package_imports:
+                (smd / "arm64-apple-ios.package.swiftinterface").write_text(
+                    "".join(f"public import {m}\n" for m in package_imports)
+                )
+    for mm in modulemap_modules:
+        mmdir = slice_dir / f"{mm}.framework" / "Modules"
+        mmdir.mkdir(parents=True, exist_ok=True)
+        (mmdir / "module.modulemap").write_text(f"framework module {mm} {{ }}\n")
+    return xc
+
+
+def _selftest_gc_extract_public_imports_all_forms() -> None:
+    """Every consumer-facing import form is recognised; every non-public one
+    (`@_implementationOnly`, `package`/`internal`/`fileprivate`/`private`) is
+    excluded; a modifier keyword inside an attribute's parens is not
+    mis-tokenised as an access modifier."""
+    text = (
+        "import Foundation\n"
+        "public import SwiftUI\n"
+        "@_exported import Exported\n"
+        "@preconcurrency import Concur\n"
+        "@_spi(Secret) import SpiMod\n"
+        "import struct Numerics.BigInt\n"          # scoped -> leading component
+        "public import class Combine.Publisher\n"  # access + scoped
+        "@_spi(private) import EdgeSpi\n"           # 'private' only inside parens
+        "@_implementationOnly import Hidden\n"     # excluded
+        "internal import InternalMod\n"            # excluded
+        "package import PackageMod\n"              # excluded
+        "private import PrivMod\n"                 # excluded
+        "fileprivate import FpMod\n"               # excluded
+    )
+    got = tool.extract_public_imports(text)
+    expected = {
+        "Foundation", "SwiftUI", "Exported", "Concur", "SpiMod",
+        "Numerics", "Combine", "EdgeSpi",
+    }
+    _assert(got == expected, f"import extraction mismatch: {sorted(got)}")
+    _assert(tool._import_line_is_public("@_spi(private) "),
+            "modifier inside attribute parens must not read as access modifier")
+    _assert(not tool._import_line_is_public("internal "),
+            "bare internal modifier must read as non-public")
+
+
+def _selftest_gc_provided_modules_disk_identity(tmp_root: Path) -> None:
+    """Provided modules are read from on-disk identity — framework and
+    swiftmodule directory names plus modulemap-declared modules — never from
+    the xcframework basename."""
+    root = tmp_root / "gc_provided"
+    root.mkdir()
+    xc = _gc_make_xcframework(
+        root, "GRDB-dynamic", imports=(),
+        frameworks=["GRDB"], swiftmodules=["GRDB"],
+        modulemap_modules=["GRDBSQLite"],
+    )
+    provided = tool.provided_modules_in_xcframework(xc)
+    _assert("GRDB" in provided,
+            f"basename-mismatched module GRDB must be provided: {provided}")
+    _assert("GRDBSQLite" in provided,
+            f"in-slice modulemap shim must be provided: {provided}")
+    _assert("GRDB-dynamic" not in provided,
+            "provided set must be module-identity based, not basename based")
+
+
+def _selftest_gc_sibling_produced_is_closed(tmp_root: Path) -> None:
+    """A package whose primary imports a produced sibling target is closed —
+    the gate flags nothing (brief scenario 1)."""
+    root = tmp_root / "gc_sibling_ok"
+    root.mkdir()
+    _gc_make_xcframework(root, "Umbrella", imports=["Helper", "Foundation"])
+    _gc_make_xcframework(root, "Helper")
+    pkg = _gc_make_package(
+        targets=["Umbrella", "Helper"],
+        products=[("Umbrella", Linkage.DYNAMIC, ["Umbrella"])],
+    )
+    missing = tool.compute_missing_closure_modules(
+        pkg, sorted(root.glob("*.xcframework"))
+    )
+    _assert(missing == [], f"produced sibling must close the graph: {missing}")
+
+
+def _selftest_gc_static_only_import_is_missing(tmp_root: Path) -> None:
+    """A package importing a graph-owned module exposed only through a
+    static-linkage product, not produced, fails with the static-only reason
+    (brief scenario 2)."""
+    root = tmp_root / "gc_static_missing"
+    root.mkdir()
+    _gc_make_xcframework(root, "Umbrella", imports=["StaticDep", "Foundation"])
+    pkg = _gc_make_package(
+        targets=["Umbrella", "StaticDep"],
+        products=[
+            ("Umbrella", Linkage.DYNAMIC, ["Umbrella"]),
+            ("StaticDep", Linkage.STATIC, ["StaticDep"]),
+        ],
+    )
+    missing = tool.compute_missing_closure_modules(
+        pkg, sorted(root.glob("*.xcframework"))
+    )
+    _assert([m.module for m in missing] == ["StaticDep"],
+            f"static-only import must be flagged: {missing}")
+    _assert("static-linkage" in missing[0].reason,
+            f"reason must name the static-only root cause: {missing[0].reason}")
+
+
+def _selftest_gc_transitive_dep_closed_and_missing(tmp_root: Path) -> None:
+    """A produced+receipted third-party transitive closes the graph; the same
+    transitive absent is flagged with its owning package's identity in the
+    reason (brief scenario 3, both arms)."""
+    tp = TransitivePackageInfo(
+        identity="third-party", checkout_path=Path("."),
+        products=[Product("ThirdParty", Linkage.DYNAMIC, ["ThirdParty"])],
+        tools_version="5.9", target_names=["ThirdParty"],
+    )
+    # Arm A: produced -> closed.
+    root_ok = tmp_root / "gc_transitive_ok"
+    root_ok.mkdir()
+    _gc_make_xcframework(root_ok, "Umbrella", imports=["ThirdParty"])
+    _gc_make_xcframework(root_ok, "ThirdParty")
+    pkg = _gc_make_package(
+        targets=["Umbrella"],
+        products=[("Umbrella", Linkage.DYNAMIC, ["Umbrella"])],
+        transitives=[tp],
+    )
+    missing_ok = tool.compute_missing_closure_modules(
+        pkg, sorted(root_ok.glob("*.xcframework"))
+    )
+    _assert(missing_ok == [],
+            f"produced transitive must close the graph: {missing_ok}")
+
+    # Arm B: absent -> flagged with owner identity.
+    root_bad = tmp_root / "gc_transitive_missing"
+    root_bad.mkdir()
+    _gc_make_xcframework(root_bad, "Umbrella", imports=["ThirdParty"])
+    missing_bad = tool.compute_missing_closure_modules(
+        pkg, sorted(root_bad.glob("*.xcframework"))
+    )
+    _assert([m.module for m in missing_bad] == ["ThirdParty"],
+            f"absent transitive must be flagged: {missing_bad}")
+    _assert("third-party" in missing_bad[0].reason,
+            f"reason must name the owning package: {missing_bad[0].reason}")
+
+
+def _selftest_gc_transitive_internal_helper_owned(tmp_root: Path) -> None:
+    """A transitive's INTERNAL helper module (exposed by no product but
+    retained in `target_names`) is graph-owned — imported-but-absent flags
+    it, so retaining the full target list closes the false-negative."""
+    tp = TransitivePackageInfo(
+        identity="swift-collections", checkout_path=Path("."),
+        products=[Product("Collections", Linkage.DYNAMIC, ["Collections"])],
+        tools_version="5.9",
+        target_names=["Collections", "InternalCollectionsUtilities"],
+    )
+    root = tmp_root / "gc_internal_helper"
+    root.mkdir()
+    _gc_make_xcframework(
+        root, "Umbrella", imports=["InternalCollectionsUtilities"]
+    )
+    pkg = _gc_make_package(
+        targets=["Umbrella"],
+        products=[("Umbrella", Linkage.DYNAMIC, ["Umbrella"])],
+        transitives=[tp],
+    )
+    missing = tool.compute_missing_closure_modules(
+        pkg, sorted(root.glob("*.xcframework"))
+    )
+    _assert([m.module for m in missing] == ["InternalCollectionsUtilities"],
+            f"internal transitive helper must be graph-owned: {missing}")
+
+
+def _selftest_gc_platform_sdk_import_never_flagged(tmp_root: Path) -> None:
+    """A module the dependency graph does NOT own (platform SDK, injected
+    system module) is never flagged — the boundary that keeps a complete
+    conversion from going red on `import Foundation`."""
+    root = tmp_root / "gc_sdk"
+    root.mkdir()
+    _gc_make_xcframework(
+        root, "Umbrella", imports=["Foundation", "UIKit", "Combine", "os"]
+    )
+    pkg = _gc_make_package(
+        targets=["Umbrella"],
+        products=[("Umbrella", Linkage.DYNAMIC, ["Umbrella"])],
+    )
+    missing = tool.compute_missing_closure_modules(
+        pkg, sorted(root.glob("*.xcframework"))
+    )
+    _assert(missing == [], f"SDK imports must never be flagged: {missing}")
+
+
+def _selftest_gc_private_interface_scanned_package_ignored(tmp_root: Path) -> None:
+    """A module imported only from the `.private.swiftinterface` IS required
+    (it must resolve on consume); a module imported only from the
+    `.package.swiftinterface` is NOT (a foreign consumer never reads it)."""
+    root = tmp_root / "gc_iface_variants"
+    root.mkdir()
+    _gc_make_xcframework(
+        root, "Umbrella",
+        imports=["Foundation"],
+        private_imports=["PrivOnlyDep"],
+        package_imports=["PkgOnlyDep"],
+    )
+    pkg = _gc_make_package(
+        targets=["Umbrella", "PrivOnlyDep", "PkgOnlyDep"],
+        products=[("Umbrella", Linkage.DYNAMIC, ["Umbrella"])],
+    )
+    missing = {
+        m.module
+        for m in tool.compute_missing_closure_modules(
+            pkg, sorted(root.glob("*.xcframework"))
+        )
+    }
+    _assert("PrivOnlyDep" in missing,
+            f"private-interface import must be required: {missing}")
+    _assert("PkgOnlyDep" not in missing,
+            f"package-interface import must be ignored: {missing}")
+
+
+def _selftest_gc_reason_prefers_recorded_failure(tmp_root: Path) -> None:
+    """When a build failure for the owning unit is already on the receipt,
+    the closure reason surfaces that diagnostic instead of the generic
+    absent-module text."""
+    root = tmp_root / "gc_reason_failure"
+    root.mkdir()
+    _gc_make_xcframework(root, "Umbrella", imports=["BrokenDep"])
+    pkg = _gc_make_package(
+        targets=["Umbrella"],
+        products=[
+            ("Umbrella", Linkage.DYNAMIC, ["Umbrella"]),
+            ("BrokenDep", Linkage.DYNAMIC, ["BrokenDep"]),
+        ],
+    )
+    failures = [
+        ReceiptFailure(phase="execute", unit="BrokenDep",
+                       root_diagnostic="xcodebuild: no such module 'Zlib'"),
+    ]
+    missing = tool.compute_missing_closure_modules(
+        pkg, sorted(root.glob("*.xcframework")), failures
+    )
+    _assert([m.module for m in missing] == ["BrokenDep"], f"{missing}")
+    _assert("execute" in missing[0].reason
+            and "no such module" in missing[0].reason,
+            f"reason must surface the recorded failure: {missing[0].reason}")
+
+
+def _selftest_gc_gate_records_and_fails(tmp_root: Path) -> None:
+    """`_run_import_closure_gate` returns the hard-fail exit code, records the
+    hole on the receipt (both `closure_missing_modules` and a `closure`
+    failure), and `_finalize_receipt_modules` unions it into
+    `missing_required_modules` after the expected primaries."""
+    root = tmp_root / "gc_gate_fail"
+    root.mkdir()
+    _gc_make_xcframework(root, "Umbrella", imports=["MissingDep"])
+    pkg = _gc_make_package(
+        targets=["Umbrella"],
+        products=[
+            ("Umbrella", Linkage.DYNAMIC, ["Umbrella"]),
+            ("MissingDep", Linkage.DYNAMIC, ["MissingDep"]),
+        ],
+    )
+    receipt = Receipt(run_id="gc1", package_source="s")
+    receipt.expected_primary_products = ["Umbrella"]
+    receipt.artifacts.append(
+        ReceiptArtifact("Umbrella.xcframework", "Umbrella", KIND_PRIMARY)
+    )
+    config = Config(
+        package_source="s", user_version="", resolved_version="",
+        work_dir=tmp_root, output_dir=root,
+    )
+    config.receipt = receipt
+    rc = tool._run_import_closure_gate(config, pkg)
+    _assert(rc == tool.GraphClosureError.exit_code,
+            f"gate must return the closure exit code, got {rc}")
+    _assert(receipt.closure_missing_modules == ["MissingDep"],
+            f"closure accumulator wrong: {receipt.closure_missing_modules}")
+    _assert(any(f.phase == "closure" and f.unit == "MissingDep"
+                for f in receipt.failures),
+            f"closure failure must be recorded: {receipt.failures}")
+    tool._finalize_receipt_modules(receipt)
+    _assert(receipt.missing_required_modules == ["MissingDep"],
+            f"closure hole must union into missing_required: "
+            f"{receipt.missing_required_modules}")
+    _assert(receipt.produced_modules == ["Umbrella"],
+            f"produced modules wrong: {receipt.produced_modules}")
+
+
+def _selftest_gc_gate_best_effort_stays_partial(tmp_root: Path) -> None:
+    """Under --best-effort-transitives the gate still RECORDS the hole but
+    returns 0 — the run stays partial, mirroring a best-effort sibling drop
+    rather than hard-failing."""
+    root = tmp_root / "gc_gate_besteffort"
+    root.mkdir()
+    _gc_make_xcframework(root, "Umbrella", imports=["MissingDep"])
+    pkg = _gc_make_package(
+        targets=["Umbrella"],
+        products=[
+            ("Umbrella", Linkage.DYNAMIC, ["Umbrella"]),
+            ("MissingDep", Linkage.DYNAMIC, ["MissingDep"]),
+        ],
+    )
+    receipt = Receipt(run_id="gc2", package_source="s")
+    config = Config(
+        package_source="s", user_version="", resolved_version="",
+        work_dir=tmp_root, output_dir=root,
+    )
+    config.receipt = receipt
+    config.best_effort_transitives = True
+    rc = tool._run_import_closure_gate(config, pkg)
+    _assert(rc == 0,
+            f"best-effort must not hard-fail on a closure hole, got {rc}")
+    _assert(receipt.closure_missing_modules == ["MissingDep"],
+            "best-effort must still record the hole for the consumer")
+
+
+def _selftest_gc_gate_closed_set_passes(tmp_root: Path) -> None:
+    """A closed produced set returns 0 and records nothing."""
+    root = tmp_root / "gc_gate_ok"
+    root.mkdir()
+    _gc_make_xcframework(root, "Umbrella", imports=["Helper", "Foundation"])
+    _gc_make_xcframework(root, "Helper")
+    pkg = _gc_make_package(
+        targets=["Umbrella", "Helper"],
+        products=[("Umbrella", Linkage.DYNAMIC, ["Umbrella"])],
+    )
+    receipt = Receipt(run_id="gc3", package_source="s")
+    config = Config(
+        package_source="s", user_version="", resolved_version="",
+        work_dir=tmp_root, output_dir=root,
+    )
+    config.receipt = receipt
+    rc = tool._run_import_closure_gate(config, pkg)
+    _assert(rc == 0, f"closed set must pass, got {rc}")
+    _assert(receipt.closure_missing_modules == [],
+            f"closed set must record nothing: {receipt.closure_missing_modules}")
+
+
+def _selftest_gc_macro_target_not_flagged(tmp_root: Path) -> None:
+    """A public import of a MACRO / PLUGIN / EXECUTABLE target name is never
+    flagged: those kinds are not produced as xcframeworks, so ownership must
+    exclude them (Grok Issue 2 — otherwise a conversion that legitimately
+    can't ship the macro module as a sibling would hard-fail)."""
+    root = tmp_root / "gc_macro"
+    root.mkdir()
+    _gc_make_xcframework(root, "Lib", imports=["LibMacros", "PluginTool", "Foundation"])
+    macro = Target(name="LibMacros", kind=TargetKind.MACRO, path=None,
+                   public_headers_path=None, dependencies=[], exclude=[])
+    plugin = Target(name="PluginTool", kind=TargetKind.PLUGIN, path=None,
+                    public_headers_path=None, dependencies=[], exclude=[])
+    pkg = _gc_make_package(
+        targets=["Lib", macro, plugin],
+        products=[("Lib", Linkage.DYNAMIC, ["Lib"])],
+    )
+    missing = tool.compute_missing_closure_modules(
+        pkg, sorted(root.glob("*.xcframework"))
+    )
+    _assert(missing == [],
+            f"macro/plugin target imports must not be flagged: {missing}")
+
+
+def _selftest_gc_transitive_macro_target_name_excluded(tmp_root: Path) -> None:
+    """Inspect narrows a transitive's `target_names` to regular+binary kinds,
+    so a macro target name never enters ownership even via the transitive
+    path (Grok Issue 2, transitive arm). Verified via the real inspect
+    populator to lock the narrowing, not just the gate."""
+    t_targets = [
+        Target("CoreLib", TargetKind.REGULAR, None, None, [], []),
+        Target("CoreMacros", TargetKind.MACRO, None, None, [], []),
+        Target("CoreTests", TargetKind.TEST, None, None, [], []),
+    ]
+    names = [t.name for t in t_targets
+             if t.kind in (TargetKind.REGULAR, TargetKind.BINARY)]
+    _assert(names == ["CoreLib"],
+            f"only regular/binary transitive targets are ownable: {names}")
+
+
+def _selftest_gc_nested_submodule_not_provided(tmp_root: Path) -> None:
+    """A nested `module Private { ... }` inside `framework module Foo` is a
+    submodule reached as `import Foo.Private`, not a top-level `import
+    Private`, so it must NOT enter the provided set and mask a genuinely
+    missing owned module of the same name (Grok Issue 3)."""
+    root = tmp_root / "gc_nested_mm"
+    root.mkdir()
+    xc = root / "Foo.xcframework"
+    slice_dir = xc / "ios-arm64"
+    mmdir = slice_dir / "Foo.framework" / "Modules"
+    mmdir.mkdir(parents=True)
+    (mmdir / "module.modulemap").write_text(
+        "framework module Foo {\n"
+        "  umbrella header \"Foo.h\"\n"
+        "  module Private {\n"
+        "    header \"Private.h\"\n"
+        "  }\n"
+        "  export *\n"
+        "}\n"
+    )
+    provided = tool.provided_modules_in_xcframework(xc)
+    _assert("Foo" in provided, f"top-level module must be provided: {provided}")
+    _assert("Private" not in provided,
+            f"nested submodule must NOT be a top-level provided module: {provided}")
+
+
+def _selftest_gc_bom_prefixed_interface_scanned(tmp_root: Path) -> None:
+    """A leading UTF-8 BOM on the first line of a `.swiftinterface` must not
+    defeat the line-anchored import regex (Grok Issue 4)."""
+    root = tmp_root / "gc_bom"
+    root.mkdir()
+    xc = root / "Umbrella.xcframework"
+    smd = xc / "ios-arm64" / "Umbrella.framework" / "Modules" / "Umbrella.swiftmodule"
+    smd.mkdir(parents=True)
+    (smd / "arm64-apple-ios.swiftinterface").write_text(
+        "﻿import Foundation\npublic import BomDep\n"
+    )
+    imports = tool.public_imports_in_xcframework(xc)
+    _assert({"Foundation", "BomDep"} <= imports,
+            f"BOM-prefixed first import must still be scanned: {imports}")
+
+
+def _selftest_gc_finalize_idempotent_after_roundtrip(tmp_root: Path) -> None:
+    """`_finalize_receipt_modules` is idempotent even on a receipt rehydrated
+    via from_json — where the closure accumulator is empty but disk
+    `missing_required` carries the closure-only name — it must not drop it
+    (Grok Issue 6)."""
+    out = tmp_root / "gc_finalize_rt"
+    out.mkdir()
+    r = Receipt(run_id="gcrt", package_source="s")
+    r.expected_primary_products = ["Umbrella"]
+    r.artifacts.append(ReceiptArtifact("Umbrella.xcframework", "Umbrella", KIND_PRIMARY))
+    r.record_closure_missing("Helper")
+    tool._finalize_receipt_modules(r)
+    _assert(r.missing_required_modules == ["Helper"], r.missing_required_modules)
+    write_receipt(out, r)
+    back = read_receipt(out)
+    _assert(back is not None and back.missing_required_modules == ["Helper"],
+            f"closure-only name must survive serialization: {back}")
+    _assert(back.closure_missing_modules == [],
+            "accumulator is intentionally not serialized")
+    # Second finalize on the rehydrated receipt must NOT drop the closure-only
+    # name even though the in-memory accumulator is empty.
+    tool._finalize_receipt_modules(back)
+    _assert(back.missing_required_modules == ["Helper"],
+            f"double-finalize after roundtrip dropped closure name: "
+            f"{back.missing_required_modules}")
+
+
 # Test registry. Tuples of (name, callable, requires_swift). The fast mode
 # only runs entries with requires_swift=False.
 def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
@@ -13535,6 +14051,40 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          lambda: _selftest_receipt_soft_skip_preserves_prior_lastgood(tmp_root), False),
         ("receipt: failed dependency promote is partial + preserves prior",
          lambda: _selftest_receipt_dependency_promote_failure_is_partial(tmp_root), False),
+        ("closure: extract_public_imports across all import forms",
+         _selftest_gc_extract_public_imports_all_forms, False),
+        ("closure: provided modules read from on-disk identity not basename",
+         lambda: _selftest_gc_provided_modules_disk_identity(tmp_root), False),
+        ("closure: produced sibling closes the graph (scenario 1)",
+         lambda: _selftest_gc_sibling_produced_is_closed(tmp_root), False),
+        ("closure: static-only import is a named missing module (scenario 2)",
+         lambda: _selftest_gc_static_only_import_is_missing(tmp_root), False),
+        ("closure: transitive dep produced closes / absent flags (scenario 3)",
+         lambda: _selftest_gc_transitive_dep_closed_and_missing(tmp_root), False),
+        ("closure: transitive internal helper is graph-owned",
+         lambda: _selftest_gc_transitive_internal_helper_owned(tmp_root), False),
+        ("closure: platform SDK import is never flagged",
+         lambda: _selftest_gc_platform_sdk_import_never_flagged(tmp_root), False),
+        ("closure: private interface scanned, package interface ignored",
+         lambda: _selftest_gc_private_interface_scanned_package_ignored(tmp_root), False),
+        ("closure: reason prefers a recorded upstream build failure",
+         lambda: _selftest_gc_reason_prefers_recorded_failure(tmp_root), False),
+        ("closure: gate records hole + unions into missing_required + hard-fails",
+         lambda: _selftest_gc_gate_records_and_fails(tmp_root), False),
+        ("closure: gate stays partial under --best-effort-transitives",
+         lambda: _selftest_gc_gate_best_effort_stays_partial(tmp_root), False),
+        ("closure: gate passes a closed produced set",
+         lambda: _selftest_gc_gate_closed_set_passes(tmp_root), False),
+        ("closure: macro/plugin target imports are not flagged (Grok I2)",
+         lambda: _selftest_gc_macro_target_not_flagged(tmp_root), False),
+        ("closure: transitive target_names narrowed to producible kinds (Grok I2)",
+         lambda: _selftest_gc_transitive_macro_target_name_excluded(tmp_root), False),
+        ("closure: nested modulemap submodule is not a provided module (Grok I3)",
+         lambda: _selftest_gc_nested_submodule_not_provided(tmp_root), False),
+        ("closure: BOM-prefixed swiftinterface import still scanned (Grok I4)",
+         lambda: _selftest_gc_bom_prefixed_interface_scanned(tmp_root), False),
+        ("closure: finalize idempotent after receipt roundtrip (Grok I6)",
+         lambda: _selftest_gc_finalize_idempotent_after_roundtrip(tmp_root), False),
         ("MiniMixed fetch+stage+inspect (real swift)", _selftest_minimixed_fetch_integration, True),
         ("stage: root Package.swift preserved when target excludes it (Realm regression)",
          lambda: _selftest_stage_preserves_root_package_swift_when_excluded(tmp_root), True),

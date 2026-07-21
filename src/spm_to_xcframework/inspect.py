@@ -867,6 +867,17 @@ def _discover_transitive_packages(
         binary_target_names = [
             t.name for t in t_targets if t.kind == TargetKind.BINARY
         ]
+        # Retain this transitive's library/binary target names so the
+        # import-closure gate can recognise its internal helper modules — the
+        # ones exposed by no product — as graph-owned. Narrowed to producible
+        # kinds (regular + binary): a macro / plugin / executable / test
+        # target is never emitted as a sibling xcframework, so the gate must
+        # not treat a public import of one as a fillable hole.
+        target_names = [
+            t.name
+            for t in t_targets
+            if t.kind in (TargetKind.REGULAR, TargetKind.BINARY)
+        ]
         origin_url = upstream_url if _looks_remote_url(upstream_url) else None
         head_tag = resolved_version if _looks_resolved_version(resolved_version) else None
         out.append(
@@ -884,6 +895,7 @@ def _discover_transitive_packages(
                 binary_target_names=binary_target_names,
                 origin_url=origin_url,
                 head_tag=head_tag,
+                target_names=target_names,
             )
         )
     return out

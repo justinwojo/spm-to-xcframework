@@ -242,6 +242,19 @@ class VerifyBug(VerifyError):
     traceback."""
 
 
+class GraphClosureError(SpmToXcframeworkError):
+    """The produced artifact set is not closed under public import: a
+    produced `.swiftinterface` imports a module the dependency graph owns
+    but that this run did not produce (static-only, toolchain-incompatible,
+    or a build failure upstream). Distinct exit code so the corpus harness
+    can classify an import-closure hole apart from a per-unit Verify failure.
+    Never raised as an exception — the gate returns this code directly and
+    records the precise missing modules on the receipt — but defined here so
+    the exit-code taxonomy stays in one place."""
+
+    exit_code = 9
+
+
 # ============================================================================
 # --- diagnostics.py --------------------------------------------------------
 # ============================================================================
@@ -1151,6 +1164,18 @@ class TransitivePackageInfo:
     # (revision-pinned packages, branch-tracking deps). Used by the
     # binary-only auto-switch to populate Fetch's `--version <tag>`.
     head_tag: Optional[str] = None
+    # This transitive's library/binary (regular + binary kind) target names,
+    # from the same target dump used to compute `is_binary_only`. Products
+    # expose only the module names a caller imports by product; this retains
+    # the producible target list so the import-closure gate can recognise a
+    # transitive's INTERNAL helper module (canonical: a nested dependency's
+    # auto-synth'd `InternalCollectionsUtilities` / `_NumericsShims`) as
+    # graph-owned when a produced interface imports it. Narrowed to producible
+    # kinds so a macro / plugin / executable target — never emitted as a
+    # sibling xcframework — is not mistaken for a fillable hole. Populated by
+    # Inspect; empty is a safe under-approximation (the gate simply won't
+    # attribute such a module to this package).
+    target_names: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -3619,6 +3644,17 @@ def _discover_transitive_packages(
         binary_target_names = [
             t.name for t in t_targets if t.kind == TargetKind.BINARY
         ]
+        # Retain this transitive's library/binary target names so the
+        # import-closure gate can recognise its internal helper modules — the
+        # ones exposed by no product — as graph-owned. Narrowed to producible
+        # kinds (regular + binary): a macro / plugin / executable / test
+        # target is never emitted as a sibling xcframework, so the gate must
+        # not treat a public import of one as a fillable hole.
+        target_names = [
+            t.name
+            for t in t_targets
+            if t.kind in (TargetKind.REGULAR, TargetKind.BINARY)
+        ]
         origin_url = upstream_url if _looks_remote_url(upstream_url) else None
         head_tag = resolved_version if _looks_resolved_version(resolved_version) else None
         out.append(
@@ -3636,6 +3672,7 @@ def _discover_transitive_packages(
                 binary_target_names=binary_target_names,
                 origin_url=origin_url,
                 head_tag=head_tag,
+                target_names=target_names,
             )
         )
     return out
@@ -15089,7 +15126,7 @@ class ReceiptFailure:
     deleted unless `--keep-work`, so this is frequently null rather than a
     dangling path — we never invent one."""
 
-    phase: str                             # fetch|inspect|plan|prepare|execute|verify|promote
+    phase: str                             # fetch|inspect|plan|prepare|execute|verify|promote|closure
     unit: Optional[str]
     root_diagnostic: str
     result_bundle_path: Optional[str] = None
@@ -15138,6 +15175,19 @@ class Receipt:
     missing_required_modules: List[str] = field(default_factory=list)
     failures: List[ReceiptFailure] = field(default_factory=list)
     produced_at: str = ""  # stamped at write time
+    # In-memory accumulator for the import-closure gate (graph_closure.py):
+    # modules a produced interface publicly imports that the produced set does
+    # not provide, yet the dependency graph owns. NOT a separate serialized
+    # field — the finalizer unions it INTO `missing_required_modules` so the
+    # serialized schema (v1) stays exactly as documented above. Kept distinct
+    # in memory only so the union is idempotent and order-stable regardless of
+    # how many times the gate records into it.
+    closure_missing_modules: List[str] = field(default_factory=list)
+
+    def record_closure_missing(self, module: str) -> None:
+        """De-duplicating append used by the import-closure gate."""
+        if module not in self.closure_missing_modules:
+            self.closure_missing_modules.append(module)
 
     def record_failure(
         self,
@@ -15732,6 +15782,354 @@ def print_verify_summary(
         if r.passed and r.warnings:
             for w in r.warnings:
                 warn(f"  {r.xcframework_path.name}: {w}")
+
+
+# ============================================================================
+# --- graph_closure.py ------------------------------------------------------
+# ============================================================================
+
+
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Set
+
+
+# Target kinds that can be produced as a consumer-resolvable xcframework
+# module. A macro / plugin / executable / (empty) target is compiled through
+# a different path (compiler-plugin support, an app binary) and is NEVER
+# emitted as an xcframework, so it must not be treated as "owed" by the gate —
+# flagging a public import of such a module would fail a conversion with no
+# possible remediation, exactly like flagging a platform SDK import. SYSTEM
+# targets become in-slice clang-module shims and always surface in the
+# provided set via their `module.modulemap`, so excluding them from ownership
+# is safe (they are never missing). BINARY targets DO become xcframeworks
+# (vendor artifacts copied through), so they stay ownable.
+_OWNABLE_TARGET_KINDS = frozenset({TargetKind.REGULAR, TargetKind.BINARY})
+
+# --- public-import extraction ------------------------------------------------
+#
+# Parity with the swift-bindings ingestion preflight's import detector: a
+# line-anchored matcher whose prefix is an unordered run of attributes
+# (`@Name` optionally with `(...)`) and access modifiers, followed by
+# `import`, an optional decl-kind keyword introducing a scoped import
+# (`import struct Foo.Bar`), and the leading MODULE identifier.
+
+_ACCESS_MODIFIERS = r"public|private|internal|fileprivate|open|package"
+_DECL_KINDS = r"typealias|struct|class|enum|protocol|let|var|func"
+_IMPORT_LINE_RE = re.compile(
+    r"^[ \t]*"
+    r"(?P<prefix>(?:@[A-Za-z_]\w*(?:\([^)]*\))?[ \t]+|(?:"
+    + _ACCESS_MODIFIERS
+    + r")[ \t]+)*)"
+    r"import[ \t]+"
+    r"(?:(?:" + _DECL_KINDS + r")[ \t]+)?"
+    r"(?P<module>[A-Za-z_]\w*)",
+    re.MULTILINE,
+)
+
+# An import line carrying any of these in its prefix is NOT part of the
+# consumer-facing surface a client must resolve: `@_implementationOnly` hides
+# the dependency from clients entirely, and a `package`/`internal`/
+# `fileprivate`/`private` import never widens client visibility. (A `package
+# import` the tool has already rewritten to `public import` in a shipped
+# sibling reads as public here — which is correct: post-rewrite the consumer
+# DOES have to resolve it.)
+_NONPUBLIC_IMPORT_MODIFIERS = frozenset(
+    {"package", "internal", "fileprivate", "private"}
+)
+
+# `module M { ... }`, `framework module M`, `explicit module M` — the module
+# name may be dotted for a submodule (`M.Sub`); we normalise to the leading
+# component so it matches an import (which is captured leading-component-only).
+# Matched per-line (not global) so a brace-depth counter can restrict capture
+# to TOP-LEVEL modules — a nested `module Private { ... }` submodule is what a
+# consumer reaches via `import Foo.Private`, never a top-level `import Private`,
+# so counting it as a provided top-level module could mask a genuinely missing
+# owned module of the same name.
+_MODULEMAP_MODULE_LINE_RE = re.compile(
+    r"^\s*(?:framework\s+)?(?:explicit\s+)?module\s+([A-Za-z_][\w.]*)"
+)
+
+
+def _top_level_modulemap_modules(text: str) -> List[str]:
+    """Every module declared at brace-depth 0 in a `module.modulemap`,
+    normalised to its leading component. Nested submodules (depth ≥ 1) are
+    skipped — they are not top-level importable modules."""
+    out: List[str] = []
+    depth = 0
+    for line in text.splitlines():
+        if depth == 0:
+            m = _MODULEMAP_MODULE_LINE_RE.match(line)
+            if m:
+                out.append(m.group(1).split(".", 1)[0])
+        depth += line.count("{") - line.count("}")
+        if depth < 0:
+            depth = 0
+    return out
+
+
+def _import_line_is_public(prefix: str) -> bool:
+    """A prefix is non-public iff it carries `@_implementationOnly` or a
+    non-public access modifier as a standalone token. Tokenising on
+    whitespace keeps a modifier keyword that appears INSIDE an attribute's
+    parens (e.g. `@_spi(private)`) from being read as an access modifier."""
+    for tok in prefix.split():
+        if tok in _NONPUBLIC_IMPORT_MODIFIERS:
+            return False
+        if tok.startswith("@_implementationOnly"):
+            return False
+    return True
+
+
+def extract_public_imports(interface_text: str) -> Set[str]:
+    """Every module named by a consumer-facing `import` in a swiftinterface.
+
+    Recognises plain / attributed (`@_exported`, `@_spi(x)`,
+    `@preconcurrency`) / access-modified (`public import`) / scoped
+    (`import struct Foo.Bar` → `Foo`) forms; the captured name is the
+    leading module component only. Non-public imports (`@_implementationOnly`
+    or `package`/`internal`/... access) are excluded — a client never has to
+    resolve them.
+    """
+    out: Set[str] = set()
+    for m in _IMPORT_LINE_RE.finditer(interface_text):
+        if _import_line_is_public(m.group("prefix")):
+            out.add(m.group("module"))
+    return out
+
+
+# --- on-disk produced-module enumeration -------------------------------------
+
+
+def _iter_consumer_swiftinterfaces(xcframework: Path):
+    """Yield every consumer-relevant `.swiftinterface` under `xcframework`.
+
+    Includes the public `<arch>.swiftinterface` AND the
+    `<arch>.private.swiftinterface` — xcodebuild recompiles both when the
+    interface is consumed, so a module imported by EITHER must ship (this is
+    what catches an owned module imported only from the private interface,
+    e.g. a `@usableFromInline`-driven `_NumericsShims`). The
+    `.package.swiftinterface` variant is skipped: it is the same-package-only
+    interface a foreign consumer never reads (and the tool deletes / rewrites
+    it during packaging).
+    """
+    for iface in xcframework.rglob("*.swiftinterface"):
+        if iface.name.endswith(".package.swiftinterface"):
+            continue
+        yield iface
+
+
+def public_imports_in_xcframework(xcframework: Path) -> Set[str]:
+    """Union of the public-import closure across every consumer-relevant
+    `.swiftinterface` in the bundle."""
+    out: Set[str] = set()
+    for iface in _iter_consumer_swiftinterfaces(xcframework):
+        try:
+            # utf-8-sig strips a leading BOM if present so `^import Foo` on the
+            # first line still anchor-matches.
+            text = iface.read_text(encoding="utf-8-sig", errors="replace")
+        except OSError:
+            continue
+        out |= extract_public_imports(text)
+    return out
+
+
+def provided_modules_in_xcframework(xcframework: Path) -> Set[str]:
+    """Every module a consumer can resolve from this bundle.
+
+    Module-identity based, never xcframework-basename based: framework and
+    swiftmodule DIRECTORY names (primary AND in-slice shim frameworks) plus
+    every top-level module declared in any shipped `module.modulemap`. So a
+    `GRDB-dynamic.xcframework` carrying `GRDB.framework` / `GRDB.swiftmodule`
+    provides `GRDB`, and a binary-less in-slice `GRDBSQLite.framework` system
+    shim (declared via its modulemap) provides `GRDBSQLite` even though no
+    `GRDBSQLite.xcframework` exists.
+    """
+    provided: Set[str] = set()
+    if not xcframework.is_dir():
+        return provided
+    for path in xcframework.rglob("*"):
+        name = path.name
+        if path.is_dir():
+            if name.endswith(".framework"):
+                provided.add(name[: -len(".framework")])
+            elif name.endswith(".swiftmodule"):
+                provided.add(name[: -len(".swiftmodule")])
+        elif name == "module.modulemap":
+            try:
+                text = path.read_text(encoding="utf-8-sig", errors="replace")
+            except OSError:
+                continue
+            for decl in _top_level_modulemap_modules(text):
+                provided.add(decl)
+    return provided
+
+
+def find_produced_xcframeworks(output_dir: Path) -> List[Path]:
+    """The xcframeworks produced by this run. During a build `output_dir` is
+    the run-scoped staging directory, which holds ONLY this run's artifacts
+    (umbrella + every sibling), so a plain glob is exact — no prior-run
+    leftovers to filter out."""
+    if output_dir is None or not Path(output_dir).is_dir():
+        return []
+    return sorted(Path(output_dir).glob("*.xcframework"))
+
+
+# --- dependency-graph ownership ---------------------------------------------
+
+
+@dataclass
+class _Ownership:
+    owned: Set[str]
+    owner_of: Dict[str, str]  # module -> owning package identity / umbrella name
+    static_only: Set[str]  # modules exposed ONLY via static-linkage product(s)
+
+
+def _graph_ownership(package: Package) -> _Ownership:
+    """Modules the dependency graph is responsible for producing: every
+    target / product / product-backing-target name of the umbrella and of
+    every transitive package. Records the owning package per module and which
+    modules are exposed only through static-linkage products (for reason
+    classification)."""
+    owned: Set[str] = set()
+    owner_of: Dict[str, str] = {}
+    linkages: Dict[str, Set[str]] = {}
+
+    def add(module: str, owner: str) -> None:
+        owned.add(module)
+        owner_of.setdefault(module, owner)
+
+    for t in package.targets:
+        # Only kinds that are actually produced as an xcframework are owed by
+        # the gate (see `_OWNABLE_TARGET_KINDS`). A macro / plugin /
+        # executable target is never emitted as a sibling, so a public import
+        # of it is not a hole this tool can fill.
+        if t.kind in _OWNABLE_TARGET_KINDS:
+            add(t.name, package.name)
+    for p in package.products:
+        add(p.name, package.name)
+        linkages.setdefault(p.name, set()).add(p.linkage)
+        for tname in p.targets:
+            add(tname, package.name)
+            linkages.setdefault(tname, set()).add(p.linkage)
+
+    for tp in package.transitive_packages:
+        # `target_names` (retained by Inspect, already narrowed to ownable
+        # kinds) covers internal helper modules that are not exposed as
+        # products — e.g. a transitive's auto-synth'd
+        # `InternalCollectionsUtilities` / `_NumericsShims`.
+        for tname in getattr(tp, "target_names", None) or []:
+            add(tname, tp.identity)
+        for p in tp.products:
+            add(p.name, tp.identity)
+            linkages.setdefault(p.name, set()).add(p.linkage)
+            for tname in p.targets:
+                add(tname, tp.identity)
+                linkages.setdefault(tname, set()).add(p.linkage)
+
+    static_only = {
+        m for m, ls in linkages.items() if ls and ls == {Linkage.STATIC}
+    }
+    return _Ownership(owned=owned, owner_of=owner_of, static_only=static_only)
+
+
+# --- the gate ---------------------------------------------------------------
+
+
+@dataclass
+class MissingClosureModule:
+    """One required-but-not-produced module, with its owning package (when
+    known) and a human-readable root reason for the receipt."""
+
+    module: str
+    owner: Optional[str]
+    reason: str
+
+
+def _classify_reason(
+    module: str,
+    owner: Optional[str],
+    static_only: Set[str],
+    failures_by_unit: Dict[str, object],
+) -> str:
+    # 1. An already-recorded upstream failure for the module or its owning
+    #    package is the most precise explanation — surface its diagnostic.
+    for unit in (module, owner):
+        if unit is not None and unit in failures_by_unit:
+            f = failures_by_unit[unit]
+            return (
+                f"required module {module!r} was not produced: the build of "
+                f"{unit!r} failed at the {f.phase} phase — {f.root_diagnostic}"
+            )
+    # 2. Exposed only through static-linkage product(s) — no dynamic
+    #    xcframework could be produced.
+    if module in static_only:
+        return (
+            f"required module {module!r} is exposed only through "
+            f"static-linkage product(s); no dynamic xcframework was produced "
+            f"for it"
+        )
+    # 3. Owned by a named dependency but simply absent from the output set.
+    if owner is not None:
+        return (
+            f"required module {module!r} (declared by dependency {owner!r}) "
+            f"is imported by the produced interface but no xcframework was "
+            f"produced for it"
+        )
+    return (
+        f"required module {module!r} is declared in the dependency graph but "
+        f"no xcframework was produced for it"
+    )
+
+
+def compute_missing_closure_modules(
+    package: Package,
+    produced_xcframeworks: Sequence[Path],
+    failures: Sequence[object] = (),
+) -> List[MissingClosureModule]:
+    """Return the graph-owned modules that the produced interfaces import but
+    that the produced artifact set does not provide — ordered by module name.
+
+    `failures` is the receipt's accumulated failure records (each with
+    `.unit` / `.phase` / `.root_diagnostic`); used only to attribute a
+    precise root reason. An empty list is returned when the produced set is
+    closed under public import.
+    """
+    imported: Set[str] = set()
+    provided: Set[str] = set()
+    for xc in produced_xcframeworks:
+        imported |= public_imports_in_xcframework(xc)
+        provided |= provided_modules_in_xcframework(xc)
+
+    own = _graph_ownership(package)
+    failures_by_unit: Dict[str, object] = {}
+    for f in failures:
+        unit = getattr(f, "unit", None)
+        if unit is not None:
+            failures_by_unit.setdefault(unit, f)
+
+    missing: List[MissingClosureModule] = []
+    for module in sorted(imported):
+        if module in provided:
+            continue
+        if module not in own.owned:
+            # Not ours to produce: a platform SDK framework, an injected
+            # system module, or a dependency outside the resolved graph. Never
+            # fail on it — that is the boundary that keeps a complete
+            # conversion from going red on `import Foundation`.
+            continue
+        owner = own.owner_of.get(module)
+        missing.append(
+            MissingClosureModule(
+                module=module,
+                owner=owner,
+                reason=_classify_reason(
+                    module, owner, own.static_only, failures_by_unit
+                ),
+            )
+        )
+    return missing
 
 
 # ============================================================================
@@ -16571,15 +16969,86 @@ def _record_receipt_artifacts(
 def _finalize_receipt_modules(receipt: "Receipt") -> None:
     """Fill in the module-closure fields (the session-04 contract):
     `produced` = the modules that reached disk; `missing_required` = the
-    expected primary products that did NOT. On a clean success the missing
-    set is empty; on any failure it names exactly which required modules
-    were never produced — the fact a directory scan cannot establish."""
+    expected primary products that did NOT, UNIONED with the import-closure
+    holes the graph-closure gate found (a graph-owned module a produced
+    interface imports but that the produced set does not provide). On a clean,
+    closed success both sources are empty; otherwise the field names exactly
+    which required modules are absent — expected primaries first (order
+    preserved), then any additional closure modules — the fact a directory
+    scan cannot establish."""
     produced = [a.module for a in receipt.artifacts]
     receipt.produced_modules = produced
     produced_set = set(produced)
-    receipt.missing_required_modules = [
+    missing = [
         p for p in receipt.expected_primary_products if p not in produced_set
     ]
+    # Union in (a) any names already on `missing_required_modules` and (b) the
+    # in-memory closure accumulator. Including (a) makes this idempotent even
+    # when called on a receipt rehydrated via `from_json` (where the closure
+    # accumulator is empty but disk `missing_required` still carries the
+    # closure-only names) — a second finalize then never drops them.
+    for module in list(receipt.missing_required_modules) + list(
+        receipt.closure_missing_modules
+    ):
+        if module not in missing:
+            missing.append(module)
+    receipt.missing_required_modules = missing
+
+
+def _run_import_closure_gate(config: Config, package: "Package") -> int:
+    """Import-closure completeness gate — the session-04 contract.
+
+    Runs once over the WHOLE produced artifact set (umbrella + every sibling)
+    after the build, asking a question no per-unit Verify can: is the set
+    closed under public import? Every module a produced `.swiftinterface`
+    publicly imports that (a) the produced artifacts do not provide AND (b)
+    the dependency graph owns is a required module this run failed to
+    produce — recorded on the receipt (into `missing_required_modules`, with
+    a precise root reason in `failures`) so a consumer never has to scan the
+    directory to discover the hole.
+
+    Returns 0 when the set is closed (or nothing was produced / no output
+    dir). When holes exist it records them regardless of mode, then returns a
+    hard-failure exit code UNLESS `--best-effort-transitives` is set — in
+    which case the run stays partial (exit 0) exactly as it does for a
+    best-effort sibling drop, since the closure hole is the downstream shadow
+    of precisely such a drop. Never fails a run on a platform SDK / system
+    import: those modules are not graph-owned, so they are never flagged.
+    """
+    output_dir = config.output_dir
+    if output_dir is None:
+        return 0
+    produced = find_produced_xcframeworks(Path(output_dir))
+    if not produced:
+        return 0
+    receipt = config.receipt
+    failures = list(receipt.failures) if receipt is not None else []
+    missing = compute_missing_closure_modules(package, produced, failures)
+    if not missing:
+        return 0
+
+    print(
+        _wrap(
+            "Error (closure): the produced xcframework set is not closed "
+            f"under public import — {len(missing)} required module(s) are "
+            "imported by a produced interface but were not produced:",
+            "red",
+        ),
+        file=sys.stderr,
+    )
+    for mm in missing:
+        print(_wrap(f"  - {mm.module}: {mm.reason}", "red"), file=sys.stderr)
+        if receipt is not None:
+            receipt.record_closure_missing(mm.module)
+            receipt.record_failure("closure", mm.module, mm.reason)
+
+    if config.best_effort_transitives:
+        warn(
+            "  continuing per --best-effort-transitives; the run is PARTIAL "
+            "and the receipt records the missing module(s) above"
+        )
+        return 0
+    return GraphClosureError.exit_code
 
 
 def _validate_platforms_post_autodetect(config: Config) -> None:
@@ -16783,7 +17252,18 @@ def _source_mode_after_inspect(
 
     prepared = prepare(staged_dir, plan, verbose=config.verbose)
     executed = execute_source_plan(prepared, config)
-    return _finalize_with_verify(executed, config, old_manifest=old_manifest)
+    result = _finalize_with_verify(executed, config, old_manifest=old_manifest)
+    if result != 0:
+        return result
+    # Import-closure completeness gate. Skipped for a child run — the
+    # orchestrator runs it once over the merged umbrella+siblings set, so an
+    # individual transitive child (whose interface legitimately imports a
+    # sibling built later in the same run) is never gated in isolation. A
+    # top-level self-contained or `--no-transitive-products` run has
+    # `child_run == False` and IS gated here.
+    if not config.child_run:
+        return _run_import_closure_gate(config, package)
+    return result
 
 
 def _run_source_mode(config: Config) -> int:
@@ -17634,6 +18114,16 @@ def _run_source_mode_with_transitives(config: Config) -> int:
     if umbrella_result != 0:
         return umbrella_result
     all_entries.extend(config.collected_entries)
+
+    # Import-closure completeness gate over the WHOLE produced tree (umbrella
+    # + every sibling now sitting in the run-staging output dir). The umbrella
+    # ran as a child, so its own `_source_mode_after_inspect` skipped the
+    # gate; this is where the merged set is finally complete and can be
+    # checked for closure. A hole here aborts the run (unless best-effort) so
+    # the staging dir is discarded rather than promoted.
+    closure_result = _run_import_closure_gate(config, package)
+    if closure_result != 0:
+        return closure_result
 
     _finalize_manifest(config, all_entries, old_manifest=old_manifest)
     return 0

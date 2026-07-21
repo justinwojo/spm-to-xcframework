@@ -26,6 +26,7 @@ from .diagnostics import format_block, scan_plan_error
 from .errors import (
     ExecuteError,
     FetchError,
+    GraphClosureError,
     InspectError,
     PlanError,
     PrepareBug,
@@ -43,6 +44,10 @@ from .fetch import (
     fetch_source,
     normalize_version_tag,
     stage_source,
+)
+from .graph_closure import (
+    compute_missing_closure_modules,
+    find_produced_xcframeworks,
 )
 from .inspect import (
     inspect_package,
@@ -913,15 +918,86 @@ def _record_receipt_artifacts(
 def _finalize_receipt_modules(receipt: "Receipt") -> None:
     """Fill in the module-closure fields (the session-04 contract):
     `produced` = the modules that reached disk; `missing_required` = the
-    expected primary products that did NOT. On a clean success the missing
-    set is empty; on any failure it names exactly which required modules
-    were never produced — the fact a directory scan cannot establish."""
+    expected primary products that did NOT, UNIONED with the import-closure
+    holes the graph-closure gate found (a graph-owned module a produced
+    interface imports but that the produced set does not provide). On a clean,
+    closed success both sources are empty; otherwise the field names exactly
+    which required modules are absent — expected primaries first (order
+    preserved), then any additional closure modules — the fact a directory
+    scan cannot establish."""
     produced = [a.module for a in receipt.artifacts]
     receipt.produced_modules = produced
     produced_set = set(produced)
-    receipt.missing_required_modules = [
+    missing = [
         p for p in receipt.expected_primary_products if p not in produced_set
     ]
+    # Union in (a) any names already on `missing_required_modules` and (b) the
+    # in-memory closure accumulator. Including (a) makes this idempotent even
+    # when called on a receipt rehydrated via `from_json` (where the closure
+    # accumulator is empty but disk `missing_required` still carries the
+    # closure-only names) — a second finalize then never drops them.
+    for module in list(receipt.missing_required_modules) + list(
+        receipt.closure_missing_modules
+    ):
+        if module not in missing:
+            missing.append(module)
+    receipt.missing_required_modules = missing
+
+
+def _run_import_closure_gate(config: Config, package: "Package") -> int:
+    """Import-closure completeness gate — the session-04 contract.
+
+    Runs once over the WHOLE produced artifact set (umbrella + every sibling)
+    after the build, asking a question no per-unit Verify can: is the set
+    closed under public import? Every module a produced `.swiftinterface`
+    publicly imports that (a) the produced artifacts do not provide AND (b)
+    the dependency graph owns is a required module this run failed to
+    produce — recorded on the receipt (into `missing_required_modules`, with
+    a precise root reason in `failures`) so a consumer never has to scan the
+    directory to discover the hole.
+
+    Returns 0 when the set is closed (or nothing was produced / no output
+    dir). When holes exist it records them regardless of mode, then returns a
+    hard-failure exit code UNLESS `--best-effort-transitives` is set — in
+    which case the run stays partial (exit 0) exactly as it does for a
+    best-effort sibling drop, since the closure hole is the downstream shadow
+    of precisely such a drop. Never fails a run on a platform SDK / system
+    import: those modules are not graph-owned, so they are never flagged.
+    """
+    output_dir = config.output_dir
+    if output_dir is None:
+        return 0
+    produced = find_produced_xcframeworks(Path(output_dir))
+    if not produced:
+        return 0
+    receipt = config.receipt
+    failures = list(receipt.failures) if receipt is not None else []
+    missing = compute_missing_closure_modules(package, produced, failures)
+    if not missing:
+        return 0
+
+    print(
+        _wrap(
+            "Error (closure): the produced xcframework set is not closed "
+            f"under public import — {len(missing)} required module(s) are "
+            "imported by a produced interface but were not produced:",
+            "red",
+        ),
+        file=sys.stderr,
+    )
+    for mm in missing:
+        print(_wrap(f"  - {mm.module}: {mm.reason}", "red"), file=sys.stderr)
+        if receipt is not None:
+            receipt.record_closure_missing(mm.module)
+            receipt.record_failure("closure", mm.module, mm.reason)
+
+    if config.best_effort_transitives:
+        warn(
+            "  continuing per --best-effort-transitives; the run is PARTIAL "
+            "and the receipt records the missing module(s) above"
+        )
+        return 0
+    return GraphClosureError.exit_code
 
 
 def _validate_platforms_post_autodetect(config: Config) -> None:
@@ -1125,7 +1201,18 @@ def _source_mode_after_inspect(
 
     prepared = prepare(staged_dir, plan, verbose=config.verbose)
     executed = execute_source_plan(prepared, config)
-    return _finalize_with_verify(executed, config, old_manifest=old_manifest)
+    result = _finalize_with_verify(executed, config, old_manifest=old_manifest)
+    if result != 0:
+        return result
+    # Import-closure completeness gate. Skipped for a child run — the
+    # orchestrator runs it once over the merged umbrella+siblings set, so an
+    # individual transitive child (whose interface legitimately imports a
+    # sibling built later in the same run) is never gated in isolation. A
+    # top-level self-contained or `--no-transitive-products` run has
+    # `child_run == False` and IS gated here.
+    if not config.child_run:
+        return _run_import_closure_gate(config, package)
+    return result
 
 
 def _run_source_mode(config: Config) -> int:
@@ -1977,6 +2064,16 @@ def _run_source_mode_with_transitives(config: Config) -> int:
     if umbrella_result != 0:
         return umbrella_result
     all_entries.extend(config.collected_entries)
+
+    # Import-closure completeness gate over the WHOLE produced tree (umbrella
+    # + every sibling now sitting in the run-staging output dir). The umbrella
+    # ran as a child, so its own `_source_mode_after_inspect` skipped the
+    # gate; this is where the merged set is finally complete and can be
+    # checked for closure. A hole here aborts the run (unless best-effort) so
+    # the staging dir is discarded rather than promoted.
+    closure_result = _run_import_closure_gate(config, package)
+    if closure_result != 0:
+        return closure_result
 
     _finalize_manifest(config, all_entries, old_manifest=old_manifest)
     return 0

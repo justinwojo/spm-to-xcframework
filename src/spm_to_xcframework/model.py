@@ -153,6 +153,18 @@ class TransitivePackageInfo:
     # (revision-pinned packages, branch-tracking deps). Used by the
     # binary-only auto-switch to populate Fetch's `--version <tag>`.
     head_tag: Optional[str] = None
+    # This transitive's library/binary (regular + binary kind) target names,
+    # from the same target dump used to compute `is_binary_only`. Products
+    # expose only the module names a caller imports by product; this retains
+    # the producible target list so the import-closure gate can recognise a
+    # transitive's INTERNAL helper module (canonical: a nested dependency's
+    # auto-synth'd `InternalCollectionsUtilities` / `_NumericsShims`) as
+    # graph-owned when a produced interface imports it. Narrowed to producible
+    # kinds so a macro / plugin / executable target — never emitted as a
+    # sibling xcframework — is not mistaken for a fillable hole. Populated by
+    # Inspect; empty is a safe under-approximation (the gate simply won't
+    # attribute such a module to this package).
+    target_names: List[str] = field(default_factory=list)
 
 
 @dataclass

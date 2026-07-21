@@ -106,3 +106,16 @@ class VerifyBug(VerifyError):
     """A real invariant violation inside Verify (e.g. the strict check
     itself crashed on a shape it should have handled). Surfaces with a
     traceback."""
+
+
+class GraphClosureError(SpmToXcframeworkError):
+    """The produced artifact set is not closed under public import: a
+    produced `.swiftinterface` imports a module the dependency graph owns
+    but that this run did not produce (static-only, toolchain-incompatible,
+    or a build failure upstream). Distinct exit code so the corpus harness
+    can classify an import-closure hole apart from a per-unit Verify failure.
+    Never raised as an exception — the gate returns this code directly and
+    records the precise missing modules on the receipt — but defined here so
+    the exit-code taxonomy stays in one place."""
+
+    exit_code = 9

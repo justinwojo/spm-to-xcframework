@@ -30,6 +30,7 @@ from .execute import *  # noqa: F401,F403
 from .output_manifest import *  # noqa: F401,F403
 from .receipt import *  # noqa: F401,F403
 from .verify import *  # noqa: F401,F403
+from .graph_closure import *  # noqa: F401,F403
 from .cli import *  # noqa: F401,F403
 
 
