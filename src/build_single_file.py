@@ -66,6 +66,7 @@ MODULE_ORDER: List[str] = [
     "execute/run_unit.py",
     "execute/binary_promote.py",
     "output_manifest.py",
+    "receipt.py",
     "verify.py",
     "cli.py",
 ]

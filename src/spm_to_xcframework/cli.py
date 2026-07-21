@@ -17,6 +17,7 @@ import re
 import shutil
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
@@ -61,7 +62,7 @@ from .platforms import (
     _declared_unincluded_platforms,
     _enabled_platforms,
 )
-from .prepare import prepare
+from .prepare import prepare, _swift_toolchain_version
 from .prune_child import _identity_from_url, prune_child_manifest_for_products
 from .execute import (
     detect_framework_type,
@@ -76,6 +77,16 @@ from .output_manifest import (
     _cleanup_stale_manifest_entries,
     _read_output_manifest,
     _write_output_manifest,
+)
+from .receipt import (
+    KIND_DEPENDENCY,
+    KIND_PRIMARY,
+    STATUS_FAILED,
+    STATUS_PARTIAL,
+    STATUS_SUCCESS,
+    Receipt,
+    ReceiptArtifact,
+    write_receipt,
 )
 from .verify import (
     print_verify_summary,
@@ -389,33 +400,144 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     work_dir = Path(tempfile.mkdtemp(prefix="spm2xc-"))
     config.work_dir = work_dir
     keep = config.keep_work
+
+    # Run-scoped conversion receipt. Allocated for every invocation that
+    # enters the build pipeline; dry-run / inspect-only produce no artifacts
+    # and touch no output, so they get neither a receipt nor a staging
+    # redirect. Shared by reference into every child config (the child-config
+    # factories leave `config.receipt` alone) so a transitive child's failure
+    # is visible to the finalizer here.
+    run_id = uuid.uuid4().hex
+    receipt = Receipt(
+        run_id=run_id,
+        package_source=config.package_source,
+        requested_version=config.user_version,
+        resolved_version=config.resolved_version,
+        revision=config.revision,
+    )
+    config.receipt = receipt
+
+    will_build = not (config.dry_run or config.inspect_only)
+    real_output = config.output_dir
+    staging: Optional[Path] = None
+    prior_manifest: Optional[OutputManifest] = None
+    exit_code = 1
     try:
+        if will_build:
+            # Build + verify into a run-scoped staging directory under the
+            # final output dir. Every producer and consumer of sibling
+            # xcframeworks keys off `config.output_dir` (dedup-overlap,
+            # transitive-sibling consumption, --include-deps, verify), so
+            # redirecting that one pointer moves the whole in-run artifact
+            # bus into staging without threading a second path through
+            # Execute. Staging lives on the same filesystem as the final
+            # output so promotion is a per-basename rename. The final output
+            # dir keeps exactly three responsibilities: the prior-manifest
+            # read (now, for cross-run cleanup), the always-written receipt,
+            # and the post-verify promotion + manifest write.
+            prior_manifest = _read_output_manifest(real_output)
+            staging = real_output / f".spm-run-{run_id}"
+            if staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
+            config.output_dir = staging
         try:
             if config.binary_mode:
-                return _run_binary_mode(config)
-            return _run_source_mode_with_transitives(config)
+                exit_code = _run_binary_mode(config)
+            else:
+                exit_code = _run_source_mode_with_transitives(config)
         except _USER_FACING_ERRORS as exc:
-            # User-facing phase errors (Fetch, Inspect, Plan): print a clean
-            # one-line "Error (<phase>): <msg>" and exit with the
-            # phase-specific code. No traceback. See REWRITE_DESIGN.md §7.
+            # User-facing phase errors (Fetch, Inspect, Plan, Prepare-user,
+            # Execute, Verify-user): print a clean one-line
+            # "Error (<phase>): <msg>" and exit with the phase-specific code.
+            # No traceback. See REWRITE_DESIGN.md §7.
             phase = _phase_label_for(exc)
             print(_wrap(f"Error ({phase}): {exc}", "red"), file=sys.stderr)
             if isinstance(exc, PlanError):
                 diag = scan_plan_error(str(exc))
                 if diag is not None:
                     print(format_block(diag), file=sys.stderr)
-            return exc.exit_code
-        except _BUG_CLASS_ERRORS:
-            # Tool bugs (Prepare, Verify) and uncaught exceptions deliberately
-            # bubble up so the traceback lands in the user's terminal — these
-            # are not their problem to interpret. See REWRITE_DESIGN.md §7.
-            raise
-        # ExecuteError sits in the middle: surface a clean error without a
-        # traceback, but still capture enough context that the user can find
-        # the xcresult bundle. The structured handling lives in session 4
-        # where the executor is wired up.
-
+            receipt.record_failure(phase, None, _first_diagnostic_line(str(exc)))
+            exit_code = exc.exit_code
+        # Bug-class errors (PrepareBug, VerifyBug) and any unexpected
+        # exception propagate untouched so the traceback lands in the user's
+        # terminal — these are not their problem to interpret. The outer
+        # `finally` still writes a `failed` receipt before they surface.
+        if will_build:
+            config.output_dir = real_output
+            if exit_code == 0:
+                # Success (or best-effort partial): promote the verified set
+                # from staging into the final output dir, then reuse the
+                # tested manifest finalizer for cross-run cleanup + write.
+                assert staging is not None
+                new_entries = _read_output_manifest(staging).entries
+                # Promotion reports back exactly which basenames actually
+                # reached `real_output` as fresh output of THIS run.
+                promoted = _promote_staged_artifacts(
+                    staging, real_output, new_entries, run_id
+                )
+                promoted_names = {e.name for e in promoted}
+                # The manifest reflects what is AUTHORITATIVE on disk now:
+                # freshly promoted artifacts PLUS any prior last-good that a
+                # soft-skipped or failed-and-restored promotion deliberately
+                # left in place. Keying stale-cleanup off only `promoted`
+                # would treat a preserved last-good as stale and delete the
+                # very artifact promotion protected. A preserved last-good is
+                # exactly a basename this run attempted (in `new_entries`) that
+                # was already tracked in the prior manifest and is still on
+                # disk — matching on the prior manifest (not bare existence)
+                # keeps an untracked same-name user cohabitant out of our
+                # manifest.
+                prior_names = (
+                    {e.name for e in prior_manifest.entries}
+                    if prior_manifest is not None
+                    else set()
+                )
+                present = [
+                    e
+                    for e in new_entries
+                    if e.name in promoted_names
+                    or (e.name in prior_names and (real_output / e.name).exists())
+                ]
+                _finalize_manifest(config, present, old_manifest=prior_manifest)
+                # The receipt records only what THIS run produced (the freshly
+                # promoted set); a preserved last-good is not this run's output
+                # and stays visible as a missing primary, never a produced
+                # artifact. Any verified entry that failed to land is a
+                # non-fatal promotion failure — recorded so a dependency that
+                # neither landed nor remains can never read back as success.
+                _record_receipt_artifacts(receipt, promoted)
+                for entry in new_entries:
+                    if entry.name not in promoted_names:
+                        receipt.record_failure(
+                            "promote",
+                            entry.name,
+                            "verified artifact did not land in the output "
+                            "directory",
+                        )
+                _finalize_receipt_modules(receipt)
+                # Success requires BOTH a clean exit AND every expected
+                # primary on disk. A required primary that never landed (a
+                # soft-skipped promote) or a recorded non-fatal failure (the
+                # best-effort-transitives drop) downgrades to partial — the
+                # receipt never claims success for a primary that is absent.
+                if receipt.missing_required_modules or receipt.failures:
+                    receipt.status = STATUS_PARTIAL
+                else:
+                    receipt.status = STATUS_SUCCESS
+            else:
+                receipt.status = STATUS_FAILED
+        return exit_code
     finally:
+        if will_build:
+            config.output_dir = real_output
+            _snapshot_receipt_env(receipt, config)
+            _finalize_receipt_modules(receipt)
+            try:
+                write_receipt(real_output, receipt)
+            except OSError as exc:
+                warn(f"Could not write conversion receipt: {exc}")
+            if staging is not None:
+                shutil.rmtree(staging, ignore_errors=True)
         if keep:
             dim(f"Work directory retained: {work_dir}")
         else:
@@ -489,6 +611,19 @@ def _verify_executed_and_collect_entries(
     results = verify_output(units, config.output_dir)
     print_verify_summary(results, config.output_dir)
     if any(not r.passed for r in results):
+        # Record per-unit verify provenance on the run receipt so a failed
+        # run names exactly which module failed and why — the fact a
+        # directory scan (which sees only the dependency siblings that DID
+        # land) can never establish. Attributed to the failing unit; the
+        # root diagnostic is the joined fatal issues.
+        if config.receipt is not None:
+            for r in results:
+                if r.passed:
+                    continue
+                diag = "; ".join(r.fatal_issues) if r.fatal_issues else "(no detail)"
+                config.receipt.record_failure(
+                    "verify", r.unit_name, _first_diagnostic_line(diag)
+                )
         return VerifyError.exit_code, []
 
     primary_names: Set[str] = set()
@@ -589,6 +724,204 @@ def _finalize_with_verify(
         return exit_code
     _finalize_manifest(config, entries, old_manifest=old_manifest)
     return 0
+
+
+# --- Conversion receipt helpers ----------------------------------------------
+#
+# These support the always-written receipt + staged atomic promotion wired
+# into `main()`. Kept as small pure-ish functions so the exit-path handling
+# in main() stays readable.
+
+
+def _record_expected_primary_products(config: Config, plan) -> None:
+    """Record this run's expected primary products (the plan's build-unit
+    names) on the shared receipt — but ONLY for the primary run (a standalone
+    package or the umbrella). A transitive-sibling child shares the receipt by
+    reference; its products are the umbrella's *dependencies*, so letting a
+    child write here would pollute the primary set and mislabel siblings as
+    primary. Idempotent: set once, never appended to across the two planners
+    (source vs the transparent binary hand-off)."""
+    if config.receipt is None or config.is_transitive_child:
+        return
+    if config.receipt.expected_primary_products:
+        return
+    config.receipt.expected_primary_products = [bu.name for bu in plan.build_units]
+
+
+def _first_diagnostic_line(message: str) -> str:
+    """Reduce a multi-line phase-error message to a single root-cause line
+    for the receipt. Prefers the first non-empty line; caps the length so a
+    receipt never balloons on a giant xcodebuild dump."""
+    for line in message.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped[:500]
+    return message.strip()[:500]
+
+
+def _force_remove(path: Path) -> None:
+    """Remove `path` whether it is a directory, file, or symlink. Best-effort:
+    a partial failure is swallowed (the caller is mid-promotion and has a
+    recovery path), never raised."""
+    try:
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path, ignore_errors=True)
+        elif path.exists() or path.is_symlink():
+            path.unlink()
+    except OSError:
+        pass
+
+
+def _promote_staged_artifacts(
+    staging: Path,
+    real_output: Path,
+    entries: Sequence[ManifestEntry],
+    run_id: str,
+) -> List[ManifestEntry]:
+    """Promote each verified basename from `staging` into `real_output`,
+    returning ONLY the entries this run freshly landed there.
+
+    Only the verified set (the entries the manifest finalizer already
+    trusts) is moved — partial / unverified trees stay in staging and are
+    discarded with it. User-owned cohabitants of `real_output` are never
+    touched.
+
+    A prior same-name artifact (last-good) is moved ASIDE atomically to a
+    hidden `.spm-prev-<run_id>-<name>` sibling before the successor is placed,
+    then dropped only once the successor has landed. `os.replace` cannot
+    overwrite a non-empty directory, so a naive delete-then-move would destroy
+    last-good before the new tree is in place; the move-aside keeps last-good
+    intact — and recoverable — right up to the moment the successor lands. If
+    the aside itself fails, the entry is skipped with last-good untouched
+    (never deleted to force a slot); if placement fails after a successful
+    aside, last-good is moved back. Only a rare double failure (placement AND
+    restore) leaves the canonical name empty with a `.spm-prev-*` recovery
+    copy beside it.
+
+    The returned list is the subset of `entries` this call actually placed as
+    fresh output — a soft-skipped basename whose prior last-good remains on
+    disk is NOT in it. The receipt keys its produced-artifact list off this
+    return (so it only ever claims what this run produced); the caller keys
+    the manifest off a wider `present` set (fresh + preserved-tracked-prior)
+    so stale-cleanup does not delete a last-good this call deliberately kept.
+    """
+    real_output.mkdir(parents=True, exist_ok=True)
+    promoted: List[ManifestEntry] = []
+    for entry in entries:
+        src = staging / entry.name
+        if not src.exists() and not src.is_symlink():
+            # Defensive: a verified entry with no staged tree should be
+            # impossible, but never fabricate a promotion.
+            warn(f"  staged artifact missing, cannot promote: {entry.name}")
+            continue
+        dst = real_output / entry.name
+        backup = real_output / f".spm-prev-{run_id}-{entry.name}"
+        moved_aside = False
+        if dst.exists() or dst.is_symlink():
+            # Move last-good aside atomically (same filesystem) so it survives
+            # until the successor lands and can be restored on failure.
+            _force_remove(backup)
+            try:
+                os.replace(dst, backup)
+                moved_aside = True
+            except OSError as exc:
+                # Could not even move last-good aside (a genuinely odd FS
+                # state — same-dir rename failing). Never destroy last-good
+                # to force a slot: leave it in place, skip this entry, and
+                # let it surface as a non-promoted (missing) artifact.
+                warn(f"  could not stage replacement for {entry.name}: {exc}")
+                continue
+        try:
+            os.replace(src, dst)
+        except OSError:
+            # Cross-filesystem (EXDEV) or similar — fall back to copy+remove.
+            try:
+                if src.is_dir() and not src.is_symlink():
+                    shutil.copytree(src, dst, symlinks=True)
+                    shutil.rmtree(src, ignore_errors=True)
+                else:
+                    shutil.copy2(src, dst)
+                    _force_remove(src)
+            except OSError as exc:
+                # Placement failed outright. Restore last-good so a failed
+                # promotion never leaves real_output missing an artifact it
+                # had before this run.
+                _force_remove(dst)
+                if moved_aside:
+                    try:
+                        os.replace(backup, dst)
+                        moved_aside = False
+                    except OSError:
+                        warn(
+                            f"  could not restore last-good {entry.name}; "
+                            f"a recovery copy remains at {backup.name}"
+                        )
+                warn(f"  could not promote {entry.name}: {exc}")
+                continue
+        # Successor landed — drop the aside copy of last-good.
+        if moved_aside:
+            _force_remove(backup)
+        promoted.append(entry)
+    return promoted
+
+
+def _snapshot_receipt_env(receipt: "Receipt", config: Config) -> None:
+    """Snapshot the toolchain version and resolved platform slices into the
+    receipt. Called from main()'s finally so the values reflect what
+    actually ran; best-effort — a run that died before autodetect leaves
+    `requested_slices` empty rather than lying about a resolved minimum."""
+    if receipt.swift_toolchain is None:
+        try:
+            tc = _swift_toolchain_version()
+        except Exception:  # toolchain probe is best-effort; never fatal here
+            tc = None
+        if tc is not None:
+            receipt.swift_toolchain = ".".join(str(n) for n in tc)
+    if not receipt.requested_slices:
+        mins = {
+            "ios": config.min_ios,
+            "macos": config.min_macos,
+            "maccatalyst": config.min_maccatalyst,
+            "tvos": config.min_tvos,
+            "watchos": config.min_watchos,
+            "visionos": config.min_visionos,
+        }
+        receipt.requested_slices = [
+            (plat, mins.get(plat) or "") for plat in _enabled_platforms(config)
+        ]
+
+
+def _record_receipt_artifacts(
+    receipt: "Receipt", entries: Sequence[ManifestEntry]
+) -> None:
+    """Record produced-and-verified artifacts on the receipt, classifying
+    each as primary vs dependency from THIS run's intent (the umbrella /
+    standalone plan's expected primary products) rather than from a child's
+    own verify labeling — a transitive sibling is a dependency of the
+    umbrella even though it was a `primary` unit within its own child run."""
+    expected = set(receipt.expected_primary_products)
+    for entry in entries:
+        module = entry.name
+        if module.endswith(".xcframework"):
+            module = module[: -len(".xcframework")]
+        kind = KIND_PRIMARY if module in expected else KIND_DEPENDENCY
+        receipt.artifacts.append(
+            ReceiptArtifact(name=entry.name, module=module, kind=kind)
+        )
+
+
+def _finalize_receipt_modules(receipt: "Receipt") -> None:
+    """Fill in the module-closure fields (the session-04 contract):
+    `produced` = the modules that reached disk; `missing_required` = the
+    expected primary products that did NOT. On a clean success the missing
+    set is empty; on any failure it names exactly which required modules
+    were never produced — the fact a directory scan cannot establish."""
+    produced = [a.module for a in receipt.artifacts]
+    receipt.produced_modules = produced
+    produced_set = set(produced)
+    receipt.missing_required_modules = [
+        p for p in receipt.expected_primary_products if p not in produced_set
+    ]
 
 
 def _validate_platforms_post_autodetect(config: Config) -> None:
@@ -775,6 +1108,7 @@ def _source_mode_after_inspect(
     orchestrator own the one-shot manifest read and merged write.
     """
     plan = plan_source_build(config, package)
+    _record_expected_primary_products(config, plan)
     for w in plan.warnings:
         warn(w)
     if config.dry_run_json:
@@ -970,6 +1304,10 @@ def _make_binary_only_transitive_child_config(
         # leave the flag flipped to match the source-mode child's shape.
         no_dedup_overlap=True,
         child_run=True,
+        # A transitive sibling's products are the umbrella's DEPENDENCIES,
+        # not primary products — flag it so `_record_expected_primary_products`
+        # skips this child (it shares the umbrella's receipt by reference).
+        is_transitive_child=True,
         collected_entries=[],
         work_dir=child_work_dir,
     )
@@ -1072,6 +1410,9 @@ def _make_transitive_child_config(parent: Config, tp, child_work_dir: Path) -> C
         # module-import resolution.
         no_dedup_overlap=True,
         child_run=True,
+        # Transitive-sibling products are the umbrella's dependencies, not
+        # primary products; `_record_expected_primary_products` skips it.
+        is_transitive_child=True,
         collected_entries=[],
         work_dir=child_work_dir,
     )
@@ -1569,22 +1910,36 @@ def _run_source_mode_with_transitives(config: Config) -> int:
                 diag = scan_plan_error(str(exc))
                 if diag is not None:
                     print(format_block(diag), file=sys.stderr)
+            # Attribute the phase error to this transitive on the shared
+            # receipt. Nothing else has recorded it — the child raised before
+            # reaching verify — so this is the run's only provenance for why
+            # the sibling is absent.
+            if config.receipt is not None:
+                config.receipt.record_failure(
+                    phase, tp.identity, _first_diagnostic_line(str(exc))
+                )
             if config.best_effort_transitives:
                 warn(
                     f"  continuing per --best-effort-transitives; "
-                    f"{tp.identity!r} will not be shipped (any partial "
-                    f"artifacts under {config.output_dir} are excluded from "
-                    f"the manifest but not deleted — inspect before shipping)"
+                    f"{tp.identity!r} will not be shipped (its partial build "
+                    f"artifacts stay in the discarded run-staging directory "
+                    f"and never reach {config.output_dir}); the receipt records "
+                    f"the failure"
                 )
                 continue
             return exc.exit_code
         if result != 0:
+            # The child's own Verify already recorded per-unit provenance on
+            # the shared receipt (receipt is shared by reference), so don't
+            # double-record here — just honour the fail-fast / best-effort
+            # contract.
             if config.best_effort_transitives:
                 warn(
                     f"  transitive {tp.identity!r} failed (exit {result}); "
-                    f"continuing per --best-effort-transitives (any partial "
-                    f"artifacts under {config.output_dir} are excluded from "
-                    f"the manifest but not deleted — inspect before shipping)"
+                    f"continuing per --best-effort-transitives (its partial "
+                    f"build artifacts stay in the discarded run-staging "
+                    f"directory and never reach {config.output_dir}); the "
+                    f"receipt records the failure"
                 )
                 continue
             return result
@@ -1657,6 +2012,7 @@ def _run_binary_mode(config: Config) -> int:
 
     artifacts = discover_binary_artifacts(config)
     plan = plan_binary_build(config, artifacts)
+    _record_expected_primary_products(config, plan)
     for w in plan.warnings:
         warn(w)
     if config.dry_run_json:

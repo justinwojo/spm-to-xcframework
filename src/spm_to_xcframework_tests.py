@@ -12426,6 +12426,538 @@ def _selftest_verify_one_unit_nested_library_path_enforces_language(
     )
 
 
+# --- Conversion receipt self-tests ---------------------------------------
+#
+# All synthetic — no xcodebuild, no network, no swift. Two layers:
+#   1. receipt.py serialization: round-trip, tolerant reader, defaults.
+#   2. main()'s staging → promote → always-written-receipt machinery, driven
+#      with the build phase replaced by a fake so success / failure / partial
+#      / mid-run-crash exit paths are all exercised deterministically.
+#
+# The fake is installed on the `cli` submodule (where both `main` and
+# `_run_binary_mode` live and resolve their globals) via sys.modules, so the
+# interception is namespace-correct rather than relying on the package
+# re-export shadowing.
+
+
+def _receipt_cli_module():
+    return sys.modules["spm_to_xcframework.cli"]
+
+
+def _run_main_with_fake_build(
+    source_dir: Path,
+    output_dir: Path,
+    fake,
+    *,
+    extra_args: Sequence[str] = (),
+):
+    """Drive `main()` end to end with the binary-mode build phase replaced by
+    `fake(config)`. Binary mode is chosen only because it is the simplest
+    dispatch to intercept — the staging/promotion/receipt code in main() is
+    mode-independent. Returns (rc, raised_exception_or_None)."""
+    cli_mod = _receipt_cli_module()
+    argv = [str(source_dir), "-o", str(output_dir), "--binary", *extra_args]
+    saved_build = cli_mod._run_binary_mode
+    buf_out, buf_err = io.StringIO(), io.StringIO()
+    raised: Optional[BaseException] = None
+    rc = None
+    try:
+        cli_mod._run_binary_mode = fake
+        with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+            try:
+                # NB: `tool.main`, not the bare `main` — this test module
+                # defines its own `main()` (the suite runner) which shadows
+                # the tool's in this namespace.
+                rc = tool.main(argv)
+            except BaseException as exc:  # capture bug-class re-raise
+                raised = exc
+    finally:
+        cli_mod._run_binary_mode = saved_build
+    return rc, raised
+
+
+def _fake_build_producing(config, primaries, *, extras=(), record_failures=()):
+    """A fake build+verify phase. Replaces the whole `_run_binary_mode`
+    dispatch, so it does exactly what a real successful build leaves behind
+    in the staging dir: one xcframework directory per produced module plus a
+    staging manifest for main() to read. Deliberately uses plain directories
+    (not compiled synthetic xcframeworks) — verification is part of the phase
+    being faked, so re-running it here would only couple the test to the
+    binary toolchain. Sets expected primary products, records any requested
+    failures on the shared receipt, and returns 0."""
+    config.receipt.expected_primary_products = list(primaries)
+    for phase, unit, diag in record_failures:
+        config.receipt.record_failure(phase, unit, diag)
+    prims = set(primaries)
+    entries = []
+    for name in list(primaries) + list(extras):
+        xc = config.output_dir / f"{name}.xcframework"
+        xc.mkdir(parents=True, exist_ok=True)
+        (xc / "marker").write_text(name)
+        kind = (
+            tool._MANIFEST_KIND_PRIMARY
+            if name in prims
+            else tool._MANIFEST_KIND_DEPENDENCY
+        )
+        entries.append(ManifestEntry(name=f"{name}.xcframework", kind=kind))
+    tool._write_output_manifest(
+        config.output_dir,
+        entries,
+        package_source=config.package_source,
+        package_version=config.user_version,
+    )
+    return 0
+
+
+def _read_receipt_or_fail(output_dir: Path) -> "Receipt":
+    r = read_receipt(output_dir)
+    _assert(r is not None, f"receipt should exist under {output_dir}")
+    return r
+
+
+# --- Layer 1: receipt.py serialization -----------------------------------
+
+
+def _selftest_receipt_roundtrip(tmp_root: Path) -> None:
+    """A fully populated receipt survives write_receipt → read_receipt with
+    every field intact."""
+    out = tmp_root / "receipt_roundtrip"
+    out.mkdir()
+    r = Receipt(
+        run_id="abc123",
+        package_source="https://example.com/pkg.git",
+        requested_version="1.2.3",
+        resolved_version="v1.2.3",
+        revision="deadbeef",
+        status=STATUS_PARTIAL,
+        swift_toolchain="6.1.0",
+        requested_slices=[("ios", "15.0"), ("macos", "12.0")],
+        expected_primary_products=["Alpha", "Beta"],
+        artifacts=[
+            ReceiptArtifact("Alpha.xcframework", "Alpha", KIND_PRIMARY),
+            ReceiptArtifact("Dep.xcframework", "Dep", KIND_DEPENDENCY),
+        ],
+        produced_modules=["Alpha", "Dep"],
+        missing_required_modules=["Beta"],
+    )
+    r.record_failure("execute", "Beta", "xcodebuild failed: boom")
+    write_receipt(out, r)
+    _assert((out / RECEIPT_FILENAME).is_file(),
+            "receipt file should be written to output dir")
+    back = _read_receipt_or_fail(out)
+    _assert(back.run_id == "abc123", f"run_id lost: {back.run_id!r}")
+    _assert(back.status == STATUS_PARTIAL, f"status lost: {back.status!r}")
+    _assert(back.package_source == "https://example.com/pkg.git",
+            "package_source lost")
+    _assert(back.resolved_version == "v1.2.3", "resolved_version lost")
+    _assert(back.revision == "deadbeef", "revision lost")
+    _assert(back.swift_toolchain == "6.1.0", "toolchain lost")
+    _assert(back.requested_slices == [("ios", "15.0"), ("macos", "12.0")],
+            f"slices lost: {back.requested_slices!r}")
+    _assert(back.expected_primary_products == ["Alpha", "Beta"],
+            "expected primaries lost")
+    _assert(len(back.artifacts) == 2, "artifacts lost")
+    _assert(back.artifacts[0].kind == KIND_PRIMARY, "primary kind lost")
+    _assert(back.artifacts[1].kind == KIND_DEPENDENCY, "dependency kind lost")
+    _assert(back.missing_required_modules == ["Beta"], "missing_required lost")
+    _assert(len(back.failures) == 1 and back.failures[0].unit == "Beta",
+            f"failure lost: {back.failures!r}")
+    _assert(back.produced_at != "", "produced_at should be stamped at write")
+
+
+def _selftest_receipt_default_status_failed() -> None:
+    """A freshly constructed receipt is pessimistic: status is `failed`
+    until a clean exit upgrades it. The load-time contract depends on this
+    — a truncated/never-finalized run must never read back as success."""
+    r = Receipt(run_id="x", package_source="s")
+    _assert(r.status == STATUS_FAILED,
+            f"default status must be failed, got {r.status!r}")
+
+
+def _selftest_receipt_reader_tolerant(tmp_root: Path) -> None:
+    """read_receipt returns None (never raises) for every unhappy path:
+    missing file, unparseable JSON, non-dict top level, unknown schema."""
+    out = tmp_root / "receipt_tolerant"
+    out.mkdir()
+    _assert(read_receipt(out) is None, "missing receipt should read as None")
+    (out / RECEIPT_FILENAME).write_text("{ not json")
+    _assert(read_receipt(out) is None, "unparseable receipt should read as None")
+    (out / RECEIPT_FILENAME).write_text("[1, 2, 3]")
+    _assert(read_receipt(out) is None, "non-dict receipt should read as None")
+    (out / RECEIPT_FILENAME).write_text(
+        json.dumps({"schema_version": 999, "run_id": "z"})
+    )
+    _assert(read_receipt(out) is None,
+            "unknown schema version should read as None")
+
+
+# --- Layer 2: main() staging / promotion / always-written receipt --------
+
+
+def _selftest_receipt_written_on_success(tmp_root: Path) -> None:
+    """A clean build writes a `success` receipt AND promotes the verified
+    artifacts into the real output dir, leaving no run-staging directory."""
+    src = tmp_root / "recv_success_src"
+    src.mkdir()
+    out = tmp_root / "recv_success_out"
+    rc, raised = _run_main_with_fake_build(
+        src, out, lambda c: _fake_build_producing(c, ["Primary"], extras=["Dep"])
+    )
+    _assert(raised is None, f"success path should not raise: {raised!r}")
+    _assert(rc == 0, f"success path should exit 0, got {rc}")
+    _assert((out / "Primary.xcframework").exists(),
+            "Primary should be promoted to the real output dir")
+    _assert((out / "Dep.xcframework").exists(),
+            "Dep should be promoted to the real output dir")
+    leftover = list(out.glob(".spm-run-*"))
+    _assert(not leftover, f"no run-staging dir should survive, found {leftover}")
+    r = _read_receipt_or_fail(out)
+    _assert(r.status == STATUS_SUCCESS, f"status should be success, got {r.status!r}")
+    kinds = {a.module: a.kind for a in r.artifacts}
+    _assert(kinds.get("Primary") == KIND_PRIMARY,
+            f"Primary should be primary, got {kinds!r}")
+    _assert(kinds.get("Dep") == KIND_DEPENDENCY,
+            f"Dep should be dependency (not an expected primary), got {kinds!r}")
+    _assert("Primary" in r.produced_modules, "Primary should be in produced")
+    _assert(not r.missing_required_modules,
+            f"nothing should be missing, got {r.missing_required_modules!r}")
+
+
+def _selftest_receipt_written_on_failure_and_prior_artifacts_preserved(
+    tmp_root: Path,
+) -> None:
+    """A build that raises a phase error writes a `failed` receipt naming the
+    phase, promotes NOTHING, and leaves the prior last-good artifact and its
+    directory untouched (staged-atomic-promotion invariant)."""
+    src = tmp_root / "recv_fail_src"
+    src.mkdir()
+    out = tmp_root / "recv_fail_out"
+    out.mkdir()
+    # Prior last-good state on disk.
+    (out / "Good.xcframework").mkdir()
+    (out / "Good.xcframework" / "keep").write_text("prior")
+
+    def fake_fail(config):
+        config.receipt.expected_primary_products = ["Primary"]
+        # Simulate a partial write into staging before the crash — it must
+        # NOT leak into the real output dir.
+        (config.output_dir / "Primary.xcframework").mkdir(parents=True)
+        (config.output_dir / "Primary.xcframework" / "partial").write_text("x")
+        raise ExecuteError(
+            "xcodebuild archive failed for Primary\nlots of noise\nmore noise"
+        )
+
+    rc, raised = _run_main_with_fake_build(src, out, fake_fail)
+    _assert(raised is None,
+            f"ExecuteError is user-facing and should be caught, got {raised!r}")
+    _assert(rc == ExecuteError.exit_code,
+            f"exit code should be ExecuteError's, got {rc}")
+    _assert((out / "Good.xcframework" / "keep").read_text() == "prior",
+            "prior last-good artifact must be untouched after a failed build")
+    _assert(not (out / "Primary.xcframework").exists(),
+            "partial artifact must NOT be promoted into the real output dir")
+    leftover = list(out.glob(".spm-run-*"))
+    _assert(not leftover, f"staging dir must be discarded, found {leftover}")
+    r = _read_receipt_or_fail(out)
+    _assert(r.status == STATUS_FAILED, f"status should be failed, got {r.status!r}")
+    _assert(any(f.phase == "execute" for f in r.failures),
+            f"failure should name the execute phase, got {r.failures!r}")
+    _assert(r.missing_required_modules == ["Primary"],
+            f"Primary should be recorded as missing, got "
+            f"{r.missing_required_modules!r}")
+    _assert(not r.artifacts, f"no artifacts should be recorded, got {r.artifacts!r}")
+
+
+def _selftest_receipt_partial_on_recorded_failure(tmp_root: Path) -> None:
+    """A clean exit that nonetheless recorded a failure (the canonical
+    --best-effort-transitives dropped-sibling shape) is `partial`, not
+    `success`, and the dropped module shows up in missing_required — the fact
+    a directory scan of the surviving siblings can never establish."""
+    src = tmp_root / "recv_partial_src"
+    src.mkdir()
+    out = tmp_root / "recv_partial_out"
+
+    def fake_partial(config):
+        # Two primaries expected, but Dropped never reaches disk (the
+        # best-effort-transitives shape). Only Primary is produced; the
+        # failure for Dropped is recorded on the shared receipt.
+        config.receipt.expected_primary_products = ["Primary", "Dropped"]
+        config.receipt.record_failure("execute", "Dropped", "transitive Dropped failed")
+        xc = config.output_dir / "Primary.xcframework"
+        xc.mkdir(parents=True, exist_ok=True)
+        (xc / "marker").write_text("Primary")
+        tool._write_output_manifest(
+            config.output_dir,
+            [ManifestEntry(name="Primary.xcframework", kind=tool._MANIFEST_KIND_PRIMARY)],
+            package_source=config.package_source,
+            package_version=config.user_version,
+        )
+        return 0
+
+    rc, raised = _run_main_with_fake_build(src, out, fake_partial)
+    _assert(raised is None, f"partial path should not raise: {raised!r}")
+    _assert(rc == 0, f"best-effort partial still exits 0, got {rc}")
+    r = _read_receipt_or_fail(out)
+    _assert(r.status == STATUS_PARTIAL,
+            f"a clean exit with a recorded failure must be partial, got "
+            f"{r.status!r}")
+    _assert(r.missing_required_modules == ["Dropped"],
+            f"Dropped should be the missing required module, got "
+            f"{r.missing_required_modules!r}")
+    _assert(any(a.module == "Primary" for a in r.artifacts),
+            "Primary should still be a recorded artifact")
+
+
+def _selftest_receipt_written_on_bug_class_crash(tmp_root: Path) -> None:
+    """Even an un-caught bug-class exception (which re-raises to surface a
+    traceback) must still deposit a `failed` receipt on the way out — the
+    receipt is written in main()'s finally, so proof-of-attempt survives a
+    crash. Prior artifacts stay intact and no staging leaks."""
+    src = tmp_root / "recv_bug_src"
+    src.mkdir()
+    out = tmp_root / "recv_bug_out"
+    out.mkdir()
+    (out / "Good.xcframework").mkdir()
+    (out / "Good.xcframework" / "keep").write_text("prior")
+
+    class _Boom(RuntimeError):
+        pass
+
+    def fake_bug(config):
+        config.receipt.expected_primary_products = ["Primary"]
+        raise _Boom("invariant violated deep in execute")
+
+    rc, raised = _run_main_with_fake_build(src, out, fake_bug)
+    _assert(isinstance(raised, _Boom),
+            f"bug-class error must propagate, got rc={rc} raised={raised!r}")
+    _assert((out / "Good.xcframework" / "keep").read_text() == "prior",
+            "prior artifact must survive a bug-class crash")
+    leftover = list(out.glob(".spm-run-*"))
+    _assert(not leftover, f"staging must be discarded even on crash, found {leftover}")
+    r = _read_receipt_or_fail(out)
+    _assert(r.status == STATUS_FAILED,
+            f"crash receipt must be failed, got {r.status!r}")
+
+
+def _selftest_receipt_promotion_replaces_prior_same_name(tmp_root: Path) -> None:
+    """Promotion replaces a prior same-name artifact atomically: after a
+    successful rebuild, the new content is present and the manifest-tracked
+    stale sibling is cleaned."""
+    src = tmp_root / "recv_replace_src"
+    src.mkdir()
+    out = tmp_root / "recv_replace_out"
+    out.mkdir()
+    # Prior manifest lists Primary (to be replaced) + Stale (to be cleaned).
+    (out / "Primary.xcframework").mkdir()
+    (out / "Primary.xcframework" / "old").write_text("old-primary")
+    (out / "Stale.xcframework").mkdir()
+    (out / "Stale.xcframework" / "old").write_text("old-stale")
+    _write_manifest_file(out, [
+        ("Primary.xcframework", "primary"),
+        ("Stale.xcframework", "primary"),
+    ])
+
+    rc, raised = _run_main_with_fake_build(
+        src, out, lambda c: _fake_build_producing(c, ["Primary"])
+    )
+    _assert(raised is None, f"should not raise: {raised!r}")
+    _assert(rc == 0, f"should succeed, got {rc}")
+    _assert((out / "Primary.xcframework").exists(),
+            "Primary should be present after promotion")
+    _assert(not (out / "Primary.xcframework" / "old").exists(),
+            "prior Primary content must be fully replaced, not merged")
+    _assert(not (out / "Stale.xcframework").exists(),
+            "manifest-tracked Stale sibling should be cleaned")
+    fresh = _read_output_manifest(out)
+    names = {e.name for e in fresh.entries}
+    _assert(names == {"Primary.xcframework"},
+            f"final manifest should list only Primary, got {names}")
+
+
+def _selftest_receipt_clean_exit_missing_primary_is_not_success(
+    tmp_root: Path,
+) -> None:
+    """A build that exits 0 but never produces its expected primary must NOT
+    read back as `success`. Success requires both a clean exit AND every
+    expected primary on disk; a clean exit with a missing primary is a
+    provable incompleteness, not a green run."""
+    src = tmp_root / "recv_missing_src"
+    src.mkdir()
+    out = tmp_root / "recv_missing_out"
+
+    def fake_empty(config):
+        # Clean exit, primary expected, but nothing is produced and the
+        # staging manifest is empty.
+        config.receipt.expected_primary_products = ["Primary"]
+        config.output_dir.mkdir(parents=True, exist_ok=True)
+        tool._write_output_manifest(
+            config.output_dir,
+            [],
+            package_source=config.package_source,
+            package_version=config.user_version,
+        )
+        return 0
+
+    rc, raised = _run_main_with_fake_build(src, out, fake_empty)
+    _assert(raised is None, f"should not raise: {raised!r}")
+    _assert(rc == 0, f"fake exits 0, got {rc}")
+    r = _read_receipt_or_fail(out)
+    _assert(r.status != STATUS_SUCCESS,
+            f"a clean exit with a missing primary must NOT be success, got "
+            f"{r.status!r}")
+    _assert(r.status == STATUS_PARTIAL,
+            f"missing primary on a clean exit should be partial, got {r.status!r}")
+    _assert(r.missing_required_modules == ["Primary"],
+            f"Primary must be recorded missing, got {r.missing_required_modules!r}")
+    _assert(not r.artifacts,
+            f"no artifacts should be recorded, got {r.artifacts!r}")
+
+
+def _selftest_receipt_soft_skipped_promote_not_recorded(tmp_root: Path) -> None:
+    """If a manifest entry has no staged tree, promotion soft-skips it — and
+    the receipt must NOT then claim it as produced. The receipt is keyed off
+    what actually landed on disk, so a soft-skipped primary shows up as
+    missing (never as a produced artifact, never as success)."""
+    src = tmp_root / "recv_softskip_src"
+    src.mkdir()
+    out = tmp_root / "recv_softskip_out"
+
+    def fake_manifest_without_tree(config):
+        # Manifest lists Primary, but the Primary.xcframework directory is
+        # never created — the exact shape that trips the promote soft-skip.
+        config.receipt.expected_primary_products = ["Primary"]
+        config.output_dir.mkdir(parents=True, exist_ok=True)
+        tool._write_output_manifest(
+            config.output_dir,
+            [ManifestEntry(name="Primary.xcframework",
+                           kind=tool._MANIFEST_KIND_PRIMARY)],
+            package_source=config.package_source,
+            package_version=config.user_version,
+        )
+        return 0
+
+    rc, raised = _run_main_with_fake_build(src, out, fake_manifest_without_tree)
+    _assert(raised is None, f"should not raise: {raised!r}")
+    _assert(rc == 0, f"fake exits 0, got {rc}")
+    _assert(not (out / "Primary.xcframework").exists(),
+            "soft-skipped Primary must not appear on disk")
+    r = _read_receipt_or_fail(out)
+    _assert(r.status != STATUS_SUCCESS,
+            f"a soft-skipped primary must NOT be success, got {r.status!r}")
+    _assert(not any(a.module == "Primary" for a in r.artifacts),
+            f"soft-skipped Primary must NOT be a recorded artifact, got "
+            f"{r.artifacts!r}")
+    _assert(r.missing_required_modules == ["Primary"],
+            f"soft-skipped Primary must be recorded missing, got "
+            f"{r.missing_required_modules!r}")
+
+
+def _selftest_receipt_soft_skip_preserves_prior_lastgood(tmp_root: Path) -> None:
+    """A soft-skipped promote on a clean exit must NOT let stale-cleanup
+    delete the prior last-good it preserved. The prior artifact stays on disk
+    and in the manifest; the receipt still reports the primary missing (never
+    produced this run) with the run marked partial."""
+    src = tmp_root / "recv_preserve_src"
+    src.mkdir()
+    out = tmp_root / "recv_preserve_out"
+    out.mkdir()
+    # Prior last-good Primary on disk + tracked in the manifest.
+    (out / "Primary.xcframework").mkdir()
+    (out / "Primary.xcframework" / "keep").write_text("prior-primary")
+    _write_manifest_file(out, [("Primary.xcframework", "primary")])
+
+    def fake_soft_skip(config):
+        # Manifest lists Primary but no staged tree is produced — promote
+        # soft-skips it, leaving the prior last-good in place.
+        config.receipt.expected_primary_products = ["Primary"]
+        config.output_dir.mkdir(parents=True, exist_ok=True)
+        tool._write_output_manifest(
+            config.output_dir,
+            [ManifestEntry(name="Primary.xcframework",
+                           kind=tool._MANIFEST_KIND_PRIMARY)],
+            package_source=config.package_source,
+            package_version=config.user_version,
+        )
+        return 0
+
+    rc, raised = _run_main_with_fake_build(src, out, fake_soft_skip)
+    _assert(raised is None, f"should not raise: {raised!r}")
+    _assert(rc == 0, f"fake exits 0, got {rc}")
+    _assert((out / "Primary.xcframework" / "keep").read_text() == "prior-primary",
+            "prior last-good must survive a soft-skipped promote + cleanup")
+    fresh = _read_output_manifest(out)
+    names = {e.name for e in fresh.entries}
+    _assert(names == {"Primary.xcframework"},
+            f"preserved last-good must stay in the manifest, got {names}")
+    r = _read_receipt_or_fail(out)
+    _assert(r.status == STATUS_PARTIAL,
+            f"a run that failed to land its primary is partial, got {r.status!r}")
+    _assert(r.missing_required_modules == ["Primary"],
+            f"Primary must be recorded missing, got {r.missing_required_modules!r}")
+    _assert(not any(a.module == "Primary" for a in r.artifacts),
+            "preserved last-good must NOT be recorded as a produced artifact")
+
+
+def _selftest_receipt_dependency_promote_failure_is_partial(tmp_root: Path) -> None:
+    """A dependency that fails to promote (no staged tree) while every
+    expected primary lands must downgrade the run to partial via a recorded
+    promotion failure — never a green success about a dep that didn't land —
+    and its prior last-good must be preserved through cleanup."""
+    src = tmp_root / "recv_depfail_src"
+    src.mkdir()
+    out = tmp_root / "recv_depfail_out"
+    out.mkdir()
+    # Prior state: primary + a dependency, both tracked.
+    (out / "Keep.xcframework").mkdir()
+    (out / "Keep.xcframework" / "old").write_text("old-keep")
+    (out / "Drop.xcframework").mkdir()
+    (out / "Drop.xcframework" / "keep").write_text("prior-drop")
+    _write_manifest_file(out, [("Keep.xcframework", "primary"),
+                               ("Drop.xcframework", "dependency")])
+
+    def fake_dep_fail(config):
+        # Keep is produced fresh; Drop is listed in the manifest but never
+        # staged — its promote soft-skips.
+        config.receipt.expected_primary_products = ["Keep"]
+        config.output_dir.mkdir(parents=True, exist_ok=True)
+        xc = config.output_dir / "Keep.xcframework"
+        xc.mkdir(parents=True)
+        (xc / "marker").write_text("new-keep")
+        tool._write_output_manifest(
+            config.output_dir,
+            [ManifestEntry(name="Keep.xcframework",
+                           kind=tool._MANIFEST_KIND_PRIMARY),
+             ManifestEntry(name="Drop.xcframework",
+                           kind=tool._MANIFEST_KIND_DEPENDENCY)],
+            package_source=config.package_source,
+            package_version=config.user_version,
+        )
+        return 0
+
+    rc, raised = _run_main_with_fake_build(src, out, fake_dep_fail)
+    _assert(raised is None, f"should not raise: {raised!r}")
+    _assert(rc == 0, f"fake exits 0, got {rc}")
+    _assert((out / "Keep.xcframework" / "marker").read_text() == "new-keep",
+            "fresh primary should be promoted over the prior")
+    _assert((out / "Drop.xcframework" / "keep").read_text() == "prior-drop",
+            "prior dependency last-good must survive the failed dep promote")
+    fresh = _read_output_manifest(out)
+    names = {e.name for e in fresh.entries}
+    _assert(names == {"Keep.xcframework", "Drop.xcframework"},
+            f"both authoritative artifacts should stay in the manifest, got {names}")
+    r = _read_receipt_or_fail(out)
+    _assert(r.status == STATUS_PARTIAL,
+            f"a failed dependency promote must be partial, not success, got "
+            f"{r.status!r}")
+    _assert(any(f.phase == "promote" and f.unit == "Drop.xcframework"
+                for f in r.failures),
+            f"the failed dep promote must be recorded, got {r.failures!r}")
+    _assert(any(a.module == "Keep" for a in r.artifacts),
+            "the landed primary should be a recorded artifact")
+    _assert(not any(a.module == "Drop" for a in r.artifacts),
+            "the un-landed dependency must NOT be a recorded artifact")
+
+
 # Test registry. Tuples of (name, callable, requires_swift). The fast mode
 # only runs entries with requires_swift=False.
 def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
@@ -12979,6 +13511,30 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          lambda: _selftest_manifest_corrupt_entry_filtering(tmp_root), False),
         ("manifest: --no-cleanup-stale preserves AND keeps tracking",
          lambda: _selftest_manifest_no_cleanup_stale_preserves_and_tracks(tmp_root), False),
+        ("receipt: full round-trip through write/read",
+         lambda: _selftest_receipt_roundtrip(tmp_root), False),
+        ("receipt: default status is pessimistic (failed)",
+         _selftest_receipt_default_status_failed, False),
+        ("receipt: reader tolerant of missing/malformed/wrong-schema",
+         lambda: _selftest_receipt_reader_tolerant(tmp_root), False),
+        ("receipt: written on success + artifacts promoted, no staging leak",
+         lambda: _selftest_receipt_written_on_success(tmp_root), False),
+        ("receipt: written on failure, prior artifacts preserved (atomic promotion)",
+         lambda: _selftest_receipt_written_on_failure_and_prior_artifacts_preserved(tmp_root), False),
+        ("receipt: clean exit with recorded failure is partial + missing_required",
+         lambda: _selftest_receipt_partial_on_recorded_failure(tmp_root), False),
+        ("receipt: written even on bug-class crash (finally), prior intact",
+         lambda: _selftest_receipt_written_on_bug_class_crash(tmp_root), False),
+        ("receipt: promotion replaces prior same-name + cleans stale sibling",
+         lambda: _selftest_receipt_promotion_replaces_prior_same_name(tmp_root), False),
+        ("receipt: clean exit with missing primary is not success",
+         lambda: _selftest_receipt_clean_exit_missing_primary_is_not_success(tmp_root), False),
+        ("receipt: soft-skipped promote is not recorded as produced",
+         lambda: _selftest_receipt_soft_skipped_promote_not_recorded(tmp_root), False),
+        ("receipt: soft-skip preserves prior last-good through cleanup",
+         lambda: _selftest_receipt_soft_skip_preserves_prior_lastgood(tmp_root), False),
+        ("receipt: failed dependency promote is partial + preserves prior",
+         lambda: _selftest_receipt_dependency_promote_failure_is_partial(tmp_root), False),
         ("MiniMixed fetch+stage+inspect (real swift)", _selftest_minimixed_fetch_integration, True),
         ("stage: root Package.swift preserved when target excludes it (Realm regression)",
          lambda: _selftest_stage_preserves_root_package_swift_when_excluded(tmp_root), True),

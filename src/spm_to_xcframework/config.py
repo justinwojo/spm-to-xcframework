@@ -116,6 +116,25 @@ class Config:
     # the umbrella's entries, and writes one manifest at the end.
     # Always empty on parent Configs.
     collected_entries: List["ManifestEntry"] = field(default_factory=list)
+    # True for transitive-sibling child runs spawned by the orchestrator's
+    # `_make_transitive_child_config` / `_make_binary_only_transitive_child_config`.
+    # Distinguishes a dependency child (whose products are the umbrella's
+    # dependencies) from the primary run (standalone package or the umbrella
+    # itself), so only the primary run records `expected_primary_products`
+    # into the receipt. Never set from the CLI.
+    is_transitive_child: bool = False
+    # Run-scoped conversion-receipt accumulator, created once in `main()`
+    # before mode routing and shared BY REFERENCE into every child config
+    # (the child-config factories deliberately leave this field alone rather
+    # than resetting it like `collected_entries`, so a transitive child's
+    # failure is visible to the top-level finalizer). Phases append failures
+    # and record expected products; `main()` snapshots the environment, sets
+    # the final status, and writes it to the final output dir. `main()`
+    # allocates one before mode routing, so it is set on every path that
+    # reaches routing; dry-run / inspect-only allocate it but never build,
+    # snapshot, or write it. None only before `main()` has run (a freshly
+    # constructed Config) or on a pre-routing error. Never set from the CLI.
+    receipt: Optional["Receipt"] = None
     work_dir: Optional[Path] = None  # set in main() before fetch/inspect run
     # Populated by `_run_source_mode_with_transitives` immediately before
     # the umbrella's `_source_mode_after_inspect` runs: maps each
