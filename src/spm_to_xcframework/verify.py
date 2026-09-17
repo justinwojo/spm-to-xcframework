@@ -368,18 +368,18 @@ def _verify_one_unit(unit: ExecutedUnit, output_dir: Path) -> VerifyResult:
         and detected_type not in ("", "Unknown")
         and detected_type != required_type
     ):
-        # The Swift→Mixed direction is benign for Stripe-shaped products
-        # (Swift target with a `<TargetName>.h` umbrella stub at target
-        # root): the umbrella injection is intentional so ObjC consumers
-        # can `#import <Mod/Mod.h>`, and post-hoc detection sees the
-        # Headers/ + modulemap and reports Mixed. Other directions (Mixed
-        # plan but ObjC on disk, ObjC plan but Swift on disk, etc.) still
-        # signal a partial injection worth investigating.
+        # The Swift→Mixed direction is benign when a Swift product target
+        # depends on an internal-only Clang target: that target's public
+        # headers have nowhere else to ship, so they are folded into this
+        # framework's Headers/ + modulemap and post-hoc detection reports
+        # Mixed. Other directions (Mixed plan but ObjC on disk, ObjC plan
+        # but Swift on disk, etc.) still signal a partial injection worth
+        # investigating.
         if required_type == Language.SWIFT and detected_type == Language.MIXED:
             warnings.append(
                 f"plan expected Swift framework but on-disk detection "
-                "says Mixed (expected for products that ship a "
-                "<TargetName>.h umbrella stub for ObjC consumers)"
+                "says Mixed (expected when an internal Clang dependency's "
+                "public headers are folded into the framework)"
             )
         else:
             warnings.append(

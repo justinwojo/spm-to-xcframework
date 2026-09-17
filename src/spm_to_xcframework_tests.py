@@ -7888,31 +7888,31 @@ def _selftest_inject_objc_headers_with_umbrella(tmp_root: Path) -> None:
 
 
 def _selftest_inject_objc_headers_mixed_c_dep_yaml(tmp_root: Path) -> None:
-    """[X-006 regression] A mixed framework whose Swift target ships an
-    umbrella header that `#import`s an INTERNAL C dependency's header must
-    get BOTH header dirs copied. Canonical case: Yams's `Yams.h` umbrella
-    does `#import <Yams/yaml.h>`, but `yaml.h` lives in the internal-only
-    `CYaml` target's `include/`. The legacy single-dir resolver stopped at
-    the Yams umbrella (first match) and dropped `yaml.h`, leaving the
-    `#import` dangling at consume time.
+    """[X-006 / X-007] A Swift product target that depends on an internal
+    C target. SwiftPM classifies Yams as a `SwiftTarget`, so its stray
+    `Yams.h` template umbrella is never a public header. What happens to
+    the C dependency's `include/` depends on where that dependency ships:
 
-    Asserts: (1) `_collect_objc_header_dirs` returns BOTH dirs, primary
-    first; (2) `_find_objc_headers_dir` (legacy wrapper) still returns only
-    the primary (backward compat); (3) `inject_objc_headers` copies both
-    `Yams.h` AND `yaml.h` into the framework Headers/.
+      (a) Internal-only and NOT packaged as its own framework: its headers
+          have nowhere else to go, so they fold into the parent (X-006).
+      (b) Packaged as its own build unit (Yams: `CYaml.xcframework`, the
+          X-001 pure-C shim promotion, which surfaces as a product in
+          the re-dumped manifest): its headers belong to that framework
+          alone and are not folded (the Stripe3DS2 rule). Before the
+          SwiftTarget rule, (b) shipped
+          `Yams.framework` with only the umbrella, whose
+          `#import <Yams/yaml.h>` pointed at a header that is only in
+          CYaml (X-007).
     """
     base = tmp_root / "objc_inject_mixed_c_dep"
     staged = base / "staged"
     staged.mkdir(parents=True)
 
-    # Swift target `Yams` — umbrella header at the target root, no include/.
     yams_dir = staged / "Sources" / "Yams"
     yams_dir.mkdir(parents=True)
     (yams_dir / "Yams.swift").write_text("// swift")
     (yams_dir / "Yams.h").write_text("#import <Yams/yaml.h>\n")
 
-    # Internal-only C target `CYaml` — default SPM `include/` layout, no
-    # product exposes it, so its headers fold into the parent framework.
     cyaml_inc = staged / "Sources" / "CYaml" / "include"
     cyaml_inc.mkdir(parents=True)
     (cyaml_inc / "yaml.h").write_text("// libyaml public header")
@@ -7939,35 +7939,51 @@ def _selftest_inject_objc_headers_mixed_c_dep_yaml(tmp_root: Path) -> None:
         targets=[
             Target(name="Yams", kind=TargetKind.REGULAR, path="Sources/Yams",
                    public_headers_path=None, dependencies=["CYaml"],
-                   exclude=[], language=Language.MIXED),
+                   exclude=[], language=Language.SWIFT),
             Target(name="CYaml", kind=TargetKind.REGULAR, path="Sources/CYaml",
                    public_headers_path=None, dependencies=[], exclude=[],
-                   language=Language.OBJC),
+                   language=Language.OBJC, clang_is_pure_c=True),
         ],
         schemes=[], raw_dump=raw_dump, staged_dir=staged,
     )
 
     from spm_to_xcframework.execute.inject_objc import _collect_objc_header_dirs
+
+    # (a) CYaml ships nowhere else: fold its include/ into the parent.
     dirs = _collect_objc_header_dirs(package, product_name="Yams",
                                      fw_name="Yams")
-    _assert(dirs == [yams_dir, cyaml_inc],
-            f"expected [Yams dir, CYaml/include], got {dirs!r}")
-    # Legacy single-dir wrapper must still yield only the primary.
-    _assert(_find_objc_headers_dir(package, product_name="Yams",
-                                   fw_name="Yams") == yams_dir,
-            "legacy _find_objc_headers_dir must return only the primary dir")
-
-    fw = base / "Yams.framework"
-    fw.mkdir()
-    injected = inject_objc_headers(
-        package=package, product_name="Yams", fw_name="Yams",
-        fw_path=fw, verbose=False,
-    )
-    _assert(injected, "inject_objc_headers should have returned True")
-    _assert((fw / "Headers" / "Yams.h").is_file(),
-            "umbrella Yams.h must be copied")
+    _assert(dirs == [cyaml_inc],
+            f"expected only CYaml/include (Yams.h is not public), got {dirs!r}")
+    fw = base / "a" / "Yams.framework"
+    fw.mkdir(parents=True)
+    _assert(inject_objc_headers(package=package, product_name="Yams",
+                                fw_name="Yams", fw_path=fw, verbose=False),
+            "(a) the internal C dep's headers must be injected")
     _assert((fw / "Headers" / "yaml.h").is_file(),
-            "internal C dep's yaml.h must ALSO be copied (X-006)")
+            "(a) internal C dep's yaml.h must be copied (X-006)")
+    _assert(not (fw / "Headers" / "Yams.h").exists(),
+            "(a) the SwiftTarget's template umbrella must not ship")
+
+    # (b) CYaml is its own build unit. Prepare re-dumps the manifest
+    # after its edits, so the synthesized `CYaml` library is a product
+    # in the dump Execute reads: nothing belongs in Yams.framework.
+    import copy
+    unit_dump = copy.deepcopy(raw_dump)
+    unit_dump["products"].append(
+        {"name": "CYaml", "type": {"library": ["automatic"]},
+         "targets": ["CYaml"]})
+    package.raw_dump = unit_dump
+    dirs = _collect_objc_header_dirs(package, product_name="Yams",
+                                     fw_name="Yams")
+    _assert(dirs == [],
+            f"(b) a dep packaged as its own unit must not fold; got {dirs!r}")
+    fw = base / "b" / "Yams.framework"
+    fw.mkdir(parents=True)
+    _assert(not inject_objc_headers(package=package, product_name="Yams",
+                                    fw_name="Yams", fw_path=fw, verbose=False),
+            "(b) nothing may be injected into Yams.framework")
+    _assert(not (fw / "Headers").exists(),
+            "(b) Yams.framework must carry no authored headers")
 
 
 def _selftest_inject_objc_headers_explicit_modulemap(tmp_root: Path) -> None:
@@ -8757,65 +8773,101 @@ def _selftest_find_objc_headers_dir_umbrella_rejects_unrelated_h(tmp_root: Path)
     )
 
 
-def _selftest_find_objc_headers_dir_umbrella_swift_classified_still_fires(
+def _selftest_find_objc_headers_dir_swift_target_exposes_no_authored_headers(
     tmp_root: Path,
 ) -> None:
-    """Regression: the umbrella-at-target-root branch must KEEP firing
-    for Swift-classified targets — Stripe's `StripePayments` is the
-    canonical case (220 .swift + 1 `<TargetName>.h` umbrella, 0 .m/.mm).
+    """A target SwiftPM classifies as `SwiftTarget` has no public C/ObjC
+    headers: SwiftPM never compiles, copies or module-maps a `.h` that
+    sits in a Swift target's directory, so an SPM consumer of the package
+    cannot see it. The only Clang surface such a target publishes is the
+    compiler-generated `<Module>-Swift.h`, which
+    `inject_pure_swift_clang_modulemap` wires up.
 
-    The classifier was tightened so a target with no .m/.mm classifies
-    as Swift even when stub `.h` files are present (BlinkIDUX fix). The
-    umbrella branch must still fire for these targets: even when the
-    umbrella file itself is only a FOUNDATION_EXPORT stub, the resulting
-    `Headers/<Target>.h` + `module.modulemap` is what lets ObjC consumers
-    `#import <StripePayments/StripePayments.h>` and the Swift bridge
-    `-Swift.h` plug into a published Clang module. Gating this branch
-    on `target.language != Language.SWIFT` would silently drop the
-    Stripe surface, which is why no such gate exists.
+    Stray headers in Swift targets are usually Xcode framework-template
+    umbrellas kept for a parallel Xcode-project or CocoaPods build. They
+    declare `<Name>VersionNumber` constants that only an Xcode
+    versioning build defines, and their `#import`s follow that other
+    build system's layout. Surfacing them:
+      - Yams 6.2.2 `Sources/Yams/Yams.h` does `#import <Yams/yaml.h>`,
+        which resolves only in `Yams.xcodeproj`, where `yaml.h` is a
+        public header of the Yams framework itself.
+      - TelemetryDeck 2.14.1 `Sources/TelemetryClient/TelemetryClient.h`
+        does `#import <TelemetryDeck/TelemetryClient.h>`, a CocoaPods-era
+        path that no build of the package produces any more.
+    Both produced frameworks whose Clang module could not be built, and in
+    every such framework the umbrella modulemap also displaced the real
+    `-Swift.h` modulemap. Neither `<Target>.h`, `<Target>-umbrella.h` nor
+    an `include/` directory is a public header root for a Swift target.
     """
-    base = tmp_root / "headers_umbrella_swift_classified"
+    base = tmp_root / "headers_swift_target_no_authored_headers"
     staged = base / "staged"
 
-    target_dir = staged / "StripePayments" / "StripePayments"
+    target_dir = staged / "Sources" / "TelemetryClient"
     target_dir.mkdir(parents=True)
-    (target_dir / "StripePayments.h").write_text(
-        "// FOUNDATION_EXPORT double StripePaymentsVersionNumber;"
+    (target_dir / "TelemetryClient.h").write_text(
+        "FOUNDATION_EXPORT double TelemetryClientVersionNumber;\n"
+        "#import <TelemetryDeck/TelemetryClient.h>\n"
     )
-    (target_dir / "API.swift").write_text("// swift")
+    (target_dir / "TelemetryClient-umbrella.h").write_text("// umbrella")
+    (target_dir / "include").mkdir()
+    (target_dir / "include" / "Stray.h").write_text("// stray")
+    (target_dir / "TelemetryClient.swift").write_text("// swift")
 
     raw_dump = {
         "products": [
-            {"name": "StripePayments", "type": {"library": ["automatic"]},
-             "targets": ["StripePayments"]},
+            {"name": "TelemetryClient", "type": {"library": ["automatic"]},
+             "targets": ["TelemetryClient"]},
         ],
         "targets": [
-            {"name": "StripePayments", "type": "regular",
-             "path": "StripePayments/StripePayments",
+            {"name": "TelemetryClient", "type": "regular",
+             "path": "Sources/TelemetryClient",
              "publicHeadersPath": None, "dependencies": []},
         ],
     }
     package = Package(
-        name="StripePayments", tools_version="5.7.0", platforms=[],
-        products=[Product(name="StripePayments", linkage=Linkage.AUTOMATIC,
-                          targets=["StripePayments"])],
+        name="TelemetryDeck", tools_version="5.9.0", platforms=[],
+        products=[Product(name="TelemetryClient", linkage=Linkage.AUTOMATIC,
+                          targets=["TelemetryClient"])],
         targets=[
-            Target(name="StripePayments", kind=TargetKind.REGULAR,
-                   path="StripePayments/StripePayments",
+            Target(name="TelemetryClient", kind=TargetKind.REGULAR,
+                   path="Sources/TelemetryClient",
                    public_headers_path=None, dependencies=[], exclude=[],
                    language=Language.SWIFT),
         ],
         schemes=[], raw_dump=raw_dump, staged_dir=staged,
     )
-    found = _find_objc_headers_dir(package, product_name="StripePayments",
-                                    fw_name="StripePayments")
-    _assert(
-        found is not None and found.name == "StripePayments"
-        and found.parent.name == "StripePayments",
-        f"Swift-classified target with <Target>.h umbrella (Stripe shape) "
-        f"must still return target dir so Headers/ + modulemap get "
-        f"injected for ObjC consumers; got {found!r}",
+    from spm_to_xcframework.execute.inject_objc import _collect_objc_header_dirs
+    dirs = _collect_objc_header_dirs(package, product_name="TelemetryClient",
+                                     fw_name="TelemetryClient")
+    _assert(dirs == [],
+            f"a SwiftTarget publishes no authored headers; got {dirs!r}")
+
+    fw = base / "TelemetryClient.framework"
+    (fw / "Modules" / "TelemetryClient.swiftmodule").mkdir(parents=True)
+    injected = inject_objc_headers(
+        package=package, product_name="TelemetryClient",
+        fw_name="TelemetryClient", fw_path=fw, verbose=False,
     )
+    _assert(not injected, "no header may be injected for a SwiftTarget")
+    _assert(not (fw / "Headers" / "TelemetryClient.h").exists(),
+            "the stray template umbrella must not ship")
+    _assert(not (fw / "Modules" / "module.modulemap").exists(),
+            "no umbrella modulemap may be written for a SwiftTarget")
+
+    # The framework's real Clang surface, the generated bridge header,
+    # must still be published: the umbrella modulemap used to block it.
+    dd = base / "DerivedData" / "DerivedSources"
+    dd.mkdir(parents=True)
+    (dd / "TelemetryClient-Swift.h").write_text("// generated bridge")
+    _assert(
+        inject_pure_swift_clang_modulemap(
+            fw_path=fw, fw_name="TelemetryClient", dd_path=base / "DerivedData",
+            variant="ios-arm64", verbose=False,
+        ),
+        "the -Swift.h modulemap must be synthesized for the SwiftTarget",
+    )
+    mm = (fw / "Modules" / "module.modulemap").read_text()
+    _assert('header "TelemetryClient-Swift.h"' in mm, mm)
 
 
 def _selftest_find_objc_headers_dir_dep_walk_no_implicit_leak(tmp_root: Path) -> None:
@@ -13869,8 +13921,8 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          lambda: _selftest_find_objc_headers_dir_umbrella_named_variant(tmp_root), False),
         ("execute: ObjC headers dir rejects unrelated top-level .h",
          lambda: _selftest_find_objc_headers_dir_umbrella_rejects_unrelated_h(tmp_root), False),
-        ("execute: ObjC headers dir umbrella branch fires on Swift-classified target (Stripe)",
-         lambda: _selftest_find_objc_headers_dir_umbrella_swift_classified_still_fires(tmp_root), False),
+        ("execute: ObjC headers dir: a SwiftTarget publishes no authored headers (TelemetryDeck)",
+         lambda: _selftest_find_objc_headers_dir_swift_target_exposes_no_authored_headers(tmp_root), False),
         ("execute: ObjC headers dir dep walk does not leak implicit include/",
          lambda: _selftest_find_objc_headers_dir_dep_walk_no_implicit_leak(tmp_root), False),
         ("execute: ObjC headers dir dep walk folds internal default include/",

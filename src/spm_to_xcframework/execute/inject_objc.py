@@ -1,9 +1,9 @@
 """Phase 4 — Execute · public ObjC header injection.
 
 Ports the legacy bash inject_objc_headers + module.modulemap synth
-passes. Decides where to find a target's public ObjC header roots
-(explicit `publicHeadersPath`, SPM's default `include/` layout, or the
-Stripe-style umbrella-header-at-target-root pattern), then copies them
+passes. Decides where to find a Clang target's public header roots
+(explicit `publicHeadersPath`, SPM's default `include/` layout, or an
+umbrella header at the target root), then copies them
 into the framework's `Headers/` directory and synthesises a Clang
 `module.modulemap` so consumers see the framework as a Clang module.
 """
@@ -16,7 +16,7 @@ from typing import Dict, List, Optional, Set
 
 from ..inspect import _raw_internal_dep_names
 from ..log import dim, verbose_log
-from ..model import Package, _default_target_path
+from ..model import Language, Package, _default_target_path
 
 from .inject_swiftmodule import _ensure_root_symlink, _framework_content_root
 
@@ -77,13 +77,13 @@ def _collect_objc_header_dirs(
 
     Any remaining entries are the header dirs of *internal-only*
     first-level dependencies (deps no product separately packages). A
-    mixed framework whose Swift target ships an umbrella header that
-    `#import`s a C dependency's header — Yams's `Yams.h` doing
-    `#import <Yams/yaml.h>` from the internal `CYaml` target — needs BOTH
-    copied: the umbrella from the Swift target dir *and* `yaml.h` from
-    CYaml's `include/`. The single-dir resolver stopped at the first
-    match, dropping the C header and leaving the umbrella's `#import`
-    dangling at consume time (X-006).
+    Swift framework built from a target that depends on an internal Clang
+    target has nowhere else to ship that target's headers, so they fold
+    into the parent (X-006). A dependency that is packaged as its own
+    framework — including one the planner promoted to its own build unit,
+    which the re-dumped manifest lists as a product — keeps its headers.
+
+    A `SwiftTarget` never contributes a directory (see `headers_dir_for`).
 
     Returns an empty list when no public-header dir is found.
     """
@@ -132,6 +132,21 @@ def _collect_objc_header_dirs(
         if not target_path:
             return None
         target_dir = package.staged_dir / target_path
+        # 0. A target SwiftPM classifies as `SwiftTarget` has no authored
+        #    public headers: SwiftPM never compiles, copies or module-maps
+        #    a `.h` in a Swift target, whatever its name or location, and
+        #    ignores `publicHeadersPath` there. Its one Clang surface is
+        #    the generated `<Module>-Swift.h`, which
+        #    `inject_pure_swift_clang_modulemap` publishes. Headers found
+        #    in a Swift target are leftovers from a parallel Xcode-project
+        #    or CocoaPods build (framework-template umbrellas declaring
+        #    `<Name>VersionNumber`, which an SPM build never defines), and
+        #    their `#import`s follow that other layout: Yams's `Yams.h`
+        #    imports `<Yams/yaml.h>`, a header only the Xcode project puts
+        #    in Yams.framework. Shipping one breaks the framework's Clang
+        #    module and, through the umbrella modulemap, hides `-Swift.h`.
+        if target.language == Language.SWIFT:
+            return None
         # 1. Explicit `publicHeadersPath` always wins (the legacy contract).
         #    Empty string is also explicit: SPM treats `publicHeadersPath: ""`
         #    as "the target's own root directory is the public headers
@@ -163,22 +178,14 @@ def _collect_objc_header_dirs(
         include_dir = target_dir / "include"
         if include_dir.is_dir() and _has_h_files_recursive(include_dir):
             return include_dir
-        # 2b. Umbrella-header-at-target-root pattern. Stripe ships every
-        #    product this way: e.g. `StripePayments.h` sits at the top of
-        #    `StripePayments/StripePayments/` with no `include/` subdir,
-        #    next to ~220 .swift files. Even when the umbrella itself is
-        #    a stub (just FOUNDATION_EXPORT version constants), the
-        #    Headers/ + module.modulemap surface is what lets ObjC
-        #    consumers `#import <StripePayments/StripePayments.h>` —
-        #    skipping this branch for Swift-classified targets would
-        #    silently drop that surface. Accept the two umbrella forms
-        #    only — `<TargetName>.h` (the common Stripe target pattern)
-        #    and `<TargetName>-umbrella.h` (used by the Stripe product
-        #    target itself). Anything else risks over-injection:
-        #    `inject_objc_headers` walks the returned dir recursively
-        #    and copies every .h, so accepting a generic non-`-Swift.h`
-        #    would leak private/internal top-level headers into the
-        #    framework's public surface.
+        # 2b. Umbrella-header-at-target-root pattern, for Clang targets
+        #    that keep their umbrella next to their sources with no
+        #    `include/` subdir. Accept the two umbrella forms only —
+        #    `<TargetName>.h` and `<TargetName>-umbrella.h`. Anything
+        #    else risks over-injection: `inject_objc_headers` walks the
+        #    returned dir recursively and copies every .h, so accepting a
+        #    generic non-`-Swift.h` would leak private/internal top-level
+        #    headers into the framework's public surface.
         for candidate in (f"{target.name}.h", f"{target.name}-umbrella.h"):
             if (target_dir / candidate).is_file():
                 return target_dir
@@ -216,9 +223,7 @@ def _collect_objc_header_dirs(
     # a direct product target, since the parent is the only place it
     # ships. Unlike the legacy single-dir resolver, these dep dirs are
     # *added to* the primary match instead of used only as a fallback,
-    # so a mixed framework (Yams) still gets its internal C dep's
-    # headers (CYaml's yaml.h) even though the Swift target already
-    # supplied an umbrella (X-006).
+    # so every internal Clang dep's headers ship with the parent (X-006).
     dep_fw_match: Optional[Path] = None
     dep_product_match: Optional[Path] = None
     dep_rest: List[Path] = []
@@ -347,9 +352,9 @@ def inject_objc_headers(
     # because (a) `#import <Module/Sub/Header.h>` needs the physical
     # path to exist inside Headers/, and (b) a flat copy would silently
     # overwrite same-named headers that live in different subfolders
-    # (Codex [P2]). A mixed framework contributes more than one source
-    # dir (the Swift target's umbrella dir + an internal C dep's
-    # `include/`, e.g. Yams + CYaml); copy them in priority order and
+    # (Codex [P2]). A framework can contribute more than one source dir
+    # (its own target's headers plus internal Clang deps' `include/`
+    # dirs); copy them in priority order and
     # let the first (highest-priority) dir win any filename collision so
     # the primary product target's public surface can't be shadowed by a
     # dependency's header.
