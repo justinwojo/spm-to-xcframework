@@ -10087,6 +10087,7 @@ def prepare(staged_dir: Path, plan: Plan, *, verbose: bool = False) -> PreparedP
         # Re-dump anyway so PreparedPlan.package reflects whatever the
         # current manifest says — Execute reads it for diagnostic context.
         raw, products, targets, platforms, name, tv = dump_package(staged_dir)
+        scan_target_languages(staged_dir, targets)
         return PreparedPlan(
             plan=plan,
             package=Package(
@@ -10130,6 +10131,11 @@ def prepare(staged_dir: Path, plan: Plan, *, verbose: bool = False) -> PreparedP
     raw, products, targets, platforms, name, tv = validate_prepared_manifest(
         staged_dir, plan, original
     )
+    # A dump carries no per-target classification. Execute decides from
+    # it which targets may publish authored headers (a SwiftTarget never
+    # does) and what language a dependency framework should verify as,
+    # so take it from SwiftPM for the manifest Execute actually builds.
+    scan_target_languages(staged_dir, targets)
     edit_count = len(plan.package_swift_edits) + len(plan.macros)
     success(f"  Prepare validated {edit_count} edit(s) ✓")
     return PreparedPlan(

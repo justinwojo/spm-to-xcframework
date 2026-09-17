@@ -10884,6 +10884,79 @@ def _roundtrip_full_prepare_grdb() -> None:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _selftest_prepare_carries_swiftpm_target_classification(tmp_root: Path) -> None:
+    """The Package Execute receives from Prepare carries SwiftPM's own
+    per-target classification (`module_type` → language, pure-C Clang
+    sub-classification), on both the no-edit and the edited path.
+
+    Prepare re-dumps the edited manifest, and Execute decides on that
+    model whether a target may publish authored headers. A dump alone
+    carries no classification, so every target reached Execute as
+    Language.NA and the SwiftTarget header rule never applied: Yams
+    6.2.2 kept shipping its stray `Yams.h` umbrella. Runs the real
+    `swift package` commands, on the Yams shape: a Swift target with a
+    template umbrella that depends on a C target promoted to its own
+    library.
+    """
+    from spm_to_xcframework.execute.inject_objc import _collect_objc_header_dirs
+
+    def write_fixture(work: Path) -> None:
+        (work / "Sources" / "Yams").mkdir(parents=True)
+        (work / "Sources" / "Yams" / "Yams.swift").write_text(
+            "import CYaml\npublic func parse() {}\n")
+        (work / "Sources" / "Yams" / "Yams.h").write_text(
+            "#import <Foundation/Foundation.h>\n"
+            "FOUNDATION_EXPORT double YamsVersionNumber;\n"
+            "#import <Yams/yaml.h>\n")
+        (work / "Sources" / "CYaml" / "include").mkdir(parents=True)
+        (work / "Sources" / "CYaml" / "include" / "yaml.h").write_text(
+            "int yaml_version(void);\n")
+        (work / "Sources" / "CYaml" / "yaml.c").write_text(
+            '#include "yaml.h"\nint yaml_version(void) { return 1; }\n')
+        (work / "Package.swift").write_text(
+            "// swift-tools-version: 5.9\n"
+            "import PackageDescription\n"
+            "\n"
+            "let package = Package(\n"
+            '    name: "Yams",\n'
+            "    products: [\n"
+            '        .library(name: "Yams", targets: ["Yams"]),\n'
+            "    ],\n"
+            "    targets: [\n"
+            '        .target(name: "CYaml"),\n'
+            '        .target(name: "Yams", dependencies: ["CYaml"]),\n'
+            "    ]\n"
+            ")\n"
+        )
+
+    for label, edits in (
+        ("no-edit", []),
+        ("edited", [PackageSwiftEdit(kind="synth_library",
+                                     product_name="CYaml",
+                                     targets=["CYaml"])]),
+    ):
+        work = tmp_root / f"prepare-classification-{label}"
+        work.mkdir()
+        write_fixture(work)
+        plan = Plan()
+        plan.package_swift_edits = list(edits)
+        prepared = prepare(work, plan, verbose=False)
+        yams = prepared.package.target_by_name("Yams")
+        cyaml = prepared.package.target_by_name("CYaml")
+        _assert(yams is not None and yams.language == Language.SWIFT,
+                f"{label}: Yams must be classified Swift, got "
+                f"{yams and yams.language!r}")
+        _assert(cyaml is not None and cyaml.language == Language.OBJC
+                and cyaml.clang_is_pure_c,
+                f"{label}: CYaml must be a pure-C Clang target, got "
+                f"{cyaml and (cyaml.language, cyaml.clang_is_pure_c)!r}")
+        dirs = _collect_objc_header_dirs(prepared.package, "Yams", "Yams")
+        expected = ([] if edits else
+                    [work / "Sources" / "CYaml" / "include"])
+        _assert([d.resolve() for d in dirs] == [d.resolve() for d in expected],
+                f"{label}: Yams header dirs {dirs!r}, expected {expected!r}")
+
+
 # --- inject_system_clang_modules tests ------------------------------------
 #
 # `.systemLibrary` targets like GRDBSQLite have no Mach-O of their own —
@@ -13686,6 +13759,8 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          _selftest_validate_git_ref, False),
         ("language scan via swift package describe (real swift)",
          lambda: _selftest_language_counter(tmp_root), True),
+        ("prepare: prepared package carries SwiftPM target classification (Yams)",
+         lambda: _selftest_prepare_carries_swiftpm_target_classification(tmp_root), True),
         ("scheme resolver", _selftest_scheme_resolver, False),
         ("planner: GRDB (synth_dynamic_library + skip system + leave dynamic alone)",
          _selftest_planner_grdb, False),
