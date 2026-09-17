@@ -7986,6 +7986,148 @@ def _selftest_inject_objc_headers_mixed_c_dep_yaml(tmp_root: Path) -> None:
             "(b) Yams.framework must carry no authored headers")
 
 
+def _selftest_consume_external_siblings_link_only_what_each_target_reaches(
+    tmp_root: Path,
+) -> None:
+    """Each target is given exactly the consumed sibling xcframeworks it
+    reaches, never every consumed sibling.
+
+    In a source build, a target sees the modules of its own dependency
+    closure. Under the binary overlay a `.binaryTarget` has no
+    dependencies of its own, so a target needs, as explicit deps, the
+    siblings it reaches through intra-package targets (swift-case-paths:
+    CasePaths → CasePathsCore → IssueReporting) plus the siblings those
+    siblings' interfaces import (IssueReporting imports
+    IssueReportingPackageSupport, an injection-only sibling). Nothing
+    more: an extra dep is linked into the framework.
+
+    swift-dependencies 1.14.1 builds xctest-dynamic-overlay's
+    `IssueReportingTestSupport` as a sibling, because its
+    `DependenciesTestSupport` target depends on it. Giving every target
+    every sibling linked `IssueReportingTestSupport`, and through it
+    `Testing.framework` and `libXCTestSwiftSupport.dylib`, into
+    `Dependencies.framework`, which no app ships.
+    """
+    base = tmp_root / "consume_siblings_per_target"
+    staged = base / "staged"
+    staged.mkdir(parents=True)
+    siblings = base / "siblings"
+
+    def sibling(name: str, imports: List[str]) -> Path:
+        xcfw = siblings / f"{name}.xcframework"
+        sm = (xcfw / "ios-arm64" / f"{name}.framework" / "Modules"
+              / f"{name}.swiftmodule")
+        sm.mkdir(parents=True)
+        (sm / "arm64-apple-ios.swiftinterface").write_text(
+            "// swift-interface-format-version: 1.0\n"
+            + "".join(f"import {m}\n" for m in ["Swift", *imports])
+            + "public func f() {}\n"
+        )
+        return xcfw
+
+    xcfw = {
+        "IssueReportingPackageSupport": sibling("IssueReportingPackageSupport", []),
+        "IssueReporting": sibling(
+            "IssueReporting", ["Foundation", "IssueReportingPackageSupport"]),
+        "IssueReportingTestSupport": sibling(
+            "IssueReportingTestSupport", ["IssueReporting", "Testing", "XCTest"]),
+        "Clocks": sibling("Clocks", ["IssueReporting"]),
+        "Unrelated": sibling("Unrelated", []),
+    }
+
+    (staged / "Package.swift").write_text(
+        "// swift-tools-version: 5.9\n"
+        "import PackageDescription\n"
+        "\n"
+        "let package = Package(\n"
+        '  name: "swift-dependencies",\n'
+        "  products: [\n"
+        '    .library(name: "Dependencies", targets: ["Dependencies"]),\n'
+        "  ],\n"
+        "  dependencies: [\n"
+        '    .package(url: "https://github.com/pointfreeco/swift-clocks", from: "1.0.4"),\n'
+        '    .package(url: "https://github.com/pointfreeco/xctest-dynamic-overlay", from: "1.4.0"),\n'
+        "  ],\n"
+        "  targets: [\n"
+        "    .target(\n"
+        '      name: "Dependencies",\n'
+        "      dependencies: [\n"
+        '        "DependenciesCore",\n'
+        '        .product(name: "Clocks", package: "swift-clocks"),\n'
+        "      ]\n"
+        "    ),\n"
+        "    .target(\n"
+        '      name: "DependenciesCore",\n'
+        "      dependencies: [\n"
+        '        .product(name: "IssueReporting", package: "xctest-dynamic-overlay"),\n'
+        "      ]\n"
+        "    ),\n"
+        "    .target(\n"
+        '      name: "DependenciesTestSupport",\n'
+        "      dependencies: [\n"
+        '        "Dependencies",\n'
+        '        .product(name: "IssueReportingTestSupport", package: "xctest-dynamic-overlay"),\n'
+        "      ]\n"
+        "    ),\n"
+        "    .target(\n"
+        '      name: "Standalone",\n'
+        "      dependencies: []\n"
+        "    ),\n"
+        "  ]\n"
+        ")\n"
+    )
+
+    plan = tool.Plan()
+    for name, identity in (
+        ("Clocks", "swift-clocks"),
+        ("IssueReporting", "xctest-dynamic-overlay"),
+        ("IssueReportingTestSupport", "xctest-dynamic-overlay"),
+        ("IssueReportingPackageSupport", None),
+        ("Unrelated", None),
+    ):
+        plan.package_swift_edits.append(tool.PackageSwiftEdit(
+            kind="consume_external_sibling", product_name=name,
+            package_identity=identity, xcframework_path=xcfw[name],
+        ))
+
+    from spm_to_xcframework.prepare import _apply_consume_external_sibling_edits
+    saved = tool._swift_toolchain_version
+    try:
+        tool._swift_toolchain_version = lambda: None  # noqa: E731
+        _apply_consume_external_sibling_edits(staged, plan)
+    finally:
+        tool._swift_toolchain_version = saved
+
+    text = (staged / "Package.swift").read_text()
+
+    def deps_of(target: str) -> Set[str]:
+        start = text.index(f'.target(\n      name: "{target}"')
+        start = text.index("dependencies:", start)
+        arr = text[start:text.index("]", start) + 1]
+        import re as _re
+        return set(_re.findall(r'"([^"]+)"', arr))
+
+    got = {t: deps_of(t) for t in (
+        "Dependencies", "DependenciesCore", "DependenciesTestSupport",
+        "Standalone")}
+    _assert(got["DependenciesCore"] == {
+        "IssueReporting", "IssueReportingPackageSupport"},
+        f"DependenciesCore: {got['DependenciesCore']!r}")
+    _assert(got["Dependencies"] == {
+        "DependenciesCore", "Clocks", "IssueReporting",
+        "IssueReportingPackageSupport"},
+        f"Dependencies must not link test support: {got['Dependencies']!r}")
+    _assert(got["DependenciesTestSupport"] == {
+        "Dependencies", "IssueReportingTestSupport", "Clocks",
+        "IssueReporting", "IssueReportingPackageSupport"},
+        f"DependenciesTestSupport: {got['DependenciesTestSupport']!r}")
+    _assert(got["Standalone"] == set(),
+            f"a target reaching no sibling is untouched: {got['Standalone']!r}")
+    # Every consumed sibling still gets its overlay binaryTarget.
+    for name in xcfw:
+        _assert(f'name: "{name}"' in text, f"overlay entry for {name} missing")
+
+
 def _selftest_inject_objc_headers_explicit_modulemap(tmp_root: Path) -> None:
     """No umbrella header → modulemap should explicitly list every header."""
     base = tmp_root / "objc_inject_explicit"
@@ -13921,6 +14063,8 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          lambda: _selftest_find_objc_headers_dir_umbrella_named_variant(tmp_root), False),
         ("execute: ObjC headers dir rejects unrelated top-level .h",
          lambda: _selftest_find_objc_headers_dir_umbrella_rejects_unrelated_h(tmp_root), False),
+        ("prepare: consumed siblings are linked only into targets that reach them (swift-dependencies)",
+         lambda: _selftest_consume_external_siblings_link_only_what_each_target_reaches(tmp_root), False),
         ("execute: ObjC headers dir: a SwiftTarget publishes no authored headers (TelemetryDeck)",
          lambda: _selftest_find_objc_headers_dir_swift_target_exposes_no_authored_headers(tmp_root), False),
         ("execute: ObjC headers dir dep walk does not leak implicit include/",

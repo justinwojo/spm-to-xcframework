@@ -7415,13 +7415,11 @@ def _collect_depth_zero_target_or_byname_call_names(span: str) -> Set[str]:
     return out
 
 
-def _target_names_with_string_deps_in_set(
-    manifest_text: str, query_names: Set[str]
-) -> List[str]:
-    """Return target names whose top-level `dependencies:` array
-    references AT LEAST ONE name in `query_names` via either a bare
-    string literal (`"X"`) or a decorated intra-package call
-    (`.target(name: "X")` / `.byName(name: "X")`).
+def _target_string_dep_names(manifest_text: str) -> Dict[str, Set[str]]:
+    """Map each target name to the names its top-level `dependencies:`
+    array references via either a bare string literal (`"X"`) or a
+    decorated intra-package call (`.target(name: "X")` /
+    `.byName(name: "X")`).
 
     Walks every `.target / .executableTarget / .testTarget` call in
     `manifest_text` (test targets included, since their search paths
@@ -7432,19 +7430,16 @@ def _target_names_with_string_deps_in_set(
     `_collect_depth_zero_target_or_byname_call_names` for decorated
     forms). SPM treats all three shapes as equivalent edges in the
     target-dep graph, and the transitive BFS in
-    `_apply_consume_external_sibling_edits` needs to see all of them
+    `_consumed_siblings_reached_by_target` needs to see all of them
     to follow chains like `A -> .target(name: "Mid") -> "Sibling"`.
 
     Targets without a top-level `dependencies:` argument, or whose
     `dependencies:` expression isn't a literal `[...]`, are skipped
-    silently — there's no array to scan. Return order matches manifest
-    order, with no duplicates.
+    silently — there's no array to scan. Keys are in manifest order; the
+    first declaration of a name wins.
     """
-    if not query_names:
-        return []
     code_view = _make_code_token_view(manifest_text)
-    out: List[str] = []
-    seen: Set[str] = set()
+    out: Dict[str, Set[str]] = {}
     pos = 0
     while True:
         m = _TARGET_CALL_KIND_RE.search(code_view, pos)
@@ -7457,7 +7452,7 @@ def _target_names_with_string_deps_in_set(
         body = manifest_text[open_idx + 1 : close_idx]
         target_name = _top_level_name_label(body)
         pos = close_idx + 1
-        if target_name is None or target_name in seen:
+        if target_name is None or target_name in out:
             continue
         body_dz = _depth_zero_view(body)
         lm = _DEPENDENCIES_LABEL_RE.search(body_dz)
@@ -7476,9 +7471,7 @@ def _target_names_with_string_deps_in_set(
         existing_calls = _collect_depth_zero_target_or_byname_call_names(
             array_interior
         )
-        if (existing_strings | existing_calls) & query_names:
-            out.append(target_name)
-            seen.add(target_name)
+        out[target_name] = existing_strings | existing_calls
     return out
 
 
@@ -9496,6 +9489,105 @@ def _patch_sibling_swiftinterfaces_for_package_access(
                     target_path.write_text(edited)
 
 
+def _consumed_sibling_interface_edges(
+    consume_edits: Sequence[PackageSwiftEdit],
+) -> Dict[str, Set[str]]:
+    """Map each consumed sibling to the other consumed siblings its
+    consumer-facing `.swiftinterface`s import.
+
+    These are the edges a compile follows when it loads a sibling's
+    interface: swiftc resolves every module that interface imports, so a
+    target that uses IssueReporting also needs IssueReportingPackageSupport
+    on its search path. Imports are matched to siblings by the modules each
+    sibling xcframework provides, not by its file name. Non-public imports
+    (`@_implementationOnly`, `internal import`) are not followed; a client
+    never resolves them.
+    """
+    provided: Dict[str, Set[str]] = {}
+    for edit in consume_edits:
+        if edit.xcframework_path is not None:
+            provided[edit.product_name] = provided_modules_in_xcframework(
+                edit.xcframework_path
+            )
+    edges: Dict[str, Set[str]] = {}
+    for edit in consume_edits:
+        if edit.xcframework_path is None:
+            continue
+        imports = public_imports_in_xcframework(edit.xcframework_path)
+        edges[edit.product_name] = {
+            other
+            for other, modules in provided.items()
+            if other != edit.product_name and modules & imports
+        }
+    return edges
+
+
+def _consumed_siblings_reached_by_target(
+    target_deps: Dict[str, Set[str]],
+    consumed_names: Sequence[str],
+    sibling_edges: Dict[str, Set[str]],
+) -> Dict[str, Set[str]]:
+    """For every target that reaches at least one consumed sibling, the
+    full set of consumed siblings it reaches.
+
+    A target reaches a sibling it names directly, every sibling reached
+    by an intra-package target it depends on, and every sibling a reached
+    sibling's interface imports (`sibling_edges`), transitively.
+
+    Why intra-package reach matters: in swift-case-paths, CasePaths
+    depends on CasePathsCore, which depends on IssueReporting and
+    XCTestDynamicOverlay. CasePathsCore's interface imports drag those
+    modules into CasePaths' compile, and CasePaths' own source does
+    `@_spi(CurrentTestCase) import XCTestDynamicOverlay`, which SPM
+    allowed through CasePathsCore. Without the siblings named on
+    CasePaths itself, `xcodebuild archive` fails with "Unable to find
+    module dependency: 'IssueReporting'".
+
+    Why it must stop there: every named sibling is linked into the
+    target's framework. A package can build a sibling only some of its
+    targets use. swift-dependencies builds `IssueReportingTestSupport`
+    for `DependenciesTestSupport`, and handing it to every target linked
+    `Testing.framework` and XCTest into `Dependencies.framework`.
+
+    Targets that reach no sibling are omitted. Tolerates dependency
+    cycles, which SwiftPM rejects anyway.
+    """
+    consumed = set(consumed_names)
+
+    def sibling_closure(name: str) -> Set[str]:
+        out: Set[str] = set()
+        stack = [name]
+        while stack:
+            cur = stack.pop()
+            if cur in out:
+                continue
+            out.add(cur)
+            stack.extend(sibling_edges.get(cur, ()))
+        return out
+
+    reached: Dict[str, Set[str]] = {
+        name: {d for d in deps if d in consumed}
+        for name, deps in target_deps.items()
+    }
+    for name in reached:
+        closed: Set[str] = set()
+        for sib in reached[name]:
+            closed |= sibling_closure(sib)
+        reached[name] = closed
+    changed = True
+    while changed:
+        changed = False
+        for name, deps in target_deps.items():
+            for dep in deps:
+                if dep in consumed or dep not in reached or dep == name:
+                    continue
+                extra = reached[dep] - reached[name]
+                if extra:
+                    reached[name] |= extra
+                    changed = True
+    return {name: sibs for name, sibs in reached.items() if sibs}
+
+
 def _apply_consume_external_sibling_edits(
     staged_dir: Path, plan: Plan
 ) -> None:
@@ -9604,51 +9696,23 @@ def _apply_consume_external_sibling_edits(
         )
         identities_to_strip.add(edit.package_identity)
 
-    # Close the swiftinterface search-path gap: for every target whose
-    # `dependencies:` array (post-rewrite) TRANSITIVELY reaches a
-    # consumed sibling — directly OR through other intra-package
-    # targets — ensure it also names EVERY consumed sibling.
-    #
-    # Why direct-only isn't enough: in swift-case-paths, CasePaths
-    # depends on CasePathsCore (intra-package) and CasePathsCore in
-    # turn depends on IssueReporting / XCTestDynamicOverlay (consumed
-    # siblings post-rewrite). CasePathsCore's emitted swiftinterface
-    # `import IssueReporting` lines drag those modules into CasePaths'
-    # compile too, but CasePaths' direct deps mention only
-    # CasePathsCore — so a direct-only closure leaves CasePaths
-    # without FRAMEWORK_SEARCH_PATHS for the upstream siblings and
-    # `xcodebuild archive` fails with "Unable to find module
-    # dependency: 'IssueReporting'". Plus, swift-case-paths' CasePaths
-    # source itself does `@_spi(CurrentTestCase) import
-    # XCTestDynamicOverlay` — SPM let this fly because
-    # XCTestDynamicOverlay was reachable through CasePathsCore's deps;
-    # we have to preserve that reachability under the overlay.
-    #
-    # Algorithm: BFS backward from `consumed_names`. Start with
-    # `reachable = consumed_names`. Each round, find every target
-    # whose deps array names at least one element of `reachable`; for
-    # each new such target, augment its deps with ALL `consumed_names`
-    # and add it to `reachable`. Repeat to fixpoint. The augmentation
-    # itself is what feeds the next round — once T's deps contain a
-    # consumed sibling, anything that string-depends on T is picked up
-    # in the following iteration. Idempotent and order-independent.
+    # Close the swiftinterface search-path gap. A `.binaryTarget` has no
+    # dependencies of its own, so a target sees a consumed sibling's
+    # search paths only when it names that sibling itself. Give each
+    # target exactly the siblings its source build could see: those it
+    # reaches through intra-package targets, closed over the siblings
+    # each sibling's interface imports. See
+    # `_consumed_siblings_reached_by_target`.
     consumed_names = [edit.product_name for edit in consume_edits]
-    reachable: Set[str] = set(consumed_names)
-    while True:
-        candidates = _target_names_with_string_deps_in_set(
-            edited, reachable
+    reached = _consumed_siblings_reached_by_target(
+        _target_string_dep_names(edited),
+        consumed_names,
+        _consumed_sibling_interface_edges(consume_edits),
+    )
+    for target_name, names in reached.items():
+        edited = edit_augment_target_dependencies(
+            edited, target_name, [n for n in consumed_names if n in names]
         )
-        progress = False
-        for target_name in candidates:
-            if target_name in reachable:
-                continue
-            edited = edit_augment_target_dependencies(
-                edited, target_name, consumed_names
-            )
-            reachable.add(target_name)
-            progress = True
-        if not progress:
-            break
     # Strip orphan `.product(name: ?, package: ID)` refs for every
     # identity we're about to strip from `Package.dependencies`. The
     # rewrite pass above only converts `.product()` calls for products
