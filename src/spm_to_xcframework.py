@@ -10064,12 +10064,48 @@ def _unified_diff(original: str, edited: str, label: str = "Package.swift") -> s
     )
 
 
-def prepare(staged_dir: Path, plan: Plan, *, verbose: bool = False) -> PreparedPlan:
+def _carry_target_classification(
+    targets: Sequence[Target], inspected: Optional[Package]
+) -> None:
+    """Copy Inspect's per-target SwiftPM classification onto the targets
+    re-dumped from the edited manifest.
+
+    A dump carries no classification, and Execute decides from it which
+    targets may publish authored headers (a SwiftTarget never does) and
+    what language a dependency framework should verify as. Inspect already
+    classified every target from `swift package describe` on the same
+    sources, and no Prepare edit changes a target's sources, so the
+    classification carries by name. Re-describing here instead would
+    make Prepare depend on the on-disk source layout, which the
+    dump-based round-trip validator deliberately does not. A target whose
+    kind changed (an overlay replacing it with a binary target) is not
+    the target Inspect classified and keeps its dump default.
+    """
+    if inspected is None:
+        return
+    for tgt in targets:
+        source = inspected.target_by_name(tgt.name)
+        if source is None or source.kind != tgt.kind:
+            continue
+        tgt.language = source.language
+        tgt.source_file_count = source.source_file_count
+        tgt.clang_is_pure_c = source.clang_is_pure_c
+
+
+def prepare(
+    staged_dir: Path,
+    plan: Plan,
+    *,
+    inspected: Optional[Package],
+    verbose: bool = False,
+) -> PreparedPlan:
     """Top-level Prepare entry point.
 
     Applies the planner's whitelisted edits to `staged_dir/Package.swift`
     and runs the mandatory round-trip validator. Returns a PreparedPlan
-    that wraps the original Plan and the post-edit Package model. Schemes
+    that wraps the original Plan and the post-edit Package model, carrying
+    `inspected`'s per-target classification (None only where no Inspect
+    ran, and classification is then unknown). Schemes
     from the inspect-time discovery are preserved on the returned Package
     (synthetic libraries don't need pre-discovered schemes — xcodebuild
     auto-generates them at archive time against our clean staged dir).
@@ -10087,7 +10123,7 @@ def prepare(staged_dir: Path, plan: Plan, *, verbose: bool = False) -> PreparedP
         # Re-dump anyway so PreparedPlan.package reflects whatever the
         # current manifest says — Execute reads it for diagnostic context.
         raw, products, targets, platforms, name, tv = dump_package(staged_dir)
-        scan_target_languages(staged_dir, targets)
+        _carry_target_classification(targets, inspected)
         return PreparedPlan(
             plan=plan,
             package=Package(
@@ -10131,11 +10167,7 @@ def prepare(staged_dir: Path, plan: Plan, *, verbose: bool = False) -> PreparedP
     raw, products, targets, platforms, name, tv = validate_prepared_manifest(
         staged_dir, plan, original
     )
-    # A dump carries no per-target classification. Execute decides from
-    # it which targets may publish authored headers (a SwiftTarget never
-    # does) and what language a dependency framework should verify as,
-    # so take it from SwiftPM for the manifest Execute actually builds.
-    scan_target_languages(staged_dir, targets)
+    _carry_target_classification(targets, inspected)
     edit_count = len(plan.package_swift_edits) + len(plan.macros)
     success(f"  Prepare validated {edit_count} edit(s) ✓")
     return PreparedPlan(
@@ -17325,7 +17357,8 @@ def _source_mode_after_inspect(
         None if config.child_run else _read_output_manifest(config.output_dir)
     )
 
-    prepared = prepare(staged_dir, plan, verbose=config.verbose)
+    prepared = prepare(
+        staged_dir, plan, inspected=package, verbose=config.verbose)
     executed = execute_source_plan(prepared, config)
     result = _finalize_with_verify(executed, config, old_manifest=old_manifest)
     if result != 0:

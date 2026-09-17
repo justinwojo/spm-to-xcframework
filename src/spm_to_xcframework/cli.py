@@ -1199,7 +1199,8 @@ def _source_mode_after_inspect(
         None if config.child_run else _read_output_manifest(config.output_dir)
     )
 
-    prepared = prepare(staged_dir, plan, verbose=config.verbose)
+    prepared = prepare(
+        staged_dir, plan, inspected=package, verbose=config.verbose)
     executed = execute_source_plan(prepared, config)
     result = _finalize_with_verify(executed, config, old_manifest=old_manifest)
     if result != 0:

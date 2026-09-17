@@ -10785,7 +10785,7 @@ def _roundtrip_validator_catches_missing_product() -> None:
                              targets=["DoesNotExist"]),
         ]
         try:
-            prepare(tmp, plan, verbose=False)
+            prepare(tmp, plan, inspected=None, verbose=False)
         except (PrepareUserError, PrepareError) as exc:
             _assert("DoesNotExist" in str(exc),
                     f"error should mention DoesNotExist: {exc}")
@@ -10867,7 +10867,7 @@ def _roundtrip_full_prepare_grdb() -> None:
                 source_targets=["GRDB"],
             ),
         ]
-        prepared = prepare(tmp, plan, verbose=False)
+        prepared = prepare(tmp, plan, inspected=None, verbose=False)
         prods = {p.name: p for p in prepared.package.products}
         _assert("GRDBDynamic" in prods,
                 f"synthetic GRDBDynamic missing from dumped products: {sorted(prods.keys())}")
@@ -10938,9 +10938,18 @@ def _selftest_prepare_carries_swiftpm_target_classification(tmp_root: Path) -> N
         work = tmp_root / f"prepare-classification-{label}"
         work.mkdir()
         write_fixture(work)
+        # Inspect classifies the staged sources before any edit; Prepare
+        # must hand that classification on to Execute.
+        _raw, products, targets, platforms, name, tv = dump_package(work)
+        scan_target_languages(work, targets)
+        inspected = Package(name=name, tools_version=tv, platforms=platforms,
+                            products=products, targets=targets, schemes=[],
+                            raw_dump=_raw, staged_dir=work)
         plan = Plan()
         plan.package_swift_edits = list(edits)
-        prepared = prepare(work, plan, verbose=False)
+        prepared = prepare(work, plan, inspected=inspected, verbose=False)
+        _assert(prepared.package.targets is not inspected.targets,
+                f"{label}: Prepare must return the re-dumped targets")
         yams = prepared.package.target_by_name("Yams")
         cyaml = prepared.package.target_by_name("CYaml")
         _assert(yams is not None and yams.language == Language.SWIFT,
