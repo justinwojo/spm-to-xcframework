@@ -2233,11 +2233,14 @@ def edit_rewrite_external_product_to_string_dep_in_target(
     target_name: str,
     product_name: str,
     package_identity: str,
+    replacement_names: Optional[Sequence[str]] = None,
 ) -> str:
     """Rewrite every depth-0 `.product(name: product_name, package:
     package_identity[, ...])` entry inside the `dependencies:` array of
     the `.target/.executableTarget/.testTarget` call for `target_name`
-    to the bare string literal `"<product_name>"`.
+    to bare string literals naming the sibling modules the product is
+    built from: `replacement_names`, or `"<product_name>"` when omitted.
+    A product built from several siblings becomes several entries.
 
     Used by `consume_external_sibling` (Prepare): after the orchestrator
     pre-builds an external transitive product P as a sibling xcframework
@@ -2301,7 +2304,8 @@ def edit_rewrite_external_product_to_string_dep_in_target(
     )
     if not matches:
         return manifest_text
-    string_literal = _swift_string_literal(product_name)
+    names = list(replacement_names) if replacement_names else [product_name]
+    string_literal = ", ".join(_swift_string_literal(n) for n in names)
     edited_body = body
     for call_start, call_close in sorted(matches, reverse=True):
         edited_body = (
@@ -2768,6 +2772,7 @@ def edit_rewrite_external_product_to_string_dep_in_all_targets(
     package_identity: str,
     *,
     include_test_targets: bool = True,
+    replacement_names: Optional[Sequence[str]] = None,
 ) -> str:
     """Apply `edit_rewrite_external_product_to_string_dep_in_target`
     across every `.target` / `.executableTarget` (and, by default,
@@ -2807,7 +2812,7 @@ def edit_rewrite_external_product_to_string_dep_in_all_targets(
     text = manifest_text
     for name in target_names:
         text = edit_rewrite_external_product_to_string_dep_in_target(
-            text, name, product_name, package_identity
+            text, name, product_name, package_identity, replacement_names
         )
     return text
 
@@ -4632,11 +4637,13 @@ def _apply_consume_external_sibling_edits(
          Paths are relativized to the package root via
          `os.path.relpath` — SPM rejects absolute `.binaryTarget(path:)`.
 
-      2. **`.product()` → `"P"` rewrite** in every target's
-         `dependencies:` array. Routed through
+      2. **`.product(name: P, package: ID)` → `"M"` rewrite** in every
+         target's `dependencies:` array, for each sibling M whose edit
+         lists P in `via_products` (the siblings ID's product P is built
+         from). Routed through
          `edit_rewrite_external_product_to_string_dep_in_all_targets`.
-         Once the overlay supplies a binaryTarget named P, SPM resolves
-         a bare-string dep `"P"` to that binaryTarget; the `.product()`
+         Once the overlay supplies a binaryTarget named M, SPM resolves
+         a bare-string dep `"M"` to that binaryTarget; the `.product()`
          shape always disambiguates to the external package, which is
          now orphaned and would not be resolved. Test targets are
          included because a test target that imports P would dangle
@@ -4705,6 +4712,12 @@ def _apply_consume_external_sibling_edits(
     text = manifest_path.read_text()
     edited = edit_inject_or_extend_overlay_binary_targets(text, substitutions)
     identities_to_strip: Set[str] = set()
+    # `.product(name: P, package: ID)` becomes a dependency on the
+    # siblings P is built from — the edits listing P in `via_products`,
+    # which Plan resolved through ID's product -> target list. P's own
+    # name is never matched against a sibling's: Amplitude's
+    # `AmplitudeCoreFramework` product is the `AmplitudeCore` sibling.
+    siblings_by_product: Dict[Tuple[str, str], List[str]] = {}
     for edit in consume_edits:
         # `package_identity` is None for injection-only edits emitted by
         # Plan Phase 2 (sibling xcframeworks referenced solely via a
@@ -4714,12 +4727,15 @@ def _apply_consume_external_sibling_edits(
         # overlay injection above is the whole edit.
         if edit.package_identity is None:
             continue
-        edited = edit_rewrite_external_product_to_string_dep_in_all_targets(
-            edited,
-            edit.product_name,
-            edit.package_identity,
-        )
         identities_to_strip.add(edit.package_identity)
+        for product in edit.via_products:
+            siblings_by_product.setdefault(
+                (edit.package_identity, product), []
+            ).append(edit.product_name)
+    for (identity, product), siblings in siblings_by_product.items():
+        edited = edit_rewrite_external_product_to_string_dep_in_all_targets(
+            edited, product, identity, replacement_names=siblings,
+        )
 
     # Close the swiftinterface search-path gap. A `.binaryTarget` has no
     # dependencies of its own, so a target sees a consumed sibling's

@@ -116,6 +116,11 @@ class Config:
     # the umbrella's entries, and writes one manifest at the end.
     # Always empty on parent Configs.
     collected_entries: List["ManifestEntry"] = field(default_factory=list)
+    # Binary-mode output: every artifact `discover_binary_artifacts` found,
+    # with the `.binaryTarget` each was unpacked from. The orchestrator
+    # reads it off a binary-routed transitive child to build
+    # `prebuilt_sibling_binary_targets`.
+    discovered_binary_artifacts: List["BinaryArtifact"] = field(default_factory=list)
     # True for transitive-sibling child runs spawned by the orchestrator's
     # `_make_transitive_child_config` / `_make_binary_only_transitive_child_config`.
     # Distinguishes a dependency child (whose products are the umbrella's
@@ -170,6 +175,16 @@ class Config:
     # identity-based and a sibling product from the same package
     # already triggers it".
     prebuilt_sibling_identities: Dict[str, str] = field(default_factory=dict)
+    # For each binary-routed transitive (lowercased SPM identity), which
+    # sibling xcframeworks each of its `.binaryTarget`s unpacked to:
+    # {"amplitudecore-swift": {"AmplitudeCoreFramework": ["AmplitudeCore"]}}.
+    # The planner resolves a referenced product through the package's
+    # product -> target list, and a binary target's sibling is named by
+    # the archive, not the target, so this is the missing hop. Source-built
+    # transitives are absent: their child builds product P as `P.xcframework`.
+    prebuilt_sibling_binary_targets: Dict[str, Dict[str, List[str]]] = field(
+        default_factory=dict
+    )
 
     @property
     def is_remote(self) -> bool:

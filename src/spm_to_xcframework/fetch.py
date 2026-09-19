@@ -705,6 +705,35 @@ def stage_source(config: Config, source_dir: Path) -> Path:
     return staged_dir
 
 
+def _collect_binary_artifacts(artifacts_root: Path) -> List[BinaryArtifact]:
+    """Walk SwiftPM's `.build/artifacts/` tree for unpacked xcframeworks.
+
+    SwiftPM unpacks each binary target to
+    `<artifacts_root>/<identity>/<binary target>/<X>.xcframework`; the
+    target directory is recorded on each record as `binary_target`. An
+    xcframework directly under `<identity>/` (older layout) has none.
+    `__MACOSX` AppleDouble ghosts are pruned before descending or
+    matching, and `.xcframework` directories are not descended into.
+    """
+    found: List[BinaryArtifact] = []
+    for dirpath, dirnames, _filenames in os.walk(artifacts_root):
+        dirnames[:] = [d for d in dirnames if d != "__MACOSX"]
+        rel_parts = Path(dirpath).relative_to(artifacts_root).parts
+        binary_target = rel_parts[1] if len(rel_parts) == 2 else None
+        remaining: List[str] = []
+        for d in dirnames:
+            if d.endswith(".xcframework"):
+                found.append(BinaryArtifact(
+                    product_name=d[: -len(".xcframework")],
+                    path=Path(dirpath) / d,
+                    binary_target=binary_target,
+                ))
+            else:
+                remaining.append(d)
+        dirnames[:] = remaining
+    return found
+
+
 def discover_binary_artifacts(config: Config) -> List[BinaryArtifact]:
     """Resolve a binary-mode SPM shim and walk `.build/artifacts/` for
     xcframeworks. Used by binary mode instead of fetch_source + stage.
@@ -793,22 +822,7 @@ def discover_binary_artifacts(config: Config) -> List[BinaryArtifact]:
             "may not ship binary xcframeworks."
         )
 
-    found: List[BinaryArtifact] = []
-    for dirpath, dirnames, _filenames in os.walk(artifacts_root):
-        # Bug 3 fix: prune __MACOSX ghosts before descending or matching.
-        dirnames[:] = [d for d in dirnames if d != "__MACOSX"]
-        # Collect .xcframework directories at the current level without
-        # descending into them (they have their own internal structure
-        # that we don't want to walk).
-        remaining: List[str] = []
-        for d in dirnames:
-            if d.endswith(".xcframework"):
-                name = d[: -len(".xcframework")]
-                found.append(BinaryArtifact(product_name=name, path=Path(dirpath) / d))
-            else:
-                remaining.append(d)
-        dirnames[:] = remaining
-
+    found = _collect_binary_artifacts(artifacts_root)
     if not found:
         raise FetchError(
             "No xcframeworks discovered under .build/artifacts/. "

@@ -8085,9 +8085,12 @@ def _selftest_consume_external_siblings_link_only_what_each_target_reaches(
         ("IssueReportingPackageSupport", None),
         ("Unrelated", None),
     ):
+        # Source-built siblings: each referenced product is its own
+        # sibling, which Plan records in `via_products`.
         plan.package_swift_edits.append(tool.PackageSwiftEdit(
             kind="consume_external_sibling", product_name=name,
             package_identity=identity, xcframework_path=xcfw[name],
+            via_products=[name] if identity is not None else [],
         ))
 
     from spm_to_xcframework.prepare import _apply_consume_external_sibling_edits
@@ -8126,6 +8129,217 @@ def _selftest_consume_external_siblings_link_only_what_each_target_reaches(
     # Every consumed sibling still gets its overlay binaryTarget.
     for name in xcfw:
         _assert(f'name: "{name}"' in text, f"overlay entry for {name} missing")
+
+
+def _selftest_consume_external_product_resolves_through_product_targets(
+    tmp_root: Path,
+) -> None:
+    """A `.product(name: P, package: ID)` dependency reaches the sibling
+    modules that ID's product P is built from, not a sibling that happens
+    to be named P.
+
+    Amplitude-Swift's `AmplitudeSwift` target depends on
+    `.product(name: "AmplitudeCoreFramework", package: "AmplitudeCore-Swift")`.
+    That product vends the binary target `AmplitudeCoreFramework`, whose
+    artifact unpacks as `AmplitudeCore.xcframework` (module
+    `AmplitudeCore`). The same package also ships an
+    `AmplitudeCoreNoUIKit` binary artifact for a product the umbrella never
+    names. Matching the dependency by name found no sibling called
+    `AmplitudeCoreFramework`, dropped the reference as an orphan, and left
+    `AmplitudeSwift` without `AmplitudeCore` on its search path ("Unable to
+    find module dependency: 'AmplitudeCore'"). The dependency must become
+    `AmplitudeCore`, and `AmplitudeCoreNoUIKit` must stay out of the target.
+    """
+    from spm_to_xcframework.plan import _plan_external_sibling_consumption
+    from spm_to_xcframework.prepare import _apply_consume_external_sibling_edits
+
+    base = tmp_root / "consume_product_resolves_through_targets"
+    staged = base / "staged"
+    staged.mkdir(parents=True)
+    siblings = base / "siblings"
+
+    def sibling(name: str, imports: List[str]) -> Path:
+        xcfw = siblings / f"{name}.xcframework"
+        sm = (xcfw / "ios-arm64" / f"{name}.framework" / "Modules"
+              / f"{name}.swiftmodule")
+        sm.mkdir(parents=True)
+        (sm / "arm64-apple-ios.swiftinterface").write_text(
+            "// swift-interface-format-version: 1.0\n"
+            + "".join(f"import {m}\n" for m in ["Swift", *imports])
+            + "public func f() {}\n"
+        )
+        return xcfw
+
+    xcfw = {
+        "AmplitudeCore": sibling("AmplitudeCore", ["Foundation"]),
+        "AmplitudeCoreNoUIKit": sibling("AmplitudeCoreNoUIKit", ["Foundation"]),
+        "AnalyticsConnector": sibling("AnalyticsConnector", ["Foundation"]),
+    }
+
+    core = TransitivePackageInfo(
+        identity="amplitudecore-swift",
+        checkout_path=Path("/dummy/amplitudecore-swift"),
+        products=[
+            Product("AmplitudeCore", Linkage.AUTOMATIC, ["AmplitudeCore"]),
+            Product("AmplitudeCoreNoUIKit", Linkage.AUTOMATIC,
+                    ["AmplitudeCoreNoUIKit"]),
+            Product("AmplitudeCoreFramework", Linkage.AUTOMATIC,
+                    ["AmplitudeCoreFramework"]),
+            Product("AmplitudeCoreNoUIKitFramework", Linkage.AUTOMATIC,
+                    ["AmplitudeCoreNoUIKitFramework"]),
+        ],
+        tools_version="5.7",
+        referenced_products=["AmplitudeCoreFramework"],
+        binary_target_names=["AmplitudeCoreFramework",
+                             "AmplitudeCoreNoUIKitFramework"],
+    )
+    connector = TransitivePackageInfo(
+        identity="analytics-connector-ios",
+        checkout_path=Path("/dummy/analytics-connector-ios"),
+        products=[Product("AnalyticsConnector", Linkage.AUTOMATIC,
+                          ["AnalyticsConnector"])],
+        tools_version="5.3",
+        referenced_products=["AnalyticsConnector"],
+    )
+    pkg = _gc_make_package(
+        name="Amplitude-Swift", targets=["AmplitudeSwift"],
+        products=[("AmplitudeSwift", Linkage.AUTOMATIC, ["AmplitudeSwift"])],
+        transitives=[core, connector],
+    )
+
+    config = Config(package_source=str(staged), user_version="",
+                    resolved_version="", work_dir=base / "work")
+    config.prebuilt_sibling_xcframeworks = dict(xcfw)
+    # What the orchestrator records for these siblings: the binary-routed
+    # package owns both artifacts; the source-built one owns its product.
+    config.prebuilt_sibling_identities = {
+        "AmplitudeCore": "amplitudecore-swift",
+        "AmplitudeCoreNoUIKit": "amplitudecore-swift",
+        "AnalyticsConnector": "analytics-connector-ios",
+    }
+    # Which binary target each binary-routed artifact was unpacked from.
+    config.prebuilt_sibling_binary_targets = {
+        "amplitudecore-swift": {
+            "AmplitudeCoreFramework": ["AmplitudeCore"],
+            "AmplitudeCoreNoUIKitFramework": ["AmplitudeCoreNoUIKit"],
+        },
+    }
+
+    plan = tool.Plan()
+    _plan_external_sibling_consumption(plan, pkg, config)
+    by_name = {e.product_name: e for e in plan.package_swift_edits}
+    _assert(set(by_name) == set(xcfw),
+            f"every sibling gets an overlay edit: {sorted(by_name)!r}")
+    _assert(getattr(by_name["AmplitudeCore"], "via_products", None)
+            == ["AmplitudeCoreFramework"],
+            "AmplitudeCore is reached through product AmplitudeCoreFramework: "
+            f"{by_name['AmplitudeCore']!r}")
+    _assert(getattr(by_name["AnalyticsConnector"], "via_products", None)
+            == ["AnalyticsConnector"],
+            f"AnalyticsConnector: {by_name['AnalyticsConnector']!r}")
+    _assert(not getattr(by_name["AmplitudeCoreNoUIKit"], "via_products", None),
+            "no referenced product resolves to AmplitudeCoreNoUIKit: "
+            f"{by_name['AmplitudeCoreNoUIKit']!r}")
+
+    (staged / "Package.swift").write_text(
+        "// swift-tools-version:5.9\n"
+        "import PackageDescription\n"
+        "\n"
+        "let package = Package(\n"
+        '    name: "Amplitude-Swift",\n'
+        "    products: [\n"
+        '        .library(name: "AmplitudeSwift", targets: ["AmplitudeSwift"]),\n'
+        "    ],\n"
+        "    dependencies: [\n"
+        '        .package(url: "https://github.com/amplitude/analytics-connector-ios.git", from: "1.3.0"),\n'
+        '        .package(url: "https://github.com/amplitude/AmplitudeCore-Swift.git", from: "1.5.0"),\n'
+        "    ],\n"
+        "    targets: [\n"
+        "        .target(\n"
+        '            name: "AmplitudeSwift",\n'
+        "            dependencies: [\n"
+        '                .product(name: "AmplitudeCoreFramework", package: "AmplitudeCore-Swift"),\n'
+        '                .product(name: "AnalyticsConnector", package: "analytics-connector-ios"),\n'
+        "            ]\n"
+        "        ),\n"
+        "        .testTarget(\n"
+        '            name: "AmplitudeSwiftTests",\n'
+        "            dependencies: [\n"
+        '                "AmplitudeSwift",\n'
+        "            ]\n"
+        "        ),\n"
+        "    ]\n"
+        ")\n"
+    )
+    saved = tool._swift_toolchain_version
+    try:
+        tool._swift_toolchain_version = lambda: None  # noqa: E731
+        _apply_consume_external_sibling_edits(staged, plan)
+    finally:
+        tool._swift_toolchain_version = saved
+    text = (staged / "Package.swift").read_text()
+
+    def deps_of(kind: str, target: str) -> Set[str]:
+        start = text.index(f'.{kind}(\n            name: "{target}"')
+        start = text.index("dependencies:", start)
+        arr = text[start:text.index("]", start) + 1]
+        import re as _re
+        return set(_re.findall(r'"([^"]+)"', arr))
+
+    _assert(deps_of("target", "AmplitudeSwift")
+            == {"AmplitudeCore", "AnalyticsConnector"},
+            "AmplitudeSwift must depend on the modules its products are "
+            f"built from, and nothing else: {deps_of('target', 'AmplitudeSwift')!r}")
+    _assert(deps_of("testTarget", "AmplitudeSwiftTests")
+            == {"AmplitudeSwift", "AmplitudeCore", "AnalyticsConnector"},
+            f"test target reach: {deps_of('testTarget', 'AmplitudeSwiftTests')!r}")
+    _assert(".product(" not in text, f"no external product ref may survive:\n{text}")
+    _assert("AmplitudeCore-Swift.git" not in text
+            and "analytics-connector-ios.git" not in text,
+            f"consumed packages are dropped from dependencies:\n{text}")
+    for name in xcfw:
+        _assert(f'name: "{name}"' in text, f"overlay entry for {name} missing")
+
+
+def _selftest_binary_artifacts_record_their_binary_target(tmp_root: Path) -> None:
+    """Binary-mode discovery keeps the `.binaryTarget` each xcframework was
+    unpacked from, and the orchestrator indexes it per package.
+
+    SwiftPM unpacks a binary target's archive to
+    `.build/artifacts/<identity>/<binary target>/<X>.xcframework`, and X is
+    whatever the archive holds: AmplitudeCore-Swift's `AmplitudeCoreFramework`
+    target unpacks `AmplitudeCore.xcframework`. That directory level is the
+    only link from a product's target list to the sibling module it
+    provides.
+    """
+    from spm_to_xcframework.cli import _binary_target_siblings
+    from spm_to_xcframework.fetch import _collect_binary_artifacts
+
+    root = tmp_root / "binary_artifact_targets" / "artifacts"
+    (root / "amplitudecore-swift" / "AmplitudeCoreFramework"
+     / "AmplitudeCore.xcframework" / "ios-arm64").mkdir(parents=True)
+    (root / "amplitudecore-swift" / "AmplitudeCoreNoUIKitFramework"
+     / "AmplitudeCoreNoUIKit.xcframework").mkdir(parents=True)
+    (root / "amplitudecore-swift" / "AmplitudeCoreNoUIKitFramework"
+     / "__MACOSX" / "Ghost.xcframework").mkdir(parents=True)
+    (root / "extract" / "amplitudecore-swift" / "AmplitudeCoreFramework").mkdir(
+        parents=True)
+    # Older SwiftPM layout: no binary-target directory level.
+    (root / "legacy-pkg" / "Legacy.xcframework").mkdir(parents=True)
+
+    found = sorted(_collect_binary_artifacts(root), key=lambda a: a.product_name)
+    got = [(a.product_name, a.binary_target) for a in found]
+    _assert(got == [
+        ("AmplitudeCore", "AmplitudeCoreFramework"),
+        ("AmplitudeCoreNoUIKit", "AmplitudeCoreNoUIKitFramework"),
+        ("Legacy", None),
+    ], f"binary targets: {got!r}")
+
+    index = _binary_target_siblings(found)
+    _assert(index == {
+        "AmplitudeCoreFramework": ["AmplitudeCore"],
+        "AmplitudeCoreNoUIKitFramework": ["AmplitudeCoreNoUIKit"],
+    }, f"binary target → sibling index: {index!r}")
 
 
 def _selftest_inject_objc_headers_explicit_modulemap(tmp_root: Path) -> None:
@@ -14149,6 +14363,10 @@ def _all_tests(tmp_root: Path) -> List[Tuple[str, Callable[[], None], bool]]:
          lambda: _selftest_find_objc_headers_dir_umbrella_rejects_unrelated_h(tmp_root), False),
         ("prepare: consumed siblings are linked only into targets that reach them (swift-dependencies)",
          lambda: _selftest_consume_external_siblings_link_only_what_each_target_reaches(tmp_root), False),
+        ("plan+prepare: an external product resolves to the sibling modules it is built from (Amplitude)",
+         lambda: _selftest_consume_external_product_resolves_through_product_targets(tmp_root), False),
+        ("fetch: binary artifacts record the binary target they were unpacked from",
+         lambda: _selftest_binary_artifacts_record_their_binary_target(tmp_root), False),
         ("execute: ObjC headers dir: a SwiftTarget publishes no authored headers (TelemetryDeck)",
          lambda: _selftest_find_objc_headers_dir_swift_target_exposes_no_authored_headers(tmp_root), False),
         ("execute: ObjC headers dir dep walk does not leak implicit include/",
@@ -14570,6 +14788,7 @@ def _selftest_plan_json_roundtrip_synthetic_edits() -> None:
                 targets=[],
                 package_identity="xctest-dynamic-overlay",
                 xcframework_path=Path("/tmp/xcframeworks/IssueReporting.xcframework"),
+                via_products=["IssueReporting"],
             ),
         ],
         build_units=[

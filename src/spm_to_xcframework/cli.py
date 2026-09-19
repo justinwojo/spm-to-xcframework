@@ -1604,6 +1604,24 @@ def _build_prebuilt_sibling_index(
     return paths, identities
 
 
+def _binary_target_siblings(
+    artifacts: Sequence["BinaryArtifact"],
+) -> Dict[str, List[str]]:
+    """Index binary-mode artifacts by the `.binaryTarget` they were
+    unpacked from: target name -> sibling xcframework basenames (without
+    `.xcframework`), in discovery order. Artifacts whose layout carried no
+    target level are left out; SwiftPM target names are unique across a
+    package graph, so the index needs no identity qualifier."""
+    out: Dict[str, List[str]] = {}
+    for art in artifacts:
+        if art.binary_target is None:
+            continue
+        names = out.setdefault(art.binary_target, [])
+        if art.product_name not in names:
+            names.append(art.product_name)
+    return out
+
+
 _CROSS_SIBLING_PRODUCT_RE = re.compile(
     r"\.product\s*\(\s*name\s*:\s*\"([^\"\\\n]+)\"\s*,\s*package\s*:\s*\"([^\"\\\n]+)\""
 )
@@ -1902,6 +1920,9 @@ def _run_source_mode_with_transitives(config: Config) -> int:
     # consumed siblings with their owning package, letting Prepare strip
     # the now-redundant `.package(url: …)` dep from the umbrella manifest.
     binary_routed_identity_by_product: Dict[str, str] = {}
+    # identity -> binary target -> sibling basenames, for binary-routed
+    # transitives. See `Config.prebuilt_sibling_binary_targets`.
+    binary_targets_by_identity: Dict[str, Dict[str, List[str]]] = {}
     # Seed `visited` with the root's own identity computed the same way
     # `_collect_referenced_package_products` keys its entries — by SPM
     # identity. `_identity_from_url` mirrors SPM's normalisation (last URL
@@ -1983,6 +2004,10 @@ def _run_source_mode_with_transitives(config: Config) -> int:
                     config.output_dir, all_entries, package,
                     binary_routed_identity_by_product,
                 )
+                child_config.prebuilt_sibling_binary_targets = {
+                    ident: dict(by_target)
+                    for ident, by_target in binary_targets_by_identity.items()
+                }
                 result = _run_source_mode(child_config)
         except _USER_FACING_ERRORS as exc:
             # Mirror main()'s clean-error path: a child's Fetch / Inspect /
@@ -2033,12 +2058,20 @@ def _run_source_mode_with_transitives(config: Config) -> int:
             return result
         all_entries.extend(child_config.collected_entries)
         if route_binary:
+            produced: Set[str] = set()
             for entry in child_config.collected_entries:
                 if entry.name.endswith(".xcframework"):
                     prod = entry.name[: -len(".xcframework")]
+                    produced.add(prod)
                     binary_routed_identity_by_product.setdefault(
                         prod, tp.identity
                     )
+            binary_targets_by_identity[tp.identity.lower()] = (
+                _binary_target_siblings([
+                    art for art in child_config.discovered_binary_artifacts
+                    if art.product_name in produced
+                ])
+            )
 
     # Build the umbrella last, as a child run so it deposits its entries
     # in the same merge bucket and skips the per-call manifest write.
@@ -2059,6 +2092,7 @@ def _run_source_mode_with_transitives(config: Config) -> int:
         config.output_dir, all_entries, package,
         binary_routed_identity_by_product,
     )
+    config.prebuilt_sibling_binary_targets = binary_targets_by_identity
     umbrella_result = _source_mode_after_inspect(
         config, source_dir, staged_dir, package
     )
@@ -2109,6 +2143,7 @@ def _run_binary_mode(config: Config) -> int:
     _validate_platforms_post_autodetect(config)
 
     artifacts = discover_binary_artifacts(config)
+    config.discovered_binary_artifacts = list(artifacts)
     plan = plan_binary_build(config, artifacts)
     _record_expected_primary_products(config, plan)
     for w in plan.warnings:

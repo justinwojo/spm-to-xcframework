@@ -260,27 +260,29 @@ class PackageSwiftEdit:
       - "consume_external_sibling" — consume a pre-built transitive
                                     sibling `.xcframework` from the
                                     output dir. Injects `.binaryTarget(
-                                    name: P, path: ...)` into
+                                    name: M, path: ...)` into
                                     `Package.targets` via the overlay
                                     mechanism and rewrites every
                                     `.product(name: P, package: <ident>)`
-                                    reference inside `.target` /
+                                    reference, for each P in
+                                    `via_products`, inside `.target` /
                                     `.executableTarget` / `.testTarget`
                                     dependency arrays to the bare string
-                                    `"P"` so SPM resolves the dep against
+                                    `"M"` so SPM resolves the dep against
                                     the injected binaryTarget instead of
                                     the now-orphaned external package.
                                     Emitted by the planner only when the
                                     orchestrator pre-populates
                                     `Config.prebuilt_sibling_xcframeworks`
                                     in the umbrella's Plan input. Carries
-                                    `product_name` (external product
-                                    name), `package_identity` (SPM
-                                    identity used in the `.product(...)`
-                                    `package:` argument), and
-                                    `xcframework_path` (absolute path to
-                                    the sibling xcframework; Prepare
-                                    relativizes it for the manifest).
+                                    `product_name` (the sibling's name M,
+                                    its xcframework basename),
+                                    `package_identity` (SPM identity used
+                                    in the `.product(...)` `package:`
+                                    argument), `xcframework_path`
+                                    (absolute path to the sibling
+                                    xcframework; Prepare relativizes it
+                                    for the manifest), and `via_products`.
 
     The two synth_* kinds are implemented by Prepare as a
     `swift package add-product` subprocess invocation, then a
@@ -296,6 +298,15 @@ class PackageSwiftEdit:
     # Populated only for `consume_external_sibling`:
     package_identity: Optional[str] = None
     xcframework_path: Optional[Path] = None
+    # The products of `package_identity` that are built from this sibling,
+    # resolved through that package's product -> target list. Prepare
+    # rewrites `.product(name: P, package: package_identity)` for each P
+    # here into a dependency on this sibling. A product can be built from
+    # a sibling of another name (Amplitude's `AmplitudeCoreFramework`
+    # product is the `AmplitudeCore` module) or from several siblings.
+    # Empty for a sibling no referenced product is built from: it is
+    # injected into the overlay and never named by a target.
+    via_products: List[str] = field(default_factory=list)
 
     def to_json(self) -> dict:
         return {
@@ -308,6 +319,7 @@ class PackageSwiftEdit:
                 if self.xcframework_path is not None
                 else None
             ),
+            "via_products": list(self.via_products),
         }
 
     @classmethod
@@ -319,6 +331,7 @@ class PackageSwiftEdit:
             targets=list(d.get("targets", [])),
             package_identity=d.get("package_identity"),
             xcframework_path=Path(xcfx) if xcfx is not None else None,
+            via_products=list(d.get("via_products", [])),
         )
 
 
@@ -459,6 +472,14 @@ class BinaryArtifact:
 
     product_name: str  # the xcframework name without the .xcframework suffix
     path: Path         # absolute path to the .xcframework directory
+    # The `.binaryTarget` this xcframework was unpacked from, read off
+    # SwiftPM's `.build/artifacts/<identity>/<target>/<X>.xcframework`
+    # layout. X is whatever the archive holds, so it can differ from the
+    # target name (AmplitudeCore-Swift's `AmplitudeCoreFramework` target
+    # unpacks `AmplitudeCore.xcframework`); this is the only link from a
+    # product's target list to the module it provides. None when the
+    # layout has no target level.
+    binary_target: Optional[str] = None
 
 
 @dataclass

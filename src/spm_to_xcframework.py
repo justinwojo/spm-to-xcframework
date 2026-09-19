@@ -947,6 +947,11 @@ class Config:
     # the umbrella's entries, and writes one manifest at the end.
     # Always empty on parent Configs.
     collected_entries: List["ManifestEntry"] = field(default_factory=list)
+    # Binary-mode output: every artifact `discover_binary_artifacts` found,
+    # with the `.binaryTarget` each was unpacked from. The orchestrator
+    # reads it off a binary-routed transitive child to build
+    # `prebuilt_sibling_binary_targets`.
+    discovered_binary_artifacts: List["BinaryArtifact"] = field(default_factory=list)
     # True for transitive-sibling child runs spawned by the orchestrator's
     # `_make_transitive_child_config` / `_make_binary_only_transitive_child_config`.
     # Distinguishes a dependency child (whose products are the umbrella's
@@ -1001,6 +1006,16 @@ class Config:
     # identity-based and a sibling product from the same package
     # already triggers it".
     prebuilt_sibling_identities: Dict[str, str] = field(default_factory=dict)
+    # For each binary-routed transitive (lowercased SPM identity), which
+    # sibling xcframeworks each of its `.binaryTarget`s unpacked to:
+    # {"amplitudecore-swift": {"AmplitudeCoreFramework": ["AmplitudeCore"]}}.
+    # The planner resolves a referenced product through the package's
+    # product -> target list, and a binary target's sibling is named by
+    # the archive, not the target, so this is the missing hop. Source-built
+    # transitives are absent: their child builds product P as `P.xcframework`.
+    prebuilt_sibling_binary_targets: Dict[str, Dict[str, List[str]]] = field(
+        default_factory=dict
+    )
 
     @property
     def is_remote(self) -> bool:
@@ -1271,27 +1286,29 @@ class PackageSwiftEdit:
       - "consume_external_sibling" — consume a pre-built transitive
                                     sibling `.xcframework` from the
                                     output dir. Injects `.binaryTarget(
-                                    name: P, path: ...)` into
+                                    name: M, path: ...)` into
                                     `Package.targets` via the overlay
                                     mechanism and rewrites every
                                     `.product(name: P, package: <ident>)`
-                                    reference inside `.target` /
+                                    reference, for each P in
+                                    `via_products`, inside `.target` /
                                     `.executableTarget` / `.testTarget`
                                     dependency arrays to the bare string
-                                    `"P"` so SPM resolves the dep against
+                                    `"M"` so SPM resolves the dep against
                                     the injected binaryTarget instead of
                                     the now-orphaned external package.
                                     Emitted by the planner only when the
                                     orchestrator pre-populates
                                     `Config.prebuilt_sibling_xcframeworks`
                                     in the umbrella's Plan input. Carries
-                                    `product_name` (external product
-                                    name), `package_identity` (SPM
-                                    identity used in the `.product(...)`
-                                    `package:` argument), and
-                                    `xcframework_path` (absolute path to
-                                    the sibling xcframework; Prepare
-                                    relativizes it for the manifest).
+                                    `product_name` (the sibling's name M,
+                                    its xcframework basename),
+                                    `package_identity` (SPM identity used
+                                    in the `.product(...)` `package:`
+                                    argument), `xcframework_path`
+                                    (absolute path to the sibling
+                                    xcframework; Prepare relativizes it
+                                    for the manifest), and `via_products`.
 
     The two synth_* kinds are implemented by Prepare as a
     `swift package add-product` subprocess invocation, then a
@@ -1307,6 +1324,15 @@ class PackageSwiftEdit:
     # Populated only for `consume_external_sibling`:
     package_identity: Optional[str] = None
     xcframework_path: Optional[Path] = None
+    # The products of `package_identity` that are built from this sibling,
+    # resolved through that package's product -> target list. Prepare
+    # rewrites `.product(name: P, package: package_identity)` for each P
+    # here into a dependency on this sibling. A product can be built from
+    # a sibling of another name (Amplitude's `AmplitudeCoreFramework`
+    # product is the `AmplitudeCore` module) or from several siblings.
+    # Empty for a sibling no referenced product is built from: it is
+    # injected into the overlay and never named by a target.
+    via_products: List[str] = field(default_factory=list)
 
     def to_json(self) -> dict:
         return {
@@ -1319,6 +1345,7 @@ class PackageSwiftEdit:
                 if self.xcframework_path is not None
                 else None
             ),
+            "via_products": list(self.via_products),
         }
 
     @classmethod
@@ -1330,6 +1357,7 @@ class PackageSwiftEdit:
             targets=list(d.get("targets", [])),
             package_identity=d.get("package_identity"),
             xcframework_path=Path(xcfx) if xcfx is not None else None,
+            via_products=list(d.get("via_products", [])),
         )
 
 
@@ -1470,6 +1498,14 @@ class BinaryArtifact:
 
     product_name: str  # the xcframework name without the .xcframework suffix
     path: Path         # absolute path to the .xcframework directory
+    # The `.binaryTarget` this xcframework was unpacked from, read off
+    # SwiftPM's `.build/artifacts/<identity>/<target>/<X>.xcframework`
+    # layout. X is whatever the archive holds, so it can differ from the
+    # target name (AmplitudeCore-Swift's `AmplitudeCoreFramework` target
+    # unpacks `AmplitudeCore.xcframework`); this is the only link from a
+    # product's target list to the module it provides. None when the
+    # layout has no target level.
+    binary_target: Optional[str] = None
 
 
 @dataclass
@@ -2682,6 +2718,35 @@ def stage_source(config: Config, source_dir: Path) -> Path:
     return staged_dir
 
 
+def _collect_binary_artifacts(artifacts_root: Path) -> List[BinaryArtifact]:
+    """Walk SwiftPM's `.build/artifacts/` tree for unpacked xcframeworks.
+
+    SwiftPM unpacks each binary target to
+    `<artifacts_root>/<identity>/<binary target>/<X>.xcframework`; the
+    target directory is recorded on each record as `binary_target`. An
+    xcframework directly under `<identity>/` (older layout) has none.
+    `__MACOSX` AppleDouble ghosts are pruned before descending or
+    matching, and `.xcframework` directories are not descended into.
+    """
+    found: List[BinaryArtifact] = []
+    for dirpath, dirnames, _filenames in os.walk(artifacts_root):
+        dirnames[:] = [d for d in dirnames if d != "__MACOSX"]
+        rel_parts = Path(dirpath).relative_to(artifacts_root).parts
+        binary_target = rel_parts[1] if len(rel_parts) == 2 else None
+        remaining: List[str] = []
+        for d in dirnames:
+            if d.endswith(".xcframework"):
+                found.append(BinaryArtifact(
+                    product_name=d[: -len(".xcframework")],
+                    path=Path(dirpath) / d,
+                    binary_target=binary_target,
+                ))
+            else:
+                remaining.append(d)
+        dirnames[:] = remaining
+    return found
+
+
 def discover_binary_artifacts(config: Config) -> List[BinaryArtifact]:
     """Resolve a binary-mode SPM shim and walk `.build/artifacts/` for
     xcframeworks. Used by binary mode instead of fetch_source + stage.
@@ -2770,22 +2835,7 @@ def discover_binary_artifacts(config: Config) -> List[BinaryArtifact]:
             "may not ship binary xcframeworks."
         )
 
-    found: List[BinaryArtifact] = []
-    for dirpath, dirnames, _filenames in os.walk(artifacts_root):
-        # Bug 3 fix: prune __MACOSX ghosts before descending or matching.
-        dirnames[:] = [d for d in dirnames if d != "__MACOSX"]
-        # Collect .xcframework directories at the current level without
-        # descending into them (they have their own internal structure
-        # that we don't want to walk).
-        remaining: List[str] = []
-        for d in dirnames:
-            if d.endswith(".xcframework"):
-                name = d[: -len(".xcframework")]
-                found.append(BinaryArtifact(product_name=name, path=Path(dirpath) / d))
-            else:
-                remaining.append(d)
-        dirnames[:] = remaining
-
+    found = _collect_binary_artifacts(artifacts_root)
     if not found:
         raise FetchError(
             "No xcframeworks discovered under .build/artifacts/. "
@@ -4728,6 +4778,41 @@ def _detect_macro_support(plan: Plan, package: Package) -> None:
     ]
 
 
+def _siblings_built_from_product(
+    tp: "TransitivePackageInfo",
+    product_name: str,
+    sibling_map: Dict[str, Path],
+    binary_targets_by_identity: Dict[str, Dict[str, List[str]]],
+) -> List[str]:
+    """The consumed sibling xcframeworks that transitive `tp`'s product
+    `product_name` is built from, resolved through `tp`'s dumped product
+    -> target list.
+
+    A binary-routed transitive ships one sibling per `.binaryTarget`,
+    named by whatever its archive unpacked
+    (`binary_targets_by_identity`), so each of the product's targets maps
+    to the siblings it unpacked: Amplitude's `AmplitudeCoreFramework`
+    product → target `AmplitudeCoreFramework` → `AmplitudeCore`. A
+    source-built transitive's child builds each product as
+    `<product>.xcframework`, so the product is its own sibling. Only
+    siblings present in `sibling_map` are returned; empty when the
+    product was not built. A binary-routed transitive whose artifact
+    layout recorded no targets falls back to the product-named sibling.
+    """
+    by_target = binary_targets_by_identity.get(tp.identity.lower())
+    if by_target:
+        product = next(
+            (p for p in tp.products if p.name == product_name), None
+        )
+        out: List[str] = []
+        for target in product.targets if product is not None else ():
+            for sibling in by_target.get(target, ()):
+                if sibling in sibling_map and sibling not in out:
+                    out.append(sibling)
+        return out
+    return [product_name] if product_name in sibling_map else []
+
+
 def _plan_external_sibling_consumption(
     plan: Plan, package: Package, config: Config
 ) -> None:
@@ -4760,28 +4845,38 @@ def _plan_external_sibling_consumption(
     identity_map = config.prebuilt_sibling_identities
 
     seen_products: Set[str] = set()
-    # Phase 1: emit edits for products the umbrella's source actually
-    # references via `.product(name: P, package: ident)`. These edits
-    # carry a known `package_identity`, which Prepare uses to scope the
-    # `.product()` → `"P"` rewrite and to drive the matching
-    # `.package(url:)` strip.
+    # Phase 1: emit edits for the siblings that the products the umbrella's
+    # source references via `.product(name: P, package: ident)` are built
+    # from. These edits carry a known `package_identity`, which Prepare
+    # uses to scope the `.product()` rewrite and to drive the matching
+    # `.package(url:)` strip, and list in `via_products` every referenced
+    # P they satisfy.
+    phase1: Dict[str, PackageSwiftEdit] = {}
     for tp in package.transitive_packages:
         identity = tp.identity
         for product_name in tp.referenced_products:
-            if product_name in seen_products:
-                continue
-            xcfx = sibling_map.get(product_name)
-            if xcfx is None:
-                continue
-            seen_products.add(product_name)
-            plan.package_swift_edits.append(
-                PackageSwiftEdit(
-                    kind="consume_external_sibling",
-                    product_name=product_name,
-                    package_identity=identity,
-                    xcframework_path=xcfx,
-                )
-            )
+            for sibling in _siblings_built_from_product(
+                tp, product_name, sibling_map,
+                config.prebuilt_sibling_binary_targets,
+            ):
+                edit = phase1.get(sibling)
+                if edit is None:
+                    if sibling in seen_products:
+                        continue
+                    seen_products.add(sibling)
+                    edit = PackageSwiftEdit(
+                        kind="consume_external_sibling",
+                        product_name=sibling,
+                        package_identity=identity,
+                        xcframework_path=sibling_map[sibling],
+                    )
+                    phase1[sibling] = edit
+                    plan.package_swift_edits.append(edit)
+                if (
+                    edit.package_identity == identity
+                    and product_name not in edit.via_products
+                ):
+                    edit.via_products.append(product_name)
 
     # Phase 2: every other freshly-built sibling xcframework gets an
     # injection-only edit (no `package_identity`). These cover the
@@ -4956,9 +5051,13 @@ def print_plan(
                     else "(missing path)"
                 )
                 pkg_ident = edit.package_identity or "(unknown package)"
+                via = (
+                    f", via {', '.join(edit.via_products)}"
+                    if edit.via_products else ""
+                )
                 print(
                     f"    - consume_external_sibling: {edit.product_name} "
-                    f"(package={pkg_ident}) ← {xcfx_basename}"
+                    f"(package={pkg_ident}{via}) ← {xcfx_basename}"
                 )
             else:
                 print(f"    - {edit.kind}: {edit.product_name}")
@@ -7209,11 +7308,14 @@ def edit_rewrite_external_product_to_string_dep_in_target(
     target_name: str,
     product_name: str,
     package_identity: str,
+    replacement_names: Optional[Sequence[str]] = None,
 ) -> str:
     """Rewrite every depth-0 `.product(name: product_name, package:
     package_identity[, ...])` entry inside the `dependencies:` array of
     the `.target/.executableTarget/.testTarget` call for `target_name`
-    to the bare string literal `"<product_name>"`.
+    to bare string literals naming the sibling modules the product is
+    built from: `replacement_names`, or `"<product_name>"` when omitted.
+    A product built from several siblings becomes several entries.
 
     Used by `consume_external_sibling` (Prepare): after the orchestrator
     pre-builds an external transitive product P as a sibling xcframework
@@ -7277,7 +7379,8 @@ def edit_rewrite_external_product_to_string_dep_in_target(
     )
     if not matches:
         return manifest_text
-    string_literal = _swift_string_literal(product_name)
+    names = list(replacement_names) if replacement_names else [product_name]
+    string_literal = ", ".join(_swift_string_literal(n) for n in names)
     edited_body = body
     for call_start, call_close in sorted(matches, reverse=True):
         edited_body = (
@@ -7744,6 +7847,7 @@ def edit_rewrite_external_product_to_string_dep_in_all_targets(
     package_identity: str,
     *,
     include_test_targets: bool = True,
+    replacement_names: Optional[Sequence[str]] = None,
 ) -> str:
     """Apply `edit_rewrite_external_product_to_string_dep_in_target`
     across every `.target` / `.executableTarget` (and, by default,
@@ -7783,7 +7887,7 @@ def edit_rewrite_external_product_to_string_dep_in_all_targets(
     text = manifest_text
     for name in target_names:
         text = edit_rewrite_external_product_to_string_dep_in_target(
-            text, name, product_name, package_identity
+            text, name, product_name, package_identity, replacement_names
         )
     return text
 
@@ -9607,11 +9711,13 @@ def _apply_consume_external_sibling_edits(
          Paths are relativized to the package root via
          `os.path.relpath` — SPM rejects absolute `.binaryTarget(path:)`.
 
-      2. **`.product()` → `"P"` rewrite** in every target's
-         `dependencies:` array. Routed through
+      2. **`.product(name: P, package: ID)` → `"M"` rewrite** in every
+         target's `dependencies:` array, for each sibling M whose edit
+         lists P in `via_products` (the siblings ID's product P is built
+         from). Routed through
          `edit_rewrite_external_product_to_string_dep_in_all_targets`.
-         Once the overlay supplies a binaryTarget named P, SPM resolves
-         a bare-string dep `"P"` to that binaryTarget; the `.product()`
+         Once the overlay supplies a binaryTarget named M, SPM resolves
+         a bare-string dep `"M"` to that binaryTarget; the `.product()`
          shape always disambiguates to the external package, which is
          now orphaned and would not be resolved. Test targets are
          included because a test target that imports P would dangle
@@ -9680,6 +9786,12 @@ def _apply_consume_external_sibling_edits(
     text = manifest_path.read_text()
     edited = edit_inject_or_extend_overlay_binary_targets(text, substitutions)
     identities_to_strip: Set[str] = set()
+    # `.product(name: P, package: ID)` becomes a dependency on the
+    # siblings P is built from — the edits listing P in `via_products`,
+    # which Plan resolved through ID's product -> target list. P's own
+    # name is never matched against a sibling's: Amplitude's
+    # `AmplitudeCoreFramework` product is the `AmplitudeCore` sibling.
+    siblings_by_product: Dict[Tuple[str, str], List[str]] = {}
     for edit in consume_edits:
         # `package_identity` is None for injection-only edits emitted by
         # Plan Phase 2 (sibling xcframeworks referenced solely via a
@@ -9689,12 +9801,15 @@ def _apply_consume_external_sibling_edits(
         # overlay injection above is the whole edit.
         if edit.package_identity is None:
             continue
-        edited = edit_rewrite_external_product_to_string_dep_in_all_targets(
-            edited,
-            edit.product_name,
-            edit.package_identity,
-        )
         identities_to_strip.add(edit.package_identity)
+        for product in edit.via_products:
+            siblings_by_product.setdefault(
+                (edit.package_identity, product), []
+            ).append(edit.product_name)
+    for (identity, product), siblings in siblings_by_product.items():
+        edited = edit_rewrite_external_product_to_string_dep_in_all_targets(
+            edited, product, identity, replacement_names=siblings,
+        )
 
     # Close the swiftinterface search-path gap. A `.binaryTarget` has no
     # dependencies of its own, so a target sees a consumed sibling's
@@ -17762,6 +17877,24 @@ def _build_prebuilt_sibling_index(
     return paths, identities
 
 
+def _binary_target_siblings(
+    artifacts: Sequence["BinaryArtifact"],
+) -> Dict[str, List[str]]:
+    """Index binary-mode artifacts by the `.binaryTarget` they were
+    unpacked from: target name -> sibling xcframework basenames (without
+    `.xcframework`), in discovery order. Artifacts whose layout carried no
+    target level are left out; SwiftPM target names are unique across a
+    package graph, so the index needs no identity qualifier."""
+    out: Dict[str, List[str]] = {}
+    for art in artifacts:
+        if art.binary_target is None:
+            continue
+        names = out.setdefault(art.binary_target, [])
+        if art.product_name not in names:
+            names.append(art.product_name)
+    return out
+
+
 _CROSS_SIBLING_PRODUCT_RE = re.compile(
     r"\.product\s*\(\s*name\s*:\s*\"([^\"\\\n]+)\"\s*,\s*package\s*:\s*\"([^\"\\\n]+)\""
 )
@@ -18059,6 +18192,9 @@ def _run_source_mode_with_transitives(config: Config) -> int:
     # consumed siblings with their owning package, letting Prepare strip
     # the now-redundant `.package(url: …)` dep from the umbrella manifest.
     binary_routed_identity_by_product: Dict[str, str] = {}
+    # identity -> binary target -> sibling basenames, for binary-routed
+    # transitives. See `Config.prebuilt_sibling_binary_targets`.
+    binary_targets_by_identity: Dict[str, Dict[str, List[str]]] = {}
     # Seed `visited` with the root's own identity computed the same way
     # `_collect_referenced_package_products` keys its entries — by SPM
     # identity. `_identity_from_url` mirrors SPM's normalisation (last URL
@@ -18140,6 +18276,10 @@ def _run_source_mode_with_transitives(config: Config) -> int:
                     config.output_dir, all_entries, package,
                     binary_routed_identity_by_product,
                 )
+                child_config.prebuilt_sibling_binary_targets = {
+                    ident: dict(by_target)
+                    for ident, by_target in binary_targets_by_identity.items()
+                }
                 result = _run_source_mode(child_config)
         except _USER_FACING_ERRORS as exc:
             # Mirror main()'s clean-error path: a child's Fetch / Inspect /
@@ -18190,12 +18330,20 @@ def _run_source_mode_with_transitives(config: Config) -> int:
             return result
         all_entries.extend(child_config.collected_entries)
         if route_binary:
+            produced: Set[str] = set()
             for entry in child_config.collected_entries:
                 if entry.name.endswith(".xcframework"):
                     prod = entry.name[: -len(".xcframework")]
+                    produced.add(prod)
                     binary_routed_identity_by_product.setdefault(
                         prod, tp.identity
                     )
+            binary_targets_by_identity[tp.identity.lower()] = (
+                _binary_target_siblings([
+                    art for art in child_config.discovered_binary_artifacts
+                    if art.product_name in produced
+                ])
+            )
 
     # Build the umbrella last, as a child run so it deposits its entries
     # in the same merge bucket and skips the per-call manifest write.
@@ -18216,6 +18364,7 @@ def _run_source_mode_with_transitives(config: Config) -> int:
         config.output_dir, all_entries, package,
         binary_routed_identity_by_product,
     )
+    config.prebuilt_sibling_binary_targets = binary_targets_by_identity
     umbrella_result = _source_mode_after_inspect(
         config, source_dir, staged_dir, package
     )
@@ -18266,6 +18415,7 @@ def _run_binary_mode(config: Config) -> int:
     _validate_platforms_post_autodetect(config)
 
     artifacts = discover_binary_artifacts(config)
+    config.discovered_binary_artifacts = list(artifacts)
     plan = plan_binary_build(config, artifacts)
     _record_expected_primary_products(config, plan)
     for w in plan.warnings:

@@ -1010,6 +1010,41 @@ def _detect_macro_support(plan: Plan, package: Package) -> None:
     ]
 
 
+def _siblings_built_from_product(
+    tp: "TransitivePackageInfo",
+    product_name: str,
+    sibling_map: Dict[str, Path],
+    binary_targets_by_identity: Dict[str, Dict[str, List[str]]],
+) -> List[str]:
+    """The consumed sibling xcframeworks that transitive `tp`'s product
+    `product_name` is built from, resolved through `tp`'s dumped product
+    -> target list.
+
+    A binary-routed transitive ships one sibling per `.binaryTarget`,
+    named by whatever its archive unpacked
+    (`binary_targets_by_identity`), so each of the product's targets maps
+    to the siblings it unpacked: Amplitude's `AmplitudeCoreFramework`
+    product → target `AmplitudeCoreFramework` → `AmplitudeCore`. A
+    source-built transitive's child builds each product as
+    `<product>.xcframework`, so the product is its own sibling. Only
+    siblings present in `sibling_map` are returned; empty when the
+    product was not built. A binary-routed transitive whose artifact
+    layout recorded no targets falls back to the product-named sibling.
+    """
+    by_target = binary_targets_by_identity.get(tp.identity.lower())
+    if by_target:
+        product = next(
+            (p for p in tp.products if p.name == product_name), None
+        )
+        out: List[str] = []
+        for target in product.targets if product is not None else ():
+            for sibling in by_target.get(target, ()):
+                if sibling in sibling_map and sibling not in out:
+                    out.append(sibling)
+        return out
+    return [product_name] if product_name in sibling_map else []
+
+
 def _plan_external_sibling_consumption(
     plan: Plan, package: Package, config: Config
 ) -> None:
@@ -1042,28 +1077,38 @@ def _plan_external_sibling_consumption(
     identity_map = config.prebuilt_sibling_identities
 
     seen_products: Set[str] = set()
-    # Phase 1: emit edits for products the umbrella's source actually
-    # references via `.product(name: P, package: ident)`. These edits
-    # carry a known `package_identity`, which Prepare uses to scope the
-    # `.product()` → `"P"` rewrite and to drive the matching
-    # `.package(url:)` strip.
+    # Phase 1: emit edits for the siblings that the products the umbrella's
+    # source references via `.product(name: P, package: ident)` are built
+    # from. These edits carry a known `package_identity`, which Prepare
+    # uses to scope the `.product()` rewrite and to drive the matching
+    # `.package(url:)` strip, and list in `via_products` every referenced
+    # P they satisfy.
+    phase1: Dict[str, PackageSwiftEdit] = {}
     for tp in package.transitive_packages:
         identity = tp.identity
         for product_name in tp.referenced_products:
-            if product_name in seen_products:
-                continue
-            xcfx = sibling_map.get(product_name)
-            if xcfx is None:
-                continue
-            seen_products.add(product_name)
-            plan.package_swift_edits.append(
-                PackageSwiftEdit(
-                    kind="consume_external_sibling",
-                    product_name=product_name,
-                    package_identity=identity,
-                    xcframework_path=xcfx,
-                )
-            )
+            for sibling in _siblings_built_from_product(
+                tp, product_name, sibling_map,
+                config.prebuilt_sibling_binary_targets,
+            ):
+                edit = phase1.get(sibling)
+                if edit is None:
+                    if sibling in seen_products:
+                        continue
+                    seen_products.add(sibling)
+                    edit = PackageSwiftEdit(
+                        kind="consume_external_sibling",
+                        product_name=sibling,
+                        package_identity=identity,
+                        xcframework_path=sibling_map[sibling],
+                    )
+                    phase1[sibling] = edit
+                    plan.package_swift_edits.append(edit)
+                if (
+                    edit.package_identity == identity
+                    and product_name not in edit.via_products
+                ):
+                    edit.via_products.append(product_name)
 
     # Phase 2: every other freshly-built sibling xcframework gets an
     # injection-only edit (no `package_identity`). These cover the
@@ -1238,9 +1283,13 @@ def print_plan(
                     else "(missing path)"
                 )
                 pkg_ident = edit.package_identity or "(unknown package)"
+                via = (
+                    f", via {', '.join(edit.via_products)}"
+                    if edit.via_products else ""
+                )
                 print(
                     f"    - consume_external_sibling: {edit.product_name} "
-                    f"(package={pkg_ident}) ← {xcfx_basename}"
+                    f"(package={pkg_ident}{via}) ← {xcfx_basename}"
                 )
             else:
                 print(f"    - {edit.kind}: {edit.product_name}")
