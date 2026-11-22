@@ -351,11 +351,14 @@ PKGEOF
         die "Failed to resolve binary package dependencies"
     fi
 
-    # Find xcframeworks in .build/artifacts/
+    # Find xcframeworks in .build/artifacts/. Skip __MACOSX resource-fork
+    # directories — some vendors (e.g. BlinkID) ship artifactbundle zips that
+    # still contain a __MACOSX/<Name>.xcframework ghost alongside the real
+    # framework, and without pruning we'd copy the ghost over the real one.
     local found_xcfws=()
     while IFS= read -r xcfw; do
         [[ -n "$xcfw" ]] && found_xcfws+=("$xcfw")
-    done < <(find "$binary_dir/.build/artifacts" -name "*.xcframework" -type d 2>/dev/null)
+    done < <(find "$binary_dir/.build/artifacts" -name '__MACOSX' -prune -o -name '*.xcframework' -type d -print 2>/dev/null)
 
     if [[ ${#found_xcfws[@]} -eq 0 ]]; then
         die "No xcframeworks found in resolved artifacts. Is this a binary-target package?"
@@ -821,10 +824,21 @@ build_archive() {
 
     # --- Handle device failure ---
     if [[ $device_rc -ne 0 ]]; then
-        # Check if the failure is due to missing scheme
-        if [[ -f "$device_log" ]] && grep -q "does not contain a scheme" "$device_log"; then
+        # Trigger the SPM-mode fallback when the xcodeproj-aware build fails for
+        # a reason that SPM mode would plausibly dodge:
+        #   - "does not contain a scheme" — the scheme lives in a target the
+        #     package's Package.swift exposes but the xcodeproj doesn't.
+        #   - "contains N projects" / "multiple projects" — the source dir has
+        #     more than one .xcodeproj and xcodebuild refuses to pick one
+        #     (e.g. GRDB ships GRDB.xcodeproj + GRDBCustom.xcodeproj).
+        # In both cases, moving all xcodeprojs aside and letting xcodebuild
+        # discover the SPM-generated scheme from Package.swift is the right
+        # recovery, so the two symptoms share a single fallback path.
+        if [[ -f "$device_log" ]] && \
+           (grep -q "does not contain a scheme" "$device_log" || \
+            grep -qE "contains [0-9]+ projects|multiple projects with the current extension" "$device_log"); then
             if $HAS_XCODEPROJ; then
-                dim "  Scheme '$scheme' not in xcodeproj — retrying in SPM mode..."
+                dim "  xcodeproj build failed ('$scheme' missing or ambiguous) — retrying in SPM mode..."
                 # Move xcodeproj aside and retry sequentially with product name as scheme
                 local xcproj
                 for xcproj in "$source_dir"/*.xcodeproj "$source_dir"/*.xcworkspace; do
