@@ -8,7 +8,11 @@ match `corpus-sweep/findings.md`.
 Most of the corpus findings (X-001, X-003, X-004, X-005, X-006) are now fixed and
 carry manifest-/packaging-layer regression tests. The remaining entries are an
 upstream/toolchain limitation the tool now surfaces with a diagnostic rather than a
-bare failure (X-002) and the library-evolution wall it can only detect, not remove.
+bare failure (X-002), the library-evolution wall it can only detect, not remove, and
+a mixed-framework umbrella-import defect that X-006's header-fold does not cover
+(X-007) — the primary framework's own umbrella `#import <Primary/dep.h>` still
+dangles because the dependency header ships under a *sibling* framework, not the
+primary the import qualifies.
 
 ## Fixed (2026-07)
 
@@ -49,6 +53,56 @@ bare failure (X-002) and the library-evolution wall it can only detect, not remo
   headers (`yaml.h`), leaving the Swift umbrella header's `#import` dangling. Header
   collection now folds in a mixed framework's internal C-dependency header dirs
   (Yams's `Sources/CYaml/include`) alongside the primary target's, so `yaml.h` ships.
+  **Incomplete on the real Yams conversion — see X-007.** On a fresh Xcode 26.3
+  conversion `yaml.h` ships under a *sibling* `CYaml.framework/Headers/`, and
+  `Yams.framework/Headers/` carries only the umbrella `Yams.h`; the umbrella's
+  `#import <Yams/yaml.h>` therefore still dangles. The header-fold is proven by the
+  `_selftest_inject_objc_headers_mixed_c_dep_yaml` unit selftest but does not fire on
+  the shipped conversion path (the C dependency is emitted as its own framework rather
+  than folded into the primary's `Headers/`).
+
+## X-007 — mixed-framework umbrella `#import <Primary/dep.h>` dangles when the dependency ships as a sibling framework
+
+Observed fresh (Xcode 26.3, 2026-07) on **Yams 6.x** and **TelemetryDeck /
+TelemetryClient**. Both fail generator ingestion at SWIFTBIND109 ("the ObjC surface of
+'<module>' imports header '<H>', which is not present in the framework distribution").
+This is the residual that X-006's header-fold was meant to close but does not, on the
+real conversion path.
+
+Shape (identical in both cases): the primary framework's auto-generated umbrella header
+does a *framework-qualified* import of a header that the converter ships under a
+**different** framework than the import names.
+
+- **Yams:** `Yams.framework/Headers/Yams.h` (the umbrella) contains
+  `#import <Yams/yaml.h>`. But `yaml.h` ships only under the sibling
+  `CYaml.framework/Headers/yaml.h` (its own `CYaml.xcframework`); `Yams.framework/Headers/`
+  holds only `Yams.h`. `<Yams/yaml.h>` resolves to nothing.
+- **TelemetryDeck:** `TelemetryClient.framework/Headers/TelemetryClient.h` (the umbrella)
+  contains `#import <TelemetryDeck/TelemetryClient.h>`. But the primary product is
+  `TelemetryClient`; `TelemetryDeck.framework/Headers/` ships only `TelemetryDeck-Swift.h`.
+  The umbrella is qualifying its *own* header under the neighbouring `TelemetryDeck`
+  framework name, which does not carry it. `<TelemetryDeck/TelemetryClient.h>` dangles.
+
+Evidence: `corpus-sweep/xcframeworks/{Yams,TelemetryDeck}/` (header layouts above);
+generator logs classify both as `objc_mixed_109`. Both were red on the session-01
+fresh-conversion baseline (`ingestion-baseline-s1.json` → `families.objc_mixed_109`).
+
+Root cause (hypothesis for the converter owner — not verified against the transform
+code): the umbrella is emitted with the framework-qualified import of the primary
+product name, but the C/ObjC dependency it references is packaged as its **own** sibling
+framework (the X-001 sibling-promotion path) rather than having its headers folded into
+the primary's `Headers/`. X-006's fold-into-primary step either does not run for this
+product shape (e.g. the primary is a synthesized dynamic product whose name/target does
+not match the fold's `product_name` filter) or is superseded by sibling-framework
+packaging without reconciling the umbrella's import qualifier. A correct fix makes the
+umbrella's `#import <Primary/dep.h>` resolvable — either by copying/symlinking the
+dependency's public headers into the primary framework's `Headers/` (so `<Primary/dep.h>`
+exists), or by rewriting the umbrella import to the framework that actually ships the
+header (`<CYaml/yaml.h>`, `<TelemetryClient/TelemetryClient.h>`).
+
+This is a converter packaging defect, not a generator issue: the generator's
+SWIFTBIND109 fail-closed classification is correct (a Swift-only fallback would silently
+erase the ObjC API surface). No generator patch is warranted.
 
 ## X-002 — transitive dynamic-library synthesis fails for static-only products (best-effort: diagnostic delivered)
 
